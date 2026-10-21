@@ -1,164 +1,63 @@
 # agent-wechat
 
-A programmable WeChat interface. Controls a WeChat client running in a Docker container — receive and send messages, see chat heads, and more via API, CLI, Wechaty puppet, or OpenClaw plugin.
+A standalone native WeChat daemon, CLI and OpenClaw channel.
 
-**[Documentation](https://thisnick.github.io/agent-wechat/)**
+The native `wx` executable speaks the protocol directly and uses official-format local profiles. It needs no official WeChat executable or desktop at runtime. See the supported profile scope and remaining limits in [implemented capabilities and validation](packages/native-client-rust/README.md).
 
-## Packages
+| Package | Responsibility |
+| --- | --- |
+| [`@agent-wechat/cli`](packages/cli) | Native `wx` and verified executable installer |
+| [`@agent-wechat/shared`](packages/shared) | Private native HTTP/SSE SDK; bundled into OpenClaw |
+| [`@agent-wechat/agent-wechat`](packages/openclaw-extension) | OpenClaw managed or external native daemon integration |
 
-| Package | npm | Description |
-|---------|-----|-------------|
-| [`@agent-wechat/cli`](./packages/cli) | [![npm](https://img.shields.io/npm/v/@agent-wechat/cli)](https://www.npmjs.com/package/@agent-wechat/cli) | CLI for managing the Docker container and interacting with WeChat |
-| [`@agent-wechat/wechaty-puppet`](./packages/wechaty-puppet) | [![npm](https://img.shields.io/npm/v/@agent-wechat/wechaty-puppet)](https://www.npmjs.com/package/@agent-wechat/wechaty-puppet) | [Wechaty](https://wechaty.js.org) puppet for agent-wechat |
-| [`@agent-wechat/agent-wechat`](./packages/openclaw-extension) | [![npm](https://img.shields.io/npm/v/@agent-wechat/agent-wechat)](https://www.npmjs.com/package/@agent-wechat/agent-wechat) | [OpenClaw](https://openclaw.ai) extension for AI agent integration |
+## Native client
 
-## What It Does
-
-- **Read** chats, messages, and media (images, voice, files) via REST API
-- **Send** text messages, images, files, and voice notes
-- **Login** via QR code displayed in your terminal
-- **Monitor** for new messages through client polling
-
-## Requirements
-
-- Docker (Colima on macOS, or Docker Desktop)
-- Node.js >= 22 (for CLI)
-- pnpm (for development)
-- **Not compatible with serverless environments** — requires ptrace capabilities
-
-## Quick Start
+The distribution targets are Linux x64 and ARM64 with glibc 2.36 or newer. Build from source with Rust 1.93.1, or install a matching native release once published:
 
 ```bash
-# Install the CLI
-npm install -g @agent-wechat/cli
-
-# Start the container (auto-pulls Docker image)
-wx up
-
-# Login (displays QR code in terminal)
-wx auth login
-
-# List your chats
-wx chats list
-
-# Send a message
-wx messages send <chatId> --text "Hello"
-
-# Record audio as a WeChat voice note
-wx messages send <chatId> --voice ./reply.mp3
-
-# Read messages
-wx messages list <chatId>
-
-# Stop the container
-wx down
+npm install -g @agent-wechat/cli@VERSION
+wx --json version
+wx config show
+wx serve
 ```
 
-## CLI Commands
+For the native beta series, select a published `1.0.0-beta.N` version explicitly or install `@agent-wechat/cli@beta`. The stable `latest` channel retains the old container CLI until stable promotion. Beta preparation uses a CI-generated version PR and separately approved publication; no native beta is implied to be published by this source change.
 
-| Command | Description |
-|---------|-------------|
-| `wx up [--proxy user:pass@host:port]` | Start the WeChat container (auto-pulls image) |
-| `wx down` | Stop and remove container |
-| `wx logs` | Stream container logs |
-| `wx status` | Show server and login status |
-| `wx auth login` | Login flow (shows QR code) |
-| `wx auth status` | Show login status |
-| `wx auth logout` | Log out of WeChat |
-| `wx chats list` | List chats |
-| `wx chats get <id>` | Show one chat |
-| `wx chats open <id>` | Select a chat in WeChat |
-| `wx find <name>` | Find chat by name |
-| `wx contacts list` / `wx contacts find <name>` | List or find contacts |
-| `wx messages list <id>` | List messages in a chat |
-| `wx messages send <id> --text <msg>` | Send text message |
-| `wx messages send <id> --image <file>` | Send image |
-| `wx messages send <id> --file <file>` | Send a file attachment |
-| `wx messages send <id> --voice <audio>` | Send audio as one or more voice notes and wait for verification |
-| `wx messages send <id> --voice <audio> --detach` | Start a voice job and return its ID immediately |
-| `wx messages voice status <jobId>` | Check voice-job progress and sent message IDs |
-| `wx messages voice cancel <jobId>` | Request cancellation of a voice job |
-| `wx messages media <id> <localId> [-o <path>] [--full\|--thumbnail]` | Save an attachment, including supported stickers with animation preserved; images use the best available copy by default |
+`serve` runs the authenticated daemon in the foreground. It creates private API-token and storage-key files under the configured durable root. It does not start Docker or automatically display a login QR. Other clients connect over the versioned HTTP/SSE API.
 
-Run `wx --help` or `wx <command> --help` for all commands and options.
-
-Supported type-47 stickers use the same media command: the server retrieves and validates the original CDN bytes, preserves animation, and keeps its own persistent cache. This does not open a chat, modify WeChat's cache, or enable automatic OpenClaw sticker ingestion. Encrypted-only or unverified sticker sources return an unavailable result.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                Docker Container                     │
-│                                                     │
-│   WeChat Linux  ←──  Xvfb + AT-SPI (accessibility)  │
-│        ↕                                            │
-│   agent-server (Rust/Axum, port 6174)               │
-│     - FSM engine for UI automation                  │
-│     - REST + WebSocket API                          │
-└──────────────────────┬──────────────────────────────┘
-                       │ HTTP / WebSocket
-                       ↓
-               CLI or AI agent
-```
-
-- **UI automation**: Login, open chats, send messages — all via deterministic FSM (no LLM needed)
-- **API**: REST endpoints for supported operations and a WebSocket login flow
-
-## Docker Setup
-
-**Option A: Via CLI** (recommended)
+In another terminal:
 
 ```bash
-wx up    # auto-pulls ghcr.io/thisnick/agent-wechat
+# Close the official Linux app before taking over its files.
+wx auth login --official
+wx accounts list
+wx threads
+wx messages list filehelper
 ```
 
-**Option B: Docker Compose** (for custom networking)
+`--official` selects the existing files on the daemon host and prepares identity/key setup automatically. Use `--official=/absolute/path/to/profile` to select a specific profile. Saved-device login is attempted when usable; a white-background QR is available when approval is needed. The files are used in place; no import is required. With multiple accounts, select one explicitly with `--account`.
 
-See [`docker-compose.yml`](./docker-compose.yml) for a full example. Key points:
+The initial scope is taking over an existing official profile and continuing supported database and media writes in place. Native history, text/media sends, contact/group lookup, rosters, avatars and downloads use that profile. Unsupported sync controls remain staged. Fresh-profile creation, copy export and returning a profile to the official app are experimental extras outside this scope. FTS/search-index maintenance is not supported. See the [capability checklist](packages/native-client-rust/FEATURES.md) for the tested scope.
 
-```yaml
-# Generate a token first:
-#   mkdir -p ~/.config/agent-wechat
-#   openssl rand -hex 32 > ~/.config/agent-wechat/token
-#   chmod 600 ~/.config/agent-wechat/token
+Server configuration defaults to `~/.config/agent-wechat/server/config.toml`; daemon data defaults to `~/.local/share/agent-wechat`. XDG paths and explicit overrides are supported. Client endpoint, token reference and selected account belong in a separate `~/.config/agent-wechat/client.toml`. The operating official profile stays at its selected path; daemon state stays in sidecars.
 
-services:
-  agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
-    security_opt:
-      - seccomp=unconfined
-    cap_add:
-      - SYS_PTRACE
-      - NET_ADMIN           # for transparent proxy (optional)
-    ports:
-      - "6174:6174"
-    volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
-    environment:
-      - PROXY=${PROXY:-}    # optional: user:pass@host:port
-    restart: unless-stopped
+See the [native guide](packages/native-client-rust/README.md) for configuration, profile ownership, recovery, API commands and current limits. [Deployment templates](deploy/native/README.md) include a user service and an official-binary-free image. Building these assets does not deploy them.
 
-volumes:
-  agent-wechat-data:
-  agent-wechat-home:
-```
+## Distribution and migration
+
+The native executable runs directly on Linux x64/ARM64 with glibc 2.36+, or inside the native-only container. The npm CLI installs the matching executable; OpenClaw is a separate npm plugin. The Rust crates and TypeScript SDK are internal source libraries, not new registry publications. See the [distribution matrix and release sequence](deploy/native/README.md).
+
+This major release retires the old UI server/image, `wx-legacy` and Wechaty puppet/gateway integrations. Existing installations and volumes are not removed. Stop the old owner, preserve a backup and select its complete official profile with the native login command. Old `/api` clients and inline-token OpenClaw configurations require migration to native `/v1`; see the [migration guide](docs/src/content/docs/getting-started/migration.mdx).
 
 ## Development
 
 ```bash
 pnpm install
-pnpm build                   # Build CLI + shared types
-pnpm dev:deploy              # Cross-compile Rust server + deploy to running container
-pnpm build:image:arm64       # Build Docker image (Apple Silicon)
-pnpm build:image:amd64       # Build Docker image (Intel)
+pnpm build
+pnpm typecheck
+pnpm native:test
+pnpm native:build
+python3 packages/native-client-rust/scripts/smoke.py packages/native-client-rust/target/debug/wx
 ```
 
-See [AGENTS.md](./AGENTS.md) for contributor guidance and implementation pointers.
-
-## Ports
-
-| Port | Service |
-|------|---------|
-| 6174 | Agent server REST API + VNC web viewer at `/vnc/` |
+The native smoke check uses synthetic profiles and loopback HTTP. Native protocol/media tests use synthetic fixtures; live account validation is separate and must use an isolated test account. See [AGENTS.md](AGENTS.md) for contributor rules and the [native guide](packages/native-client-rust/README.md) for the exact test/build commands. CI builds/tests both native architectures without publishing or deploying.

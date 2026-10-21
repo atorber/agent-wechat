@@ -15,7 +15,7 @@
     "@agent-wechat/shared": "workspace:*",
     "@types/node": "^22",
     "esbuild": "^0.25.0",
-    "openclaw": "^2026.10.2",
+    "openclaw": "2026.10.2",
     "typescript": "^5.4.5"
   },
   "openclaw": {
@@ -34,19 +34,13 @@
     "channelConfigs": {
       "agent-wechat": {
         "label": "WeChat",
-        "description": "WeChat messaging via agent-wechat container.",
+        "description": "WeChat messaging through the standalone native daemon.",
         "schema": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "enabled": {
               "type": "boolean"
-            },
-            "serverUrl": {
-              "type": "string"
-            },
-            "token": {
-              "type": "string"
             },
             "dmPolicy": {
               "type": "string",
@@ -104,18 +98,115 @@
                 }
               }
             },
-            "pollIntervalMs": {
-              "type": "integer",
-              "minimum": 100
-            },
-            "authPollIntervalMs": {
-              "type": "integer",
-              "minimum": 1000
-            },
             "mediaMaxMb": {
               "type": "integer",
               "minimum": 1,
               "maximum": 1024
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "native"
+              ]
+            },
+            "native": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "accountId",
+                "token",
+                "consumerStateDir"
+              ],
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "managed",
+                    "external"
+                  ]
+                },
+                "accountId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "endpoint": {
+                  "type": "string"
+                },
+                "executable": {
+                  "type": "string"
+                },
+                "serverConfig": {
+                  "type": "string"
+                },
+                "dataDir": {
+                  "type": "string"
+                },
+                "listen": {
+                  "type": "string"
+                },
+                "token": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "source",
+                        "provider",
+                        "id"
+                      ],
+                      "properties": {
+                        "source": {
+                          "type": "string",
+                          "enum": [
+                            "env",
+                            "file",
+                            "exec",
+                            "store"
+                          ]
+                        },
+                        "provider": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                        },
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    }
+                  ]
+                },
+                "consumerStateDir": {
+                  "type": "string"
+                },
+                "readPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "never",
+                    "on_model_dispatch"
+                  ]
+                },
+                "gatewayFacade": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "enabled"
+                  ],
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "prefix": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
             }
           }
         }

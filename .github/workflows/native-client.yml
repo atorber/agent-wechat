@@ -1,0 +1,43 @@
+name: Native client
+
+on:
+  pull_request:
+    paths:
+      - 'packages/native-client-rust/**'
+      - 'packages/shared/src/native*'
+      - 'scripts/native-generate-types.sh'
+      - '.github/workflows/native-client.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/native-client-rust/**'
+      - 'packages/shared/src/native*'
+      - 'scripts/native-generate-types.sh'
+      - '.github/workflows/native-client.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: packages/native-client-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
+      - run: bash ../../scripts/native-generate-types.sh --check
+      - run: python3 scripts/smoke.py target/debug/wx

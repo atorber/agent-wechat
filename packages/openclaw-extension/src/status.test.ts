@@ -46,19 +46,6 @@ test("collectWeChatStatusIssues: no issue when connected is undefined (static sn
   assert.deepStrictEqual(issues, []);
 });
 
-test("collectWeChatStatusIssues: reports app_not_running auth status", () => {
-  const issues = collectWeChatStatusIssues([
-    {
-      accountId: "default",
-      connected: true,
-      authStatus: "app_not_running",
-    },
-  ]);
-  assert.equal(issues.length, 1);
-  assert.equal(issues[0].kind, "runtime");
-  assert.ok(issues[0].message.includes("not running"));
-});
-
 test("collectWeChatStatusIssues: reports unlinked session", () => {
   const issues = collectWeChatStatusIssues([
     {
@@ -74,4 +61,13 @@ test("collectWeChatStatusIssues: reports unlinked session", () => {
 
 test("collectWeChatStatusIssues: handles empty array", () => {
   assert.deepStrictEqual(collectWeChatStatusIssues([]), []);
+});
+
+test("native connectivity issues point to the selected daemon instead of Docker lifecycle", () => {
+  const issues = collectWeChatStatusIssues([{ accountId: "native", backend: "native", connected: false }]);
+  assert.match(issues[0].fix, /native daemon/); assert.doesNotMatch(issues[0].fix, /wx-legacy|container/);
+});
+test("native unconfirmed handoff and uncertain custody are visible without retrying side effects", () => {
+  const issues = collectWeChatStatusIssues([{ accountId: "native", backend: "native", connected: true, linked: true, handoffUnconfirmed: true, needsReview: 1 }]);
+  assert.equal(issues.length, 2); assert.match(issues[0].message, /read state remains unchanged/); assert.match(issues[1].fix, /do not automatically resend/);
 });
