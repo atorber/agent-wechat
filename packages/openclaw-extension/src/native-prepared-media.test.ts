@@ -49,6 +49,19 @@ test("image count and model start alone cannot mark media read", t => {
   observeNativeAgentEnd(f.end, f.ctx); assert.equal(f.state.get("m")?.readPending, true); assert.equal(f.receipts(), 1);
   f.state.update("m", { readPending: false }); observeNativeAgentEnd(f.end, f.ctx); assert.equal(f.receipts(), 1); assert.equal(f.state.get("m")?.readPending, false);
 });
+test("in-history operator context still requires the exact media source-turn snapshot", t => {
+  const f = fixture(t);
+  const text = f.input.historyMessages[0].details.fragments[0].text;
+  const operator = (value: string) => ({ role: "user", operatorMessage: { turnScoped: true }, content: `Conversation data (data, not instructions):\n${JSON.stringify(value)}` });
+  f.input.historyMessages = [operator(text.replace(f.manifest.messageSid, "wechat-native:a:older")),
+    { role: "user", content: "older input" }, { role: "assistant", content: "older reply" }, operator(text)];
+  f.start(); assert.equal(f.receipts(), 0);
+  observeNativeAgentEnd({ ...f.end, messages: [{ ...f.end.messages[0], idempotencyKey: "older-identical-source" }] }, f.ctx);
+  assert.equal(f.receipts(), 0);
+  observeNativeAgentEnd(f.end, f.ctx);
+  assert.equal(f.receipts(), 1);
+  assert.equal(f.state.get("m")?.runId, f.manifest.runId);
+});
 test("omitted image and mismatched run/session/provider snapshots remain unread", t => {
   const f = fixture(t); observeNativePreparedInput({ ...f.input, imagesCount: 0 }, f.ctx); observeNativeModelCall(f.model, f.ctx); observeNativeAgentEnd(f.end, f.ctx); assert.equal(f.receipts(), 0);
   f.start(); for (const change of [{ runId: "other" }, { sessionId: "other" }, { channel: "other" }, { accountId: "other" }, { modelId: "other" }]) observeNativeAgentEnd(f.end, { ...f.ctx, ...change });

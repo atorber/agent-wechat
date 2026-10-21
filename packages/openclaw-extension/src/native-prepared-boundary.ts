@@ -72,17 +72,44 @@ function normalizedPromptMatches(text: string, manifest: NativeDispatchManifest)
   }
   return digest(text) === manifest.inputBodySha256;
 }
+function isCurrentContextCarrier(message: any): boolean {
+  return message?.role === "custom" && message.customType === "openclaw.runtime-context"
+    && message.details?.source === "openclaw-runtime-context" && message.details?.runtimeContextCarrier === true
+    || message?.role === "user" && message.operatorMessage?.turnScoped === true
+      && Object.keys(message.operatorMessage).length === 1 && typeof message.content === "string";
+}
 function currentMessageFacts(messages: unknown): Array<{ messageId: string; chatId: string }> {
   if (!Array.isArray(messages) || messages.length > 1000) return [];
+  // The host appends this turn's trusted context immediately before the current
+  // prompt (which llm_input supplies separately). Append-only provider replay
+  // may also retain older carriers before earlier user/assistant turns.
+  let start = messages.length;
+  while (start > 0 && isCurrentContextCarrier(messages[start - 1])) start--;
   const facts: Array<{ messageId: string; chatId: string }> = [];
-  for (const message of messages) {
-    if (message?.role !== "custom" || message.customType !== "openclaw.runtime-context"
-      || message.details?.source !== "openclaw-runtime-context" || message.details?.runtimeContextCarrier !== true) continue;
-    const fragments = message.details?.fragments;
-    if (!Array.isArray(fragments) || fragments.length > 64) return [];
-    for (const fragment of fragments) {
-      if (fragment?.kind !== "conversation-data" || typeof fragment.text !== "string" || fragment.text.length > 65536) continue;
-      const match = /^Conversation info: ⟦openclaw:ctx⟧\n```json\n([^\n]+)\n```$/.exec(fragment.text);
+  for (const message of messages.slice(start)) {
+    let texts: string[];
+    if (message.role === "custom") {
+      const fragments = message.details?.fragments;
+      if (!Array.isArray(fragments) || fragments.length > 64) return [];
+      texts = fragments.filter((fragment: any) => fragment?.kind === "conversation-data"
+        && typeof fragment.text === "string" && fragment.text.length <= 65536).map((fragment: any) => fragment.text);
+    } else {
+      // The pinned host projects in-history system updates into user messages
+      // with host-owned operatorMessage metadata. Only its exact data-fragment
+      // format is admitted; user-authored text alone is never a carrier.
+      if (message.content.length > 1024 * 1024) return [];
+      texts = [];
+      for (const match of message.content.matchAll(/(?:^|\n\n)Conversation data \(data, not instructions\):\n([^\r\n]*)(?=\n|$)/g)) {
+        if (texts.length >= 64) return [];
+        try {
+          const text: unknown = JSON.parse(match[1]);
+          if (typeof text !== "string" || text.length > 65536) return [];
+          texts.push(text);
+        } catch { return []; }
+      }
+    }
+    for (const text of texts) {
+      const match = /^Conversation info: ⟦openclaw:ctx⟧\n```json\n([^\n]+)\n```$/.exec(text);
       if (!match) continue;
       try { const value = JSON.parse(match[1]); if (typeof value.message_id === "string" && typeof value.chat_id === "string") facts.push({ messageId: value.message_id, chatId: value.chat_id }); } catch { /* No evidence from malformed metadata. */ }
     }
