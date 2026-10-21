@@ -149,7 +149,11 @@ pub(crate) fn check_known_table(c: &Connection, table: &str) -> Result<()> {
             .map(|i| (i.name.clone(), i.unique, i.partial, i.columns.clone()))
             .collect::<Vec<_>>()
     };
-    if a.columns != e.columns || !a.triggers.is_empty() || index(a) != index(e) {
+    // Supported writes name their columns. Physical order is not compatibility
+    // evidence; validate the same column definitions and constraints by name.
+    let columns_match = a.columns.len() == e.columns.len()
+        && a.columns.iter().all(|column| e.columns.contains(column));
+    if !columns_match || !a.triggers.is_empty() || index(a) != index(e) {
         return Err(ProfileError::UnsupportedSchema(relative.into()));
     }
     Ok(())

@@ -141,13 +141,14 @@ pub(crate) fn exact_columns(
         .into_iter()
         .find(|t| t.name == table)
         .ok_or_else(|| ProfileError::UnsupportedSchema(db.into()))?;
-    if t.columns
+    let names = t
+        .columns
         .iter()
         .map(|v| v.name.as_str())
-        .collect::<Vec<_>>()
-        != expected
-        || !t.triggers.is_empty()
-    {
+        .collect::<Vec<_>>();
+    let named_columns =
+        names.len() == expected.len() && names.iter().all(|name| expected.contains(name));
+    if !named_columns || !t.triggers.is_empty() {
         return Err(ProfileError::UnsupportedSchema(db.into()));
     }
     for col in &t.columns {
@@ -400,8 +401,13 @@ pub fn apply_incoming_text(
     {
         return Err(ProfileError::UnsupportedSchema(message_db));
     }
-    if table_schema.columns[0].declared_type.to_uppercase() != "INTEGER"
-        || table_schema.columns[0].primary_key_position != 1
+    let local_id = table_schema
+        .columns
+        .iter()
+        .find(|column| column.name == "local_id")
+        .ok_or_else(|| ProfileError::UnsupportedSchema(message_db.clone()))?;
+    if local_id.declared_type.to_uppercase() != "INTEGER"
+        || local_id.primary_key_position != 1
         || !table_schema
             .definition
             .as_ref()
