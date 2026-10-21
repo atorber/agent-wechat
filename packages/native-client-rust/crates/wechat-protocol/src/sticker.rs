@@ -1,114 +1,18 @@
 //! Original type-47 bytes from the verified CDN host. Signed URLs remain private.
 use anyhow::{ensure, Result};
-use image::{AnimationDecoder, ImageDecoder};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Cursor, Read},
+    io::Read,
     net::{IpAddr, ToSocketAddrs},
     time::Duration,
 };
+pub use wechat_media::{inspect_image, ImageInspection};
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StickerDescriptor {
     pub url: String,
     pub expected_bytes: u64,
     pub expected_md5: String,
     pub expires_at: Option<u64>,
-}
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ImageInspection {
-    pub content_type: String,
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub animation_preserved: bool,
-}
-pub fn inspect_image(bytes: &[u8]) -> Result<ImageInspection> {
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= 16 * 1024 * 1024,
-        "image_size_limit"
-    );
-    let format =
-        image::guess_format(bytes).map_err(|_| anyhow::anyhow!("image_format_unsupported"))?;
-    let limits = || {
-        let mut l = image::Limits::default();
-        l.max_image_width = Some(4096);
-        l.max_image_height = Some(4096);
-        l.max_alloc = Some(64 * 1024 * 1024);
-        l
-    };
-    let mut frames = 0u32;
-    let mut total = 0u64;
-    let mut width = 0;
-    let mut height = 0;
-    let mut count = |frame: image::ImageResult<image::Frame>| -> Result<()> {
-        let f = frame.map_err(|_| anyhow::anyhow!("image_decode_failed"))?;
-        let (w, h) = f.buffer().dimensions();
-        ensure!(
-            w > 0 && h > 0 && w as u64 * h as u64 <= 4_000_000,
-            "image_decode_limit"
-        );
-        total += w as u64 * h as u64;
-        frames += 1;
-        ensure!(frames <= 500 && total <= 100_000_000, "image_decode_limit");
-        width = width.max(w);
-        height = height.max(h);
-        Ok(())
-    };
-    let mime = match format {
-        image::ImageFormat::Gif => {
-            ensure!(bytes.last() == Some(&b';'), "gif_trailer_missing");
-            let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))?;
-            decoder.set_limits(limits())?;
-            for frame in decoder.into_frames() {
-                count(frame)?;
-            }
-            "image/gif"
-        }
-        image::ImageFormat::WebP => {
-            ensure!(
-                bytes.len() >= 12
-                    && u32::from_le_bytes(bytes[4..8].try_into()?) as usize + 8 == bytes.len(),
-                "webp_length_invalid"
-            );
-            let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))?;
-            decoder.set_limits(limits())?;
-            for frame in decoder.into_frames() {
-                count(frame)?;
-            }
-            "image/webp"
-        }
-        image::ImageFormat::Jpeg | image::ImageFormat::Png => {
-            if format == image::ImageFormat::Jpeg {
-                ensure!(bytes.ends_with(&[255, 217]), "jpeg_trailer_missing");
-            }
-            let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-            reader.limits(limits());
-            let decoded = reader
-                .decode()
-                .map_err(|_| anyhow::anyhow!("image_decode_failed"))?;
-            width = decoded.width();
-            height = decoded.height();
-            ensure!(
-                width > 0 && height > 0 && width as u64 * height as u64 <= 16_777_216,
-                "image_decode_limit"
-            );
-            frames = 1;
-            if format == image::ImageFormat::Png {
-                "image/png"
-            } else {
-                "image/jpeg"
-            }
-        }
-        _ => anyhow::bail!("image_format_unsupported"),
-    };
-    ensure!(frames > 0, "image_no_frames");
-    Ok(ImageInspection {
-        content_type: mime.into(),
-        width,
-        height,
-        frames,
-        animation_preserved: frames > 1,
-    })
 }
 pub(super) fn public_ip(ip: IpAddr) -> bool {
     match ip {
@@ -249,15 +153,5 @@ mod tests {
         for ip in ["127.0.0.1", "10.0.0.1", "::1", "2001:db8::1"] {
             assert!(!public_ip(ip.parse().unwrap()));
         }
-    }
-    #[test]
-    fn png_is_fully_decoded_and_truncation_fails() {
-        let mut bytes = std::io::Cursor::new(vec![]);
-        image::DynamicImage::new_rgb8(8, 8)
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
-        let good = bytes.into_inner();
-        assert_eq!(inspect_image(&good).unwrap().frames, 1);
-        assert!(inspect_image(&good[..20]).is_err());
     }
 }
