@@ -32,12 +32,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           toolchain: 1.93.1
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/native-client-rust -> target
+          # The automatic hash includes unused preinstalled toolchains, which
+          # differ across runner images. Key the compiler we actually select.
+          add-rust-environment-hash-key: false
+          key: native-${{ matrix.runner }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('packages/native-client-rust/**/Cargo.toml', 'packages/native-client-rust/Cargo.lock', 'packages/native-client-rust/**/.cargo/config*', '.cargo/config*') }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo build --workspace --locked
+      - run: cargo build --workspace --profile test --locked
       - run: bash ../../scripts/native-generate-types.sh --check
+        env:
+          # Reuse the optimized test dependencies for cargo run in this script.
+          CARGO_PROFILE_DEV_OPT_LEVEL: 1
       - run: python3 scripts/smoke.py target/debug/wx
