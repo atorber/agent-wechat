@@ -6,6 +6,7 @@ on:
       - 'packages/native-client-rust/**'
       - 'packages/shared/src/native*'
       - 'scripts/native-generate-types.sh'
+      - 'scripts/native-ci-cache-key*.py'
       - '.github/workflows/native-client.yml'
   push:
     branches: [main]
@@ -13,10 +14,23 @@ on:
       - 'packages/native-client-rust/**'
       - 'packages/shared/src/native*'
       - 'scripts/native-generate-types.sh'
+      - 'scripts/native-ci-cache-key*.py'
       - '.github/workflows/native-client.yml'
 
 permissions:
   contents: read
+
+concurrency:
+  group: native-client-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the contract generator and tests on the same dependency profile.
+  # Debug assertions remain enabled; large debug symbols only slow CI linking.
+  CARGO_PROFILE_DEV_OPT_LEVEL: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  FFMPEG_RELEASE: b6.1.1
 
 jobs:
   native:
@@ -24,6 +38,16 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        suite: [lint, test]
+        include:
+          - runner: ubuntu-24.04
+            ffmpeg_arch: x64
+            ffmpeg_sha256: bfe8a8fc511530457b528c48d77b5737527b504a3797a9bc4866aeca69c2dffa
+            ffprobe_sha256: 25d9b6ccb05e3d9de9e04e31e2506d8dd7f9f0418981965ac6df12e8d3afd067
+          - runner: ubuntu-24.04-arm
+            ffmpeg_arch: arm64
+            ffmpeg_sha256: 754a678672298bc68156adff58aa7385a592c2b30b1d0ae8750c45c915c4bac0
+            ffprobe_sha256: 2ab6aba60ee84412dff9188720703376cb4e7aaf7e0b5e43aa8249f2acae5bf8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
@@ -31,6 +55,9 @@ jobs:
         working-directory: packages/native-client-rust
     steps:
       - uses: actions/checkout@v4
+      - name: Identify native build dependencies
+        id: cache-key
+        run: python ../../scripts/native-ci-cache-key.py rust --github-output
       - uses: dtolnay/rust-toolchain@stable
         id: rust
         with:
@@ -42,19 +69,54 @@ jobs:
           # The automatic hash includes unused preinstalled toolchains, which
           # differ across runner images. Key the compiler we actually select.
           add-rust-environment-hash-key: false
-          key: native-${{ matrix.runner }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('packages/native-client-rust/**/Cargo.toml', 'packages/native-client-rust/Cargo.lock', 'packages/native-client-rust/**/.cargo/config*', '.cargo/config*') }}
-      - run: cargo fmt --all --check
-      - name: Ensure image decoder runtime
-        run: |
-          if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends ffmpeg
-          fi
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo build --workspace --profile test --locked
-      - run: bash ../../scripts/native-generate-types.sh --check
+          key: native-${{ matrix.runner }}-${{ matrix.suite }}-${{ steps.rust.outputs.cachekey }}-opt${{ env.CARGO_PROFILE_DEV_OPT_LEVEL }}-debug${{ env.CARGO_PROFILE_DEV_DEBUG }}-${{ env.CARGO_PROFILE_TEST_DEBUG }}-${{ steps.cache-key.outputs.rust }}
+      - if: matrix.suite == 'lint'
+        run: python ../../scripts/native-ci-cache-key.test.py
+      - if: matrix.suite == 'lint'
+        run: cargo fmt --all --check
+      - if: matrix.suite == 'lint'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Restore pinned image decoder runtime
+        if: matrix.suite == 'test'
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/native-ffmpeg
+          key: native-ffmpeg-${{ runner.arch }}-${{ env.FFMPEG_RELEASE }}-${{ matrix.ffmpeg_sha256 }}-${{ matrix.ffprobe_sha256 }}
+      - name: Install verified image decoder runtime
+        if: matrix.suite == 'test' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         env:
-          # Reuse the optimized test dependencies for cargo run in this script.
-          CARGO_PROFILE_DEV_OPT_LEVEL: 1
-      - run: python3 scripts/smoke.py target/debug/wx
+          FFMPEG_ARCH: ${{ matrix.ffmpeg_arch }}
+          FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
+          FFPROBE_SHA256: ${{ matrix.ffprobe_sha256 }}
+        run: |
+          base="https://github.com/eugeneware/ffmpeg-static/releases/download/$FFMPEG_RELEASE"
+          mkdir -p "$RUNNER_TEMP/native-ffmpeg/bin"
+          for media_tool in ffmpeg ffprobe; do
+            archive="$RUNNER_TEMP/$media_tool.gz"
+            expected_sha="$FFMPEG_SHA256"
+            if [ "$media_tool" = ffprobe ]; then expected_sha="$FFPROBE_SHA256"; fi
+            curl --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
+              "$base/$media_tool-linux-$FFMPEG_ARCH.gz" --output "$archive"
+            printf '%s  %s\n' "$expected_sha" "$archive" | sha256sum --check
+            gzip --decompress --stdout "$archive" > "$RUNNER_TEMP/native-ffmpeg/bin/$media_tool"
+            chmod 755 "$RUNNER_TEMP/native-ffmpeg/bin/$media_tool"
+          done
+          curl --fail --location --retry 3 "$base/linux-$FFMPEG_ARCH.LICENSE" \
+            --output "$RUNNER_TEMP/native-ffmpeg/LICENSE"
+          printf '%s  %s\n' 8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903 \
+            "$RUNNER_TEMP/native-ffmpeg/LICENSE" | sha256sum --check
+      - name: Enable the pinned image decoder
+        if: matrix.suite == 'test'
+        run: |
+          "$RUNNER_TEMP/native-ffmpeg/bin/ffmpeg" -version
+          "$RUNNER_TEMP/native-ffmpeg/bin/ffprobe" -version
+          echo "$RUNNER_TEMP/native-ffmpeg/bin" >> "$GITHUB_PATH"
+      - if: matrix.suite == 'test'
+        run: cargo test --workspace --locked
+      - if: matrix.suite == 'test'
+        run: cargo build --workspace --profile test --locked
+      - if: matrix.suite == 'test'
+        run: bash ../../scripts/native-generate-types.sh --check
+      - if: matrix.suite == 'test'
+        run: python3 scripts/smoke.py target/debug/wx

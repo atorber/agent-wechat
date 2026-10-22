@@ -13,6 +13,55 @@ on:
 permissions:
   contents: read
 jobs:
+  platform-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify dependency cache identities
+        run: python scripts/native-ci-cache-key.test.py
+      - name: Verify compiler completion and failure propagation
+        run: python scripts/native-ci-build.test.py
+      - name: Identify native build dependencies
+        id: cache-key
+        run: python scripts/native-ci-cache-key.py rust --github-output
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust
+        with:
+          toolchain: 1.93.1
+          targets: ${{ matrix.target }}
+      - name: Select native Windows compiler
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/native-client-rust -> target
+          add-rust-environment-hash-key: false
+          key: portable-tests-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.RUSTFLAGS }}-debug${{ env.CARGO_PROFILE_TEST_DEBUG }}-${{ steps.cache-key.outputs.rust }}
+      - name: Test Unix platform primitives and media
+        if: runner.os != 'Windows'
+        run: cargo test -p wechat-platform -p wechat-media --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
+      # Git Bash prepends its coreutils link.exe ahead of the MSVC linker.
+      - name: Test Windows platform primitives and media
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo test -p wechat-platform -p wechat-media --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
+
   build:
     strategy:
       fail-fast: false
@@ -26,23 +75,22 @@ jobs:
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      # Include the actual Windows flags in cache identity, not just build steps.
+      RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
+      - name: Identify installed and native build dependencies
+        id: cache-key
+        run: python scripts/native-ci-cache-key.py all --github-output
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           toolchain: 1.93.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: packages/native-client-rust
-          key: portable-${{ matrix.target }}
       - name: Select native Windows compiler
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -53,27 +101,52 @@ jobs:
         run: |
           if [ ! -x /c/Strawberry/perl/bin/perl.exe ]; then choco install strawberryperl --no-progress -y; fi
           echo 'C:\Strawberry\perl\bin' >> "$GITHUB_PATH"
-      - run: pnpm install --frozen-lockfile
+      - name: Restore an executable built from identical Windows inputs
+        if: runner.os == 'Windows'
+        id: native-executable
+        uses: actions/cache@v4
+        with:
+          path: packages/native-client-rust/target/${{ matrix.target }}/release/wx.exe
+          # No fallback keys: all native inputs and the build driver must match.
+          key: native-executable-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.WindowsSDKVersion }}-${{ env.RUSTFLAGS }}-${{ hashFiles('packages/native-client-rust/**', '!packages/native-client-rust/**/target/**', '.cargo/config*', '.gitattributes', 'scripts/native-ci-build.py', '.github/workflows/native-portable.yml') }}
+      - uses: Swatinem/rust-cache@v2
+        if: steps.native-executable.outputs.cache-hit != 'true'
+        with:
+          workspaces: packages/native-client-rust -> target
+          # Preinstalled unused Rust toolchains vary between runner images.
+          # Pin cache identity to our compiler, target, flags and MSVC version.
+          add-rust-environment-hash-key: false
+          key: portable-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.RUSTFLAGS }}-${{ steps.cache-key.outputs.rust }}
+      - name: Start Unix release compiler
+        if: runner.os != 'Windows'
+        run: python scripts/native-ci-build.py start ${{ matrix.target }}
+      - name: Start Windows release compiler
+        if: runner.os == 'Windows' && steps.native-executable.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: python scripts/native-ci-build.py start ${{ matrix.target }}
+      # Dependency setup is independent of Cargo and can overlap compilation.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/cache@v4
+        id: node-modules
+        with:
+          path: |
+            node_modules
+            packages/*/node_modules
+          # Node 24 patch releases share the native module ABI.
+          key: portable-pnpm-${{ runner.os }}-${{ runner.arch }}-node24-${{ steps.cache-key.outputs.pnpm }}
+          restore-keys: |
+            portable-pnpm-${{ runner.os }}-${{ runner.arch }}-node24-
+            portable-pnpm-${{ runner.os }}-${{ runner.arch }}-v24.
+      # Recreate junctions after restore: Windows archives may point at another
+      # runner's workspace. Existing package bytes still avoid a full install.
+      - run: pnpm install --frozen-lockfile --prefer-offline --filter @agent-wechat/agent-wechat...
       - run: pnpm --filter @agent-wechat/agent-wechat... build
-      - name: Test Unix platform primitives and media
-        if: runner.os != 'Windows'
-        run: cargo test -p wechat-platform -p wechat-media --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
-      # Git Bash prepends its coreutils link.exe ahead of the MSVC linker.
-      - name: Test Windows platform primitives and media
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo test -p wechat-platform -p wechat-media --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
-      - name: Build Unix release executable
-        if: runner.os != 'Windows'
-        run: cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
-      - name: Build Windows release executable
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }}
+      - name: Require a successful release build
+        if: steps.native-executable.outputs.cache-hit != 'true'
+        run: python scripts/native-ci-build.py wait
       - name: Check Windows standalone runtime dependencies
         if: runner.os == 'Windows'
         shell: pwsh
@@ -88,8 +161,15 @@ jobs:
       - name: Validate actual executable and npm installation
         run: |
           BINARY=$(node --input-type=module -e "import {assetName} from './packages/cli/scripts/native-runtime.mjs'; import fs from 'node:fs'; console.log('artifacts/native/'+assetName(JSON.parse(fs.readFileSync('packages/cli/package.json')).version))")
-          node scripts/native-platform-smoke.mjs "$BINARY"
-          node scripts/native-package-smoke.mjs artifacts/native
+          # Both checks read the artifact and create independent temporary data.
+          node scripts/native-platform-smoke.mjs "$BINARY" &
+          platform_smoke=$!
+          node scripts/native-package-smoke.mjs artifacts/native &
+          package_smoke=$!
+          smoke_status=0
+          wait "$platform_smoke" || smoke_status=1
+          wait "$package_smoke" || smoke_status=1
+          exit "$smoke_status"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix || 'native-validation' }}-${{ matrix.target }}
