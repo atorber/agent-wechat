@@ -7,8 +7,10 @@ use std::{
     path::Path,
     process::Command,
 };
+mod network;
 #[cfg(windows)]
 mod windows;
+pub use network::local_ipv4_addresses;
 
 #[cfg(unix)]
 pub const NOFOLLOW: i32 = libc::O_NOFOLLOW;
