@@ -467,7 +467,7 @@ impl Core {
         ids: &[String],
     ) -> Result<MetadataReply<ContactLookup>> {
         let mut state = self.account_state(account)?;
-        let native = client()?;
+        let native = self.upstream.native(NativeOptions::default())?;
         let capture =
             |state: &mut wechat_protocol::AccountState| -> Result<MetadataReply<ContactLookup>> {
                 let raw = native.lookup_contacts_raw(state, ids)?;
@@ -558,7 +558,10 @@ impl Core {
             MetadataAction::Members { group_id, version } => {
                 self.metadata_contact_lookup(account, std::slice::from_ref(&group_id))?;
                 let mut state = self.account_state(account)?;
-                let reply = client()?.lookup_room_receipt(&mut state, &group_id, version)?;
+                let reply = self
+                    .upstream
+                    .native(NativeOptions::default())?
+                    .lookup_room_receipt(&mut state, &group_id, version)?;
                 self.save_state(account, &state)?;
                 let fields = p::decode(&reply.raw)?;
                 let members = p::decode(p::data(&fields, 4)?)?;
@@ -591,6 +594,7 @@ impl Core {
                 )?;
                 self.apply_metadata_receipt(account, &id, false)?;
                 self.metadata_check(account, operation, deadline)?;
+                crate::upstream::require_native(self.upstream.kind())?;
                 let bytes = wechat_protocol::media::download_advertised_avatar(&source)?;
                 let id = self.stage_metadata_body(
                     account,
@@ -670,8 +674,10 @@ impl Core {
                 pending
             } else {
                 let mut state = self.account_state(account)?;
-                let reply =
-                    client()?.init_contacts_receipt(&mut state, sequences.0, sequences.1)?;
+                let reply = self
+                    .upstream
+                    .native(NativeOptions::default())?
+                    .init_contacts_receipt(&mut state, sequences.0, sequences.1)?;
                 self.save_state(account, &state)?;
                 let id =
                     self.stage_metadata_body(account, ReceiptBody::ContactCatalog(reply.clone()))?;
@@ -766,7 +772,10 @@ impl Core {
             }
             self.metadata_check(account, operation, deadline)?;
             let mut state = self.account_state(account)?;
-            let page = client()?.group_inventory(&mut state, &cursor)?;
+            let page = self
+                .upstream
+                .native(NativeOptions::default())?
+                .group_inventory(&mut state, &cursor)?;
             self.save_state(account, &state)?;
             let more = page.more;
             let wait = page.wait_seconds;

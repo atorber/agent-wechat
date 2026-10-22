@@ -14,7 +14,7 @@ use wechat_protocol::{
         CdnClient, MediaDescriptor, MediaQuality, PreparedImageUpload, PreparedUpload,
         PreparedVideoUpload, StickerDescriptor, UploadedImage, UploadedMedia, UploadedVideo,
     },
-    NativeClient, NativeOptions,
+    NativeOptions,
 };
 use wechat_store::{MediaAssetRecord, MediaJobRecord, OwnedMediaSource};
 #[path = "media_identity.rs"]
@@ -899,6 +899,7 @@ impl Core {
         if asset.state == "available" {
             return self.complete_download(account, id, &asset);
         }
+        crate::upstream::require_native(self.upstream.kind())?;
         let plan = self.asset_plan(account, &stored)?.plan;
         let link_thumbnail = matches!(&plan, DownloadPlan::LinkThumbnail { .. });
         let progress = |n, t: Option<u64>| {
@@ -918,7 +919,7 @@ impl Core {
                 source: crate::links::LinkThumbnail::Cdn(descriptor),
             } => {
                 let mut state = self.account_state(account)?;
-                let native = NativeClient::new(NativeOptions::default())?;
+                let native = self.upstream.native(NativeOptions::default())?;
                 let conf = match native.cdn_config(&mut state) {
                     Ok(conf) => conf,
                     Err(error) if is_media_auth_rejected(&error) => {
@@ -990,7 +991,7 @@ impl Core {
                     .unwrap_or_default();
                 if bytes.is_empty() {
                     let mut state = self.account_state(account)?;
-                    let native = NativeClient::new(NativeOptions::default())?;
+                    let native = self.upstream.native(NativeOptions::default())?;
                     let mut renewed = false;
                     while bytes.len() < length as usize {
                         progress(bytes.len() as u64, Some(length as u64))?;
@@ -1787,7 +1788,7 @@ impl Core {
         )?)?;
         self.progress_media(account, id, 0, None)?;
         let (source, bytes) = self.source_bytes(account, &plan.request.source_id)?;
-        let native = NativeClient::new(NativeOptions::default())?;
+        let native = self.upstream.native(NativeOptions::default())?;
         let mut state = self.account_state(account)?;
         if plan.request.kind == MediaKind::Video && plan.request.play_seconds.is_none() {
             plan.request.play_seconds = Some(video_duration(&bytes, || {
