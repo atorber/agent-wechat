@@ -19,7 +19,7 @@ try {
   await mkdir(staged);
   for (const name of ['package.json', 'README.md', 'THIRD_PARTY_NOTICES.txt', 'scripts']) await cp(join(source, name), join(staged, name), { recursive: true });
   await writeFile(join(staged, 'native-release.json'), JSON.stringify(manifest));
-  const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', temporary], { cwd: staged, maxBuffer: 1024 * 1024 });
+  const { stdout } = await exec(process.platform === 'win32' ? process.execPath : 'npm', [...(process.platform === 'win32' ? [join(process.execPath, '..', 'node_modules', 'npm', 'bin', 'npm-cli.js')] : []), 'pack', '--json', '--pack-destination', temporary], { cwd: staged, maxBuffer: 1024 * 1024 });
   const [packed] = JSON.parse(stdout);
   const names = packed.files.map(file => file.path);
   for (const required of ['native-release.json', 'THIRD_PARTY_NOTICES.txt', 'scripts/native-launcher.mjs', 'scripts/native-runtime.mjs', 'scripts/native-install.mjs']) assert.ok(names.includes(required), `Missing ${required}`);
@@ -28,7 +28,9 @@ try {
   assert.ok(!names.some(name => name.startsWith('src/') || name.startsWith('test/') || name.startsWith('native/')));
   const unpacked = join(temporary, 'unpacked');
   await mkdir(unpacked);
-  await exec('tar', ['-xzf', join(temporary, packed.filename), '-C', unpacked]);
+  // Git Bash's GNU tar interprets a Windows drive prefix as a remote host.
+  // Relative paths work with both that tar and Windows' built-in bsdtar.
+  await exec('tar', ['-xzf', packed.filename, '-C', 'unpacked'], { cwd: temporary });
   const root = join(unpacked, 'package');
   const launcher = join(root, 'scripts/native-launcher.mjs');
   await assert.rejects(exec(process.execPath, [launcher, '--json', 'version']), /not installed/);
@@ -44,7 +46,7 @@ try {
   assert.ok(identity.capabilities.includes('serve'));
   // Exercise the same canonical npm-bin symlink/payload adapter used by managed
   // OpenClaw hosting; this creates only temporary empty account slots.
-  const bin = join(temporary, 'bin'); await mkdir(bin); await symlink(launcher, join(bin, 'wx'));
-  await exec(process.execPath, ['--experimental-strip-types', resolve('scripts/native-openclaw-smoke.mjs'), join(bin, 'wx')], { maxBuffer: 1024 * 1024 });
+  const bin = join(temporary, 'bin'); await mkdir(bin); if (process.platform === 'win32') { await cp(root, join(bin, 'node_modules', '@agent-wechat', 'cli'), { recursive: true }); } else await symlink(launcher, join(bin, 'wx'));
+  await exec(process.execPath, ['--experimental-strip-types', resolve('scripts/native-openclaw-smoke.mjs'), process.platform === 'win32' ? join(bin, 'node_modules', '@agent-wechat', 'cli', 'scripts', 'native-launcher.mjs') : join(bin, 'wx')], { maxBuffer: 1024 * 1024 });
   console.log(`Tarball verified: ${packed.filename}; offline installation and native identity passed. No global installation or network download occurred.`);
 } finally { await rm(temporary, { recursive: true, force: true }); }

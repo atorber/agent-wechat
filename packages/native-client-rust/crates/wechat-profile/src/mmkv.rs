@@ -472,7 +472,7 @@ fn safe_pair_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
         &target.with_file_name(format!("{}.crc", name.to_string_lossy())),
     ] {
         let m = std::fs::symlink_metadata(p)?;
-        if !m.is_file() || m.file_type().is_symlink() {
+        if !m.is_file() || wechat_platform::is_link(&m) {
             return Err(ProfileError::UnsupportedFile);
         }
     }
@@ -481,13 +481,13 @@ fn safe_pair_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
 fn replace_mmkv_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or(ProfileError::InvalidQuery)?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    let mut staged = wechat_platform::private_tempfile_in(parent, ".wx-mmkv-")?;
     staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
     staged
         .persist(path)
         .map_err(|e| ProfileError::Io(e.error))?;
-    std::fs::File::open(parent)?.sync_all()?;
+    wechat_platform::sync_dir(parent)?;
     Ok(())
 }
 /// Publish a previously staged append while the caller holds exclusive profile
@@ -659,7 +659,7 @@ pub fn publish_mmkv_create(
     fn exists_exact(path: &Path, bytes: &[u8]) -> Result<bool> {
         match fs::symlink_metadata(path) {
             Ok(m) => {
-                if !m.is_file() || m.file_type().is_symlink() {
+                if !m.is_file() || wechat_platform::is_link(&m) {
                     return Err(ProfileError::UnsupportedFile);
                 }
                 if m.len() != bytes.len() as u64 {
@@ -679,12 +679,12 @@ pub fn publish_mmkv_create(
     let meta_exists = exists_exact(&meta, staged.metadata())?;
     fn create(path: &Path, bytes: &[u8]) -> Result<()> {
         let parent = path.parent().ok_or(ProfileError::InvalidQuery)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        let mut temp = wechat_platform::private_tempfile_in(parent, ".wx-mmkv-")?;
         temp.write_all(bytes)?;
         temp.as_file().sync_all()?;
         temp.persist_noclobber(path)
             .map_err(|e| ProfileError::Io(e.error))?;
-        fs::File::open(parent)?.sync_all()?;
+        wechat_platform::sync_dir(parent)?;
         Ok(())
     }
     if !data_exists {
