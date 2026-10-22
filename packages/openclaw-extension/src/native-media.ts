@@ -48,6 +48,15 @@ export async function waitNativeMediaSendReceipts(client: NativeWeChatClient, ac
   }
   return job;
 }
+/**
+ * How long an outbound media send may run before it is reported for inspection.
+ * Uploads and readback both use 64 KiB CDN ranges, so the allowance grows with
+ * size (16 s per MiB, about 0.5 s per range each way). The daemon job continues
+ * past this wait; it only bounds how long the caller blocks.
+ */
+export function nativeMediaSendWaitMs(byteLength: number, audioAsVoice = false): number {
+  return audioAsVoice ? 25 * 60000 : 65000 + Math.ceil(Math.max(0, byteLength) / (1024 * 1024)) * 16000;
+}
 export async function waitNativeMediaJob(client: NativeWeChatClient, accountId: string, initial: MediaJob, timeoutMs = 65000, signal?: AbortSignal, assertCurrent?: () => void): Promise<MediaJob> {
   const deadline = Date.now() + timeoutMs; let job = initial; let delay = 250;
   while (!terminalJobs.has(job.state) && Date.now() < deadline) {
@@ -318,7 +327,7 @@ export async function sendNativeAttachment(client: NativeWeChatClient, account: 
   const accountId = account.native!.accountId; const source = await client.upload(accountId, bytes, filename, mime);
   const input: MediaSendRequest = { threadId, kind: audioAsVoice ? "voice" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : "file", sourceId: source.id, standardSourceId: null, thumbnailSourceId: null, playSeconds: null, durationMs: null };
   await beforeSend?.();
-  let job = await waitNativeMediaJob(client, accountId, await client.sendMedia(accountId, input, key), audioAsVoice ? 25 * 60000 : 65000);
+  let job = await waitNativeMediaJob(client, accountId, await client.sendMedia(accountId, input, key), nativeMediaSendWaitMs(bytes.length, audioAsVoice));
   if (successfulSendJobs.has(job.state)) job = await waitNativeMediaSendReceipts(client, accountId, threadId, job, audioAsVoice);
   if (!successfulSendJobs.has(job.state)) throw new Error(`Native media job ${job.id} requires inspection (${job.state}); retain completed items and do not automatically resend`);
   const result = mediaSendResult(job);

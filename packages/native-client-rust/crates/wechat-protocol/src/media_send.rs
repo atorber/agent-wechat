@@ -1,7 +1,7 @@
 //! Final media-message metadata. CDN upload and message submission are separate
 //! steps; persist source bytes, generated keys and intent before either step.
 use crate::{
-    media::{MediaQuality, UploadedImage, UploadedMedia, UploadedVideo},
+    media::{MediaQuality, UploadedImage, UploadedMedia, UploadedVideo, MAX_NATIVE_UPLOAD_BYTES},
     protobuf as p,
     wire::base_request,
     AccountState,
@@ -27,7 +27,7 @@ fn descriptor(v: &UploadedMedia, kind: MediaQuality) -> Result<()> {
         v.descriptor.quality == kind
             && v.descriptor.aes_key.len() == 16
             && v.plaintext_bytes > 0
-            && v.plaintext_bytes <= 25 * 1024 * 1024,
+            && v.plaintext_bytes as usize <= MAX_NATIVE_UPLOAD_BYTES,
         "Invalid uploaded media descriptor"
     );
     clean(&v.descriptor.file_id, 8192)?;

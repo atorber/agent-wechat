@@ -5,6 +5,9 @@ use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use ts_rs::TS;
 
+/// Largest owned media source the sidecar store accepts.
+pub const MAX_MEDIA_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+const _: () = assert!(MAX_MEDIA_SOURCE_BYTES as usize <= crate::vault::MAX_PROTECTED_RECORD_BYTES);
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedMediaSource {
@@ -173,7 +176,7 @@ impl Store {
                 || name.len() > 255
                 || media_type.len() > 128
                 || byte_length == 0
-                || byte_length > 128 * 1024 * 1024
+                || byte_length > MAX_MEDIA_SOURCE_BYTES
                 || sha256.len() != 64
             {
                 bail!("invalid media source");

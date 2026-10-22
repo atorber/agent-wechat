@@ -181,7 +181,7 @@ test('whole-thread reads require a bounded optimistic version', async () => {
  for(const invalid of ['', 'x'.repeat(129), ['old-message-selection']]) assert.throws(()=>client.markRead('a','t',invalid));
 });
 test('media upload native limit is generated from the daemon contract and refuses before transport', async () => {
- let calls=0;const client=new NativeWeChatClient({...options,fetch:async()=>{calls++;throw Error('unexpected transport');}});assert.equal(NATIVE_MAX_SOURCE_BYTES,25*1024*1024-17);await assert.rejects(client.upload('a',new Uint8Array(NATIVE_MAX_SOURCE_BYTES+1),'fixture.bin'));assert.equal(calls,0);
+ let calls=0;const client=new NativeWeChatClient({...options,fetch:async()=>{calls++;throw Error('unexpected transport');}});assert.equal(NATIVE_MAX_SOURCE_BYTES,100*1024*1024);await assert.rejects(client.upload('a',new Uint8Array(NATIVE_MAX_SOURCE_BYTES+1),'fixture.bin'));assert.equal(calls,0);
 });
 
 test('local media writeback repair is bounded and does not submit a send or transfer', async () => {

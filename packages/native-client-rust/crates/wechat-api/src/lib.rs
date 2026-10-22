@@ -1763,6 +1763,40 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn multipart_uploads_above_the_previous_cdn_bound_are_staged() {
+        let (_temp, _core, app) = setup();
+        // 40 MiB exceeds both the previous 25 MiB source cap and the previous
+        // 32 MiB protected-record bound used to seal owned sources.
+        let size = 40 * 1024 * 1024;
+        assert!(size > 32 * 1024 * 1024);
+        assert!(size < wechat_core::MAX_SOURCE_BYTES);
+        let mut body = b"--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.bin\"\r\n\r\n".to_vec();
+        let start = body.len();
+        body.extend((0..size).map(|i| (i % 251) as u8));
+        let digest = format!("{:x}", Sha256::digest(&body[start..]));
+        body.extend_from_slice(b"\r\n--test-boundary--\r\n");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/accounts/one/uploads")
+                    .header("authorization", format!("Bearer {OWNER}"))
+                    .header(
+                        "content-type",
+                        "multipart/form-data; boundary=test-boundary",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let source: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(source["byteLength"], size);
+        assert_eq!(source["sha256"], digest);
+    }
+    #[tokio::test]
     async fn multipart_uploads_are_owned_bounded_and_never_return_original_bytes() {
         let (_temp, _core, app) = setup();
         let content = "private synthetic file";
@@ -1792,8 +1826,11 @@ mod tests {
             format!("{:x}", Sha256::digest(content.as_bytes()))
         );
         assert!(!String::from_utf8_lossy(&body).contains(content));
-        let oversized = "x".repeat(wechat_core::MAX_SOURCE_BYTES + 1);
-        let body=format!("--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large\"\r\n\r\n{oversized}\r\n--test-boundary--\r\n");
+        // Build the oversized body once; the limit is now large enough that a
+        // formatted String copy would double this test's memory.
+        let mut body = b"--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large\"\r\n\r\n".to_vec();
+        body.resize(body.len() + wechat_core::MAX_SOURCE_BYTES + 1, b'x');
+        body.extend_from_slice(b"\r\n--test-boundary--\r\n");
         let response = app
             .oneshot(
                 Request::builder()

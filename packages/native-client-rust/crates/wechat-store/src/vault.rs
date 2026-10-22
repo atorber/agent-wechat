@@ -11,6 +11,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Largest plaintext in one protected record. Owned media sources and cached
+/// sent media are single records, so this must cover the media source bound.
+pub const MAX_PROTECTED_RECORD_BYTES: usize = 128 * 1024 * 1024;
 pub struct Vault {
     key: Zeroizing<Vec<u8>>,
 }
@@ -51,7 +54,7 @@ impl Vault {
         Ok(Self { key })
     }
     pub fn seal(&self, account: &str, purpose: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-        if plaintext.len() > 32 * 1024 * 1024 {
+        if plaintext.len() > MAX_PROTECTED_RECORD_BYTES {
             bail!("protected record exceeds limit");
         }
         let mut nonce = [0u8; 12];
@@ -78,7 +81,7 @@ impl Vault {
         purpose: &str,
         record: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>> {
-        if record.len() < 29 || record[0] != 1 || record.len() > 32 * 1024 * 1024 + 29 {
+        if record.len() < 29 || record[0] != 1 || record.len() > MAX_PROTECTED_RECORD_BYTES + 29 {
             bail!("invalid protected record");
         }
         let aad = format!("agent-wechat:1:{account}:{purpose}");

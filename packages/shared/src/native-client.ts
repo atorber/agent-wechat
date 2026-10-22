@@ -48,10 +48,10 @@ export class NativeWeChatClient {
     this.streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? 45000;
     if (!Number.isInteger(this.streamIdleTimeoutMs) || this.streamIdleTimeoutMs < 1 || this.streamIdleTimeoutMs > 300000) throw new Error("Invalid native stream idle timeout");
   }
-  private async response(path: string, init: RequestInit = {}, stream = false): Promise<Response> {
+  private async response(path: string, init: RequestInit = {}, stream = false, timeoutMs = this.timeoutMs): Promise<Response> {
     const headers = new Headers(init.headers); headers.set("Authorization", `Bearer ${this.token}`);
     if (init.body != null && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
-    const timeout = stream ? undefined : AbortSignal.timeout(this.timeoutMs);
+    const timeout = stream ? undefined : AbortSignal.timeout(timeoutMs);
     const signal = init.signal && timeout ? AbortSignal.any([init.signal, timeout]) : init.signal ?? timeout;
     const response = await this.fetchImpl(new URL(path, this.baseUrl), { ...init, headers, redirect: "error", signal });
     if (!response.ok) {
@@ -83,10 +83,10 @@ export class NativeWeChatClient {
     for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
     return result;
   }
-  async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  async request<T>(path: string, init: RequestInit = {}, timeoutMs = this.timeoutMs): Promise<T> {
     // Paths are constructed by these methods, never supplied as caller URLs.
     if (!path.startsWith("v1/") || path.includes("://")) throw new Error("Invalid native API path");
-    const response = await this.response(path, init);
+    const response = await this.response(path, init, false, timeoutMs);
     if (response.status === 204) return undefined as T;
     return JSON.parse(new TextDecoder().decode(await this.readBounded(response))) as T;
   }
@@ -194,7 +194,8 @@ export class NativeWeChatClient {
   async upload(accountId: string, bytes: Uint8Array, name: string, contentType = "application/octet-stream", signal?: AbortSignal): Promise<OwnedMediaSource> {
     if (!bytes.length || bytes.length > NATIVE_MAX_SOURCE_BYTES || !name || name.length > 255 || /[\r\n/\\]/.test(name)) throw new Error("Invalid bounded media upload");
     const form = new FormData(); form.set("file", new Blob([new Uint8Array(bytes).buffer], { type: contentType }), name);
-    return this.request(`v1/accounts/${id(accountId)}/uploads`, { method: "POST", body: form, signal });
+    // Sources may be up to NATIVE_MAX_SOURCE_BYTES; allow one extra second per MiB.
+    return this.request(`v1/accounts/${id(accountId)}/uploads`, { method: "POST", body: form, signal }, this.timeoutMs + Math.ceil(bytes.length / (1024 * 1024)) * 1000);
   }
   sendMedia(accountId: string, input: MediaSendRequest, key: string): Promise<MediaJob> { if (!key || /[\r\n]/.test(key)) throw new Error("An idempotency key is required"); return this.request(`v1/accounts/${id(accountId)}/sends`, { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify(input) }); }
   mediaAssets(accountId: string, messageId: string): Promise<{ items: MediaAsset[] }> { return this.request(`v1/accounts/${id(accountId)}/messages/${id(messageId)}/media`); }

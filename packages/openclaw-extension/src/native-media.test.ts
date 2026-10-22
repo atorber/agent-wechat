@@ -5,7 +5,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { NativeApiError, type NativeMessage, type NativeWeChatClient, type MediaAsset, type MediaJob } from "@agent-wechat/shared";
-import { prepareNativeAttachment, sendNativeAttachment, waitNativeMediaSendReceipts } from "./native-media.ts";
+import { nativeMediaSendWaitMs, prepareNativeAttachment, sendNativeAttachment, waitNativeMediaSendReceipts } from "./native-media.ts";
 import { resolveWeChatAccount } from "./types.ts";
 const account=resolveWeChatAccount({channels:{"agent-wechat":{backend:"native",native:{mode:"external",accountId:"a",endpoint:"http://127.0.0.1:6174",token: "synthetic-native-token-".repeat(3),consumerStateDir:"/unused"}}}})!;
 const message={id:"m",accountId:"a",threadId:"u",type:3} as NativeMessage;
@@ -445,4 +445,11 @@ test("recalled or replaced link sources never restore their original metadata th
   const client = { mediaAssets: async () => ({ items: [asset({ state: "recalled", variant: "thumbnail", actualVariant: null })] }) } as unknown as NativeWeChatClient;
   const result = await prepareNativeAttachment({ client, account, message: linkMessage, core: {} });
   assert.equal(result.body, "[Message recalled]"); assert.equal(result.reason, "message_recalled");
+});
+test("outbound media wait grows with source size and keeps the voice allowance", () => {
+  assert.equal(nativeMediaSendWaitMs(0), 65000);
+  assert.equal(nativeMediaSendWaitMs(1), 81000);
+  assert.equal(nativeMediaSendWaitMs(1024 * 1024), 81000);
+  assert.equal(nativeMediaSendWaitMs(100 * 1024 * 1024), 65000 + 100 * 16000);
+  assert.equal(nativeMediaSendWaitMs(100 * 1024 * 1024, true), 25 * 60000);
 });

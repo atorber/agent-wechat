@@ -27,9 +27,12 @@ The crate includes QR login, QR polling/approval exchange, saved-device phone
 approval, trusted AutoAuth renewal, NewSync cursor merging, heartbeat, text send,
 known contact and group lookups, contact bootstrap pages, avatar bytes and voice
 download chunks. The CDN module supports authenticated routing bootstrap, bounded
-encrypted range downloads and uploads below the native 25 MiB big-file branch,
-supplied JPEG image variants and MP4/thumbnail uploads. Metadata finalizers cover
-files, images, videos and bounded SILK voice notes. The bundled portable SILK SDK
+encrypted range downloads (25 MiB for incoming media), standard-branch range
+uploads up to 100 MiB with streamed full readback verification, supplied JPEG
+image variants and MP4/thumbnail uploads. The observed native client switches to
+a separate big-file branch at 25 MiB; that branch is not implemented, and
+standard-branch uploads above 25 MiB still require live validation. Metadata
+finalizers cover files, images, videos and bounded SILK voice notes. The bundled portable SILK SDK
 encodes fresh mono 16 kHz audio and decodes incoming voice bytes without loading
 an official client codec. A separate core layer owns resizing, input conversion,
 durable jobs, upload readback and uncertain-send handling. Sticker retrieval is

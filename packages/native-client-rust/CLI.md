@@ -230,11 +230,18 @@ returns the same resource; changed input is a conflict. Accepted means native
 server acceptance, not recipient delivery. `needs_review`/partial voice outcomes
 retain completed note IDs and must not automatically resend.
 
-The current native source cap is25MiB−17bytes, below the separate128MiB cached
-HTTP bound. Voice uses independent SILK encoding and splits at10seconds; video
-requires supported MP4 input and server-side FFmpeg preparation. The runtime
-image includes FFmpeg/FFprobe; direct installs must provision these tools for
-source normalization. Large-file branches and sticker sending are unavailable.
+The native source cap is 100 MiB (104,857,600 bytes), below the separate 128 MiB
+cached HTTP bound. Files and videos up to that size use the standard ranged CDN
+upload and are read back in full before the message is submitted. Earlier live
+validation covered sources below 25 MiB; sends between 25 MiB and 100 MiB are
+not yet live-verified, and the official client's separate big-file branch is not
+implemented. The daemon holds a source in memory while sending, so one send can
+transiently use up to about three times the source size. Image sources of any
+accepted size are re-encoded when needed to fit the bounded JPEG variants.
+Voice uses independent SILK encoding and splits at 10 seconds; video requires
+supported MP4 input and server-side FFmpeg preparation. The runtime image
+includes FFmpeg/FFprobe; direct installs must provision these tools for source
+normalization. Sticker sending is unavailable.
 
 ```bash
 wx --account home chats read filehelper --expected-version VERSION

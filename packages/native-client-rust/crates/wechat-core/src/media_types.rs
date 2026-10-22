@@ -3,7 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-pub const MAX_SOURCE_BYTES: usize = 25 * 1024 * 1024 - 17;
+/// Largest owned media source accepted by uploads, the CLI and the SDK. It is
+/// the standard ranged CDN upload bound; see the protocol constant for which
+/// part of that range is live-verified.
+pub const MAX_SOURCE_BYTES: usize = wechat_protocol::media::MAX_NATIVE_UPLOAD_BYTES;
+const _: () = assert!(
+    MAX_SOURCE_BYTES as u64 <= wechat_store::MAX_MEDIA_SOURCE_BYTES
+        && MAX_SOURCE_BYTES <= wechat_store::vault::MAX_PROTECTED_RECORD_BYTES
+        && MAX_SOURCE_BYTES <= wechat_profile::MAX_CACHED_MEDIA_BYTES
+);
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {

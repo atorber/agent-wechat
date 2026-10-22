@@ -5,15 +5,32 @@ use crate::{
     protobuf as p, AccountState,
 };
 use anyhow::{bail, ensure, Result};
-use openssl::symm::Cipher;
+use openssl::{
+    hash::{Hasher, MessageDigest},
+    symm::{Cipher, Crypter, Mode},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, io::Read, net::Ipv4Addr, time::Duration};
 use zeroize::Zeroize;
 pub type CdnFields = BTreeMap<String, Vec<u8>>;
 const MAX_CDN_BODY: usize = 2 * 1024 * 1024;
 const UPLOAD_CHUNK: usize = 65536;
+const RANGE_CHUNK: usize = 65536;
+/// Largest decoded body accepted from an incoming-media CDN download.
 pub const MAX_CDN_TRANSFER_BYTES: usize = 25 * 1024 * 1024;
-pub const MAX_NATIVE_UPLOAD_BYTES: usize = 25 * 1024 * 1024 - 17;
+/// Largest plaintext whose PKCS#7-padded ciphertext (always 1-16 bytes longer)
+/// stays below 25 MiB, the size at which the observed native client switches
+/// to its separate big-file upload branch. This was the previous upload bound;
+/// standard-branch uploads above it have not been live-verified.
+pub const STANDARD_UPLOAD_VERIFIED_BYTES: usize = 25 * 1024 * 1024 - 17;
+/// Largest plaintext accepted by the standard ranged CDN upload. Every upload is
+/// sent as 64 KiB ranges and read back in full before a message is submitted.
+/// The big-file branch (and whatever server metadata it needs) is not
+/// implemented, so sizes above [`STANDARD_UPLOAD_VERIFIED_BYTES`] use the same
+/// standard branch and still require live validation.
+pub const MAX_NATIVE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+const _: () = assert!(MAX_NATIVE_UPLOAD_BYTES >= MAX_CDN_TRANSFER_BYTES);
+const _: () = assert!(MAX_NATIVE_UPLOAD_BYTES < u32::MAX as usize - 16);
 #[path = "avatar.rs"]
 mod avatar;
 pub use avatar::*;
@@ -238,6 +255,172 @@ pub fn decrypt_cdn(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         encrypted,
     )?)
 }
+/// Plaintext length and digests of CDN ciphertext, computed without retaining
+/// the complete plaintext.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaintextDigest {
+    pub plaintext_bytes: usize,
+    pub md5: String,
+    pub sha256: String,
+}
+/// Incremental AES-128-ECB/PKCS#7 decryption that hashes plaintext as it is
+/// produced. ECB blocks are independent, so this matches one-shot decryption.
+struct DecryptDigest {
+    crypter: Crypter,
+    md5: Hasher,
+    sha256: Hasher,
+    encrypted_bytes: usize,
+    plaintext_bytes: usize,
+    max_plaintext: usize,
+    scratch: Vec<u8>,
+}
+impl Drop for DecryptDigest {
+    fn drop(&mut self) {
+        self.scratch.zeroize();
+    }
+}
+impl DecryptDigest {
+    fn new(key: &[u8], max_plaintext: usize) -> Result<Self> {
+        ensure!(key.len() == 16, "Invalid CDN key");
+        Ok(Self {
+            crypter: Crypter::new(Cipher::aes_128_ecb(), Mode::Decrypt, key, None)?,
+            md5: Hasher::new(MessageDigest::md5())?,
+            sha256: Hasher::new(MessageDigest::sha256())?,
+            encrypted_bytes: 0,
+            plaintext_bytes: 0,
+            max_plaintext,
+            scratch: vec![],
+        })
+    }
+    fn update(&mut self, encrypted: &[u8]) -> Result<()> {
+        self.encrypted_bytes += encrypted.len();
+        ensure!(
+            self.encrypted_bytes <= self.max_plaintext + 16,
+            "Invalid CDN ciphertext"
+        );
+        self.scratch.resize(encrypted.len() + 16, 0);
+        let n = self.crypter.update(encrypted, &mut self.scratch)?;
+        self.consume(n)
+    }
+    fn consume(&mut self, n: usize) -> Result<()> {
+        self.plaintext_bytes += n;
+        ensure!(
+            self.plaintext_bytes <= self.max_plaintext,
+            "Decoded CDN body too large"
+        );
+        self.md5.update(&self.scratch[..n])?;
+        self.sha256.update(&self.scratch[..n])?;
+        self.scratch[..n].zeroize();
+        Ok(())
+    }
+    fn finish(mut self) -> Result<PlaintextDigest> {
+        ensure!(
+            self.encrypted_bytes > 0 && self.encrypted_bytes.is_multiple_of(16),
+            "Invalid CDN ciphertext"
+        );
+        self.scratch.resize(32, 0);
+        let n = self.crypter.finalize(&mut self.scratch)?;
+        self.consume(n)?;
+        Ok(PlaintextDigest {
+            plaintext_bytes: self.plaintext_bytes,
+            md5: hex::encode(self.md5.finish()?),
+            sha256: hex::encode(self.sha256.finish()?),
+        })
+    }
+}
+/// Digest CDN ciphertext in bounded pieces instead of materializing plaintext.
+pub fn digest_cdn(encrypted: &[u8], key: &[u8], max_plaintext: usize) -> Result<PlaintextDigest> {
+    let mut digest = DecryptDigest::new(key, max_plaintext)?;
+    for piece in encrypted.chunks(RANGE_CHUNK) {
+        digest.update(piece)?;
+    }
+    digest.finish()
+}
+/// Range-download state for one CDN object. Each reply must continue exactly
+/// at the current position, keep the first advertised total and stay within
+/// the caller's plaintext bound (plus at most one padding block).
+struct RangeDownload {
+    max_plaintext: usize,
+    position: usize,
+    total: usize,
+    substituted_filetype: Option<u32>,
+    picture_format: Option<u32>,
+}
+impl RangeDownload {
+    fn new(max_plaintext: usize) -> Self {
+        Self {
+            max_plaintext,
+            position: 0,
+            total: 0,
+            substituted_filetype: None,
+            picture_format: None,
+        }
+    }
+    /// Requests needed for the largest permitted ciphertext.
+    fn max_requests(&self) -> Result<u32> {
+        Ok(u32::try_from(
+            (self.max_plaintext + 16).div_ceil(RANGE_CHUNK),
+        )?)
+    }
+    fn known_total(&self) -> Option<u64> {
+        (self.total != 0).then_some(self.total as u64)
+    }
+    fn range_end(&self) -> usize {
+        if self.total == 0 {
+            RANGE_CHUNK - 1
+        } else {
+            (self.total - 1).min(self.position + RANGE_CHUNK - 1)
+        }
+    }
+    fn finished(&self) -> bool {
+        self.total > 0 && self.position == self.total
+    }
+    /// Validate one reply and return its ciphertext range.
+    fn accept<'a>(&mut self, reply: &'a CdnFields) -> Result<&'a [u8]> {
+        let code = integer(reply, "retcode")?;
+        ensure!(code == 0, "CDN download returned {code}");
+        let start = usize::try_from(integer(reply, "rangestart")?)?;
+        let end = usize::try_from(integer(reply, "rangeend")?)?;
+        let size = usize::try_from(integer(reply, "totalsize")?)?;
+        let data = reply
+            .get("filedata")
+            .ok_or_else(|| anyhow::anyhow!("Missing CDN payload"))?;
+        ensure!(
+            start == self.position
+                && !data.is_empty()
+                && size > 0
+                && size <= self.max_plaintext + 16
+                && size >= self.position
+                && data.len() <= size - self.position
+                && (self.total == 0 || self.total == size)
+                && end == start + data.len() - 1,
+            "Inconsistent CDN range response"
+        );
+        for (key, target) in [
+            ("substituteftype", &mut self.substituted_filetype),
+            ("rsppicformat", &mut self.picture_format),
+        ] {
+            if reply.contains_key(key) {
+                let value = u32::try_from(integer(reply, key)?)?;
+                ensure!(
+                    target.is_none_or(|previous| previous == value),
+                    "CDN representation changed during transfer"
+                );
+                *target = Some(value);
+            }
+        }
+        self.total = size;
+        self.position += data.len();
+        Ok(data)
+    }
+}
+/// Result of reading back an upload with streamed decryption and hashing.
+#[derive(Clone, Debug)]
+pub struct VerifiedReadback {
+    pub plaintext_bytes: u64,
+    pub md5: String,
+    pub sha256: String,
+}
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -396,11 +579,13 @@ impl PreparedUpload {
                 && self.encrypted.len() == ((self.plaintext_bytes as usize / 16) + 1) * 16,
             "Invalid prepared upload"
         );
-        let raw = decrypt_cdn(&self.encrypted, &self.aes_key)?;
+        // Stream the check: a full plaintext copy would double peak memory for
+        // large sources.
+        let digest = digest_cdn(&self.encrypted, &self.aes_key, MAX_NATIVE_UPLOAD_BYTES)?;
         ensure!(
-            raw.len() == self.plaintext_bytes as usize
-                && hex::encode(md5(&raw)) == self.md5
-                && hex::encode(sha256(&raw)) == self.sha256,
+            digest.plaintext_bytes == self.plaintext_bytes as usize
+                && digest.md5 == self.md5
+                && digest.sha256 == self.sha256,
             "Prepared upload digest mismatch"
         );
         Ok(())
@@ -463,11 +648,15 @@ impl CdnClient {
     pub fn download(&self, descriptor: &MediaDescriptor) -> Result<DownloadedMedia> {
         self.download_with_progress(descriptor, |_, _| Ok(()))
     }
-    pub fn download_with_progress(
+    /// Request every range of one object, handing each validated ciphertext
+    /// range and the advertised total to `sink`.
+    fn download_ranges(
         &self,
         descriptor: &MediaDescriptor,
+        max_plaintext: usize,
         mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
-    ) -> Result<DownloadedMedia> {
+        mut sink: impl FnMut(&[u8], usize) -> Result<()>,
+    ) -> Result<RangeDownload> {
         ensure!(
             !descriptor.file_id.is_empty()
                 && descriptor.file_id.len() <= 8192
@@ -478,79 +667,54 @@ impl CdnClient {
         if let Some(expiry) = descriptor.expires_at {
             ensure!(expiry > crate::wire::unix_time()? as u64, "media_expired");
         }
-        let mut position = 0usize;
-        let mut total = 0usize;
-        let mut encrypted = vec![];
-        let mut substituted_filetype = None;
-        let mut picture_format = None;
-        for sequence in 1..=401u32 {
-            progress(
-                position as u64,
-                if total == 0 { None } else { Some(total as u64) },
-            )?;
+        let mut state = RangeDownload::new(max_plaintext);
+        for sequence in 1..=state.max_requests()? {
+            progress(state.position as u64, state.known_total())?;
             let mut fields = shared(&self.config, sequence, descriptor.quality.filetype());
             for (k, v) in [
                 ("wxautostart", 0),
                 ("downpicformat", 1),
-                ("rangestart", position as u64),
-                (
-                    "rangeend",
-                    if total == 0 {
-                        65535
-                    } else {
-                        (total - 1).min(position + 65535)
-                    } as u64,
-                ),
+                ("rangestart", state.position as u64),
+                ("rangeend", state.range_end() as u64),
             ] {
                 put(&mut fields, k, v);
             }
             fields.insert("wxmsgflag".into(), vec![]);
             fields.insert("fileid".into(), descriptor.file_id.as_bytes().to_vec());
             let reply = self.post("/download", &fields)?;
-            let code = integer(&reply, "retcode")?;
-            ensure!(code == 0, "CDN download returned {code}");
-            let start = usize::try_from(integer(&reply, "rangestart")?)?;
-            let end = usize::try_from(integer(&reply, "rangeend")?)?;
-            let size = usize::try_from(integer(&reply, "totalsize")?)?;
-            let data = reply
-                .get("filedata")
-                .ok_or_else(|| anyhow::anyhow!("Missing CDN payload"))?;
-            ensure!(
-                start == position
-                    && !data.is_empty()
-                    && size > 0
-                    && size <= MAX_CDN_TRANSFER_BYTES + 16
-                    && size >= position
-                    && data.len() <= size - position
-                    && (total == 0 || total == size)
-                    && end == start + data.len() - 1,
-                "Inconsistent CDN range response"
-            );
-            total = size;
-            position += data.len();
-            encrypted.extend(data);
-            progress(position as u64, Some(total as u64))?;
-            for (key, target) in [
-                ("substituteftype", &mut substituted_filetype),
-                ("rsppicformat", &mut picture_format),
-            ] {
-                if reply.contains_key(key) {
-                    let value = u32::try_from(integer(&reply, key)?)?;
-                    ensure!(
-                        target.is_none_or(|previous| previous == value),
-                        "CDN representation changed during transfer"
-                    );
-                    *target = Some(value);
-                }
-            }
-            if position == total {
+            let data = state.accept(&reply)?;
+            sink(data, state.total)?;
+            progress(state.position as u64, state.known_total())?;
+            if state.finished() {
                 break;
             }
         }
-        ensure!(
-            total > 0 && position == total,
-            "CDN transfer did not finish within bound"
-        );
+        ensure!(state.finished(), "CDN transfer did not finish within bound");
+        Ok(state)
+    }
+    pub fn download_with_progress(
+        &self,
+        descriptor: &MediaDescriptor,
+        progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<DownloadedMedia> {
+        let mut encrypted = vec![];
+        let state = self.download_ranges(
+            descriptor,
+            MAX_CDN_TRANSFER_BYTES,
+            progress,
+            |data, total| {
+                if encrypted.capacity() == 0 {
+                    encrypted.reserve_exact(total);
+                }
+                encrypted.extend_from_slice(data);
+                Ok(())
+            },
+        )?;
+        let RangeDownload {
+            substituted_filetype,
+            picture_format,
+            ..
+        } = state;
         let bytes = decrypt_cdn(&encrypted, &descriptor.aes_key)?;
         ensure!(
             bytes.len() <= MAX_CDN_TRANSFER_BYTES,
@@ -579,6 +743,46 @@ impl CdnClient {
             md5: digest,
             sha256: sha,
             advertised_size_matches: size_matches,
+        })
+    }
+    /// Read an accepted upload back in full, decrypting and hashing each range
+    /// as it arrives so the plaintext is never held in memory. The exact size,
+    /// MD5 and SHA-256 recorded at upload time must all match.
+    pub fn verify_upload_readback(
+        &self,
+        uploaded: &UploadedMedia,
+        progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<VerifiedReadback> {
+        let descriptor = &uploaded.descriptor;
+        ensure!(
+            uploaded.plaintext_bytes > 0
+                && uploaded.plaintext_bytes as usize <= MAX_NATIVE_UPLOAD_BYTES
+                && descriptor.strict_size
+                && descriptor.expected_bytes == Some(uploaded.plaintext_bytes as u64),
+            "Invalid uploaded media descriptor"
+        );
+        let mut digest = DecryptDigest::new(&descriptor.aes_key, MAX_NATIVE_UPLOAD_BYTES)?;
+        self.download_ranges(descriptor, MAX_NATIVE_UPLOAD_BYTES, progress, |data, _| {
+            digest.update(data)
+        })?;
+        let digest = digest.finish()?;
+        ensure!(
+            digest.plaintext_bytes == uploaded.plaintext_bytes as usize,
+            "Advertised media size mismatch"
+        );
+        ensure!(
+            descriptor
+                .expected_md5
+                .as_deref()
+                .is_some_and(|m| digest.md5.eq_ignore_ascii_case(m))
+                && digest.md5.eq_ignore_ascii_case(&uploaded.md5),
+            "Advertised media checksum mismatch"
+        );
+        ensure!(digest.sha256 == uploaded.sha256, "media_integrity_failed");
+        Ok(VerifiedReadback {
+            plaintext_bytes: digest.plaintext_bytes as u64,
+            md5: digest.md5,
+            sha256: digest.sha256,
         })
     }
     pub fn upload(&self, prepared: &PreparedUpload) -> Result<UploadedMedia> {
@@ -1110,6 +1314,151 @@ mod tests {
         let mut corrupt = p.clone();
         corrupt.encrypted[0] ^= 1;
         assert!(corrupt.validate().is_err());
+    }
+    fn padded(plaintext: usize) -> usize {
+        (plaintext / 16 + 1) * 16
+    }
+    #[test]
+    fn previous_bound_kept_padded_ciphertext_below_25_mib() {
+        // PKCS#7 always adds 1-16 bytes; -17 is the largest plaintext whose
+        // ciphertext stays below 25 MiB.
+        assert_eq!(
+            padded(STANDARD_UPLOAD_VERIFIED_BYTES),
+            25 * 1024 * 1024 - 16
+        );
+        assert_eq!(padded(STANDARD_UPLOAD_VERIFIED_BYTES + 1), 25 * 1024 * 1024);
+        let key = [7u8; 16];
+        for n in [1, 15, 16, 17, 65535, 65536] {
+            assert_eq!(ecb_encrypt(&vec![1; n], &key).unwrap().len(), padded(n));
+        }
+    }
+    #[test]
+    fn streamed_digest_matches_one_shot_for_any_range_split() {
+        let key = [9u8; 16];
+        for n in [1, 15, 16, 17, 4095, 65536, 3 * 65536 + 5] {
+            let raw = (0..n).map(|i| (i * 31 % 251) as u8).collect::<Vec<_>>();
+            let encrypted = ecb_encrypt(&raw, &key).unwrap();
+            let expected = PlaintextDigest {
+                plaintext_bytes: n,
+                md5: hex::encode(md5(&raw)),
+                sha256: hex::encode(sha256(&raw)),
+            };
+            assert_eq!(digest_cdn(&encrypted, &key, n).unwrap(), expected);
+            // Ranges need not be block aligned; the last one rarely is.
+            for split in [1, 7, 16, 33, 65536] {
+                let mut digest = DecryptDigest::new(&key, n).unwrap();
+                for piece in encrypted.chunks(split) {
+                    digest.update(piece).unwrap();
+                }
+                assert_eq!(digest.finish().unwrap(), expected);
+            }
+            assert!(digest_cdn(&encrypted, &key, n - 1).is_err());
+            assert!(digest_cdn(&encrypted[..encrypted.len() - 1], &key, n).is_err());
+            let mut corrupt = encrypted.clone();
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 0x55;
+            assert_ne!(digest_cdn(&corrupt, &key, n).ok(), Some(expected));
+        }
+    }
+    #[test]
+    fn upload_above_previous_bound_is_ranged_and_validated_without_full_copies() {
+        let raw = (0..STANDARD_UPLOAD_VERIFIED_BYTES + 65536 * 3 + 9)
+            .map(|i| (i % 253) as u8)
+            .collect::<Vec<_>>();
+        let p =
+            PreparedUpload::prepare(&raw, MediaQuality::File, "large.bin", "filehelper").unwrap();
+        p.validate().unwrap();
+        assert_eq!(p.encrypted.len(), padded(raw.len()));
+        assert!(p.encrypted.len() > 25 * 1024 * 1024);
+        let conf = CdnConfig {
+            version: 1,
+            uin: 1,
+            client_version: 1,
+            client_os_type: "synthetic".into(),
+            auth_key: vec![1],
+            server_ips: vec!["8.8.8.8".parse().unwrap()],
+        };
+        let chunks = p.encrypted.chunks(UPLOAD_CHUNK).count();
+        assert_eq!(chunks, p.encrypted.len().div_ceil(UPLOAD_CHUNK));
+        let start = (chunks - 1) * UPLOAD_CHUNK;
+        let end = p.encrypted.len() - 1;
+        let fields = upload_fields(&conf, &p, chunks as u32, start, end).unwrap();
+        for (key, value) in [
+            ("totalsize", p.encrypted.len()),
+            ("rawtotalsize", raw.len()),
+            ("rangestart", start),
+            ("rangeend", end),
+            ("seq", chunks),
+        ] {
+            assert_eq!(fields[key], value.to_string().into_bytes(), "{key}");
+        }
+        assert_eq!(fields["filetype"], b"5");
+        assert!(upload_fields(&conf, &p, 1, 0, UPLOAD_CHUNK).is_err());
+        let mut corrupt = p.clone();
+        let middle = corrupt.encrypted.len() / 2;
+        corrupt.encrypted[middle] ^= 1;
+        assert!(corrupt.validate().is_err());
+        drop(corrupt);
+        assert!(PreparedUpload::prepare(
+            &vec![0; MAX_NATIVE_UPLOAD_BYTES + 1],
+            MediaQuality::File,
+            "too-large.bin",
+            "filehelper"
+        )
+        .is_err());
+    }
+    fn range_reply(start: usize, len: usize, total: usize) -> CdnFields {
+        let mut f = CdnFields::new();
+        put(&mut f, "retcode", 0);
+        put(&mut f, "rangestart", start);
+        put(&mut f, "rangeend", start + len - 1);
+        put(&mut f, "totalsize", total);
+        f.insert("filedata".into(), vec![0; len]);
+        f
+    }
+    #[test]
+    fn range_download_bounds_follow_the_caller_limit() {
+        // The incoming-download bound keeps its previous 401-request budget.
+        assert_eq!(
+            RangeDownload::new(MAX_CDN_TRANSFER_BYTES)
+                .max_requests()
+                .unwrap(),
+            401
+        );
+        assert_eq!(
+            RangeDownload::new(MAX_NATIVE_UPLOAD_BYTES)
+                .max_requests()
+                .unwrap() as usize,
+            (MAX_NATIVE_UPLOAD_BYTES + 16).div_ceil(RANGE_CHUNK)
+        );
+        let total = padded(40 * 1024 * 1024);
+        let reply = range_reply(0, RANGE_CHUNK, total);
+        assert!(RangeDownload::new(MAX_CDN_TRANSFER_BYTES)
+            .accept(&reply)
+            .is_err());
+        let mut state = RangeDownload::new(MAX_NATIVE_UPLOAD_BYTES);
+        assert_eq!(state.range_end(), RANGE_CHUNK - 1);
+        assert_eq!(state.accept(&reply).unwrap().len(), RANGE_CHUNK);
+        assert_eq!(state.known_total(), Some(total as u64));
+        assert_eq!(state.range_end(), 2 * RANGE_CHUNK - 1);
+        // Gaps, overlaps and a changed total are rejected.
+        assert!(state
+            .accept(&range_reply(2 * RANGE_CHUNK, RANGE_CHUNK, total))
+            .is_err());
+        assert!(state
+            .accept(&range_reply(RANGE_CHUNK, RANGE_CHUNK, total + 16))
+            .is_err());
+        while !state.finished() {
+            let len = RANGE_CHUNK.min(total - state.position);
+            assert_eq!(state.range_end(), state.position + len - 1);
+            state
+                .accept(&range_reply(state.position, len, total))
+                .unwrap();
+        }
+        assert_eq!(state.position, total);
+        assert!(RangeDownload::new(MAX_NATIVE_UPLOAD_BYTES)
+            .accept(&range_reply(0, 16, MAX_NATIVE_UPLOAD_BYTES + 32))
+            .is_err());
     }
     #[test]
     fn nonpublic_addresses_rejected() {

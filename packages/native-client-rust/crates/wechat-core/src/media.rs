@@ -810,6 +810,29 @@ impl Core {
         .context("media_worker_stopped")?
     }
     fn progress_media(&self, account: &str, id: &str, done: u64, total: Option<u64>) -> Result<()> {
+        self.record_media_progress(account, id, done, total, false)
+    }
+    /// Progress for CDN range transfers. Cancellation and session fences are
+    /// checked for every range, but byte counts are persisted (and announced as
+    /// job events) only per [`TRANSFER_PROGRESS_STEP`], at phase changes and at
+    /// completion, so a large transfer cannot flood the durable event log.
+    fn progress_transfer(
+        &self,
+        account: &str,
+        id: &str,
+        done: u64,
+        total: Option<u64>,
+    ) -> Result<()> {
+        self.record_media_progress(account, id, done, total, true)
+    }
+    fn record_media_progress(
+        &self,
+        account: &str,
+        id: &str,
+        done: u64,
+        total: Option<u64>,
+        throttle: bool,
+    ) -> Result<()> {
         let mut row = self.store.media_job(account, id)?;
         ensure!(!row.cancel_requested, "media_cancelled");
         ensure!(
@@ -824,6 +847,9 @@ impl Core {
             !self.stopping.load(Ordering::Acquire),
             "media_worker_stopping"
         );
+        if throttle && !transfer_progress_due(&row.data, done, total) {
+            return Ok(());
+        }
         row.data["completedBytes"] = done.into();
         row.data["totalBytes"] = total.into();
         self.store.save_media_job(account, &row)?;
@@ -909,7 +935,7 @@ impl Core {
                     "link_thumbnail_size_limit"
                 );
             }
-            self.progress_media(account, id, n, t)
+            self.progress_transfer(account, id, n, t)
         };
         let mut official_writeback = None;
         let (bytes, mime, actual, frames) = match plan {
@@ -1891,7 +1917,7 @@ impl Core {
         self.save_state(account, &state)?;
         let cdn = CdnClient::new(conf.clone(), Duration::from_secs(25))?;
         conf.auth_key.fill(0);
-        let callback = |n, t| self.progress_media(account, id, n, t);
+        let callback = |n, t| self.progress_transfer(account, id, n, t);
         match plan.request.kind {
             MediaKind::File => {
                 if plan.uploaded_file.is_none() {
@@ -1992,10 +2018,12 @@ impl Core {
         }
         self.phase_media(account, id, "readback")?;
         let mut verified = vec![];
+        // Files and videos may exceed the incoming-download bound; read them
+        // back with streamed decryption/hashing instead of buffering plaintext.
         if let Some(u) = &plan.uploaded_file {
-            let downloaded = cdn.download_with_progress(&u.descriptor, callback)?;
-            ensure!(downloaded.sha256 == u.sha256, "media_integrity_failed");
-            verified.push(downloaded.sha256);
+            let readback = cdn.verify_upload_readback(u, callback)?;
+            ensure!(readback.sha256 == u.sha256, "media_integrity_failed");
+            verified.push(readback.sha256);
         }
         if let Some(u) = &plan.uploaded_image {
             for variant in [&u.original, &u.standard, &u.thumbnail] {
@@ -2010,12 +2038,9 @@ impl Core {
         }
         if let Some(u) = &plan.uploaded_video {
             for variant in [&u.video, &u.thumbnail] {
-                let downloaded = cdn.download_with_progress(&variant.descriptor, callback)?;
-                ensure!(
-                    downloaded.sha256 == variant.sha256,
-                    "media_integrity_failed"
-                );
-                verified.push(downloaded.sha256);
+                let readback = cdn.verify_upload_readback(variant, callback)?;
+                ensure!(readback.sha256 == variant.sha256, "media_integrity_failed");
+                verified.push(readback.sha256);
             }
         }
         let mut row = self.store.media_job(account, id)?;
@@ -2328,6 +2353,18 @@ impl Core {
         self.store.save_media_job(account, &row)?;
         Ok(())
     }
+}
+/// Byte granularity of persisted CDN transfer progress.
+const TRANSFER_PROGRESS_STEP: u64 = 1024 * 1024;
+/// Whether a CDN range callback should persist progress: always for a new
+/// total (a new transfer or phase), the first and final byte counts and any
+/// backward step; otherwise only after crossing a [`TRANSFER_PROGRESS_STEP`].
+fn transfer_progress_due(data: &serde_json::Value, done: u64, total: Option<u64>) -> bool {
+    let previous = data["completedBytes"].as_u64();
+    if data["totalBytes"].as_u64() != total || total.is_none_or(|t| done >= t) || done == 0 {
+        return true;
+    }
+    previous.is_none_or(|p| done < p || done / TRANSFER_PROGRESS_STEP != p / TRANSFER_PROGRESS_STEP)
 }
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -3293,5 +3330,64 @@ mod tests {
         let silk = wechat_protocol::silk::encode(&pcm).unwrap();
         let decoded = audio_pcm(&silk, || Ok(())).unwrap();
         assert_eq!(decoded.len(), 16000);
+    }
+    #[test]
+    fn transfer_progress_is_persisted_per_step_and_at_boundaries() {
+        let step = TRANSFER_PROGRESS_STEP;
+        let total = 10 * step + 5;
+        let row = |done: u64, t: Option<u64>| json!({"completedBytes": done, "totalBytes": t});
+        // A new transfer or phase (changed total) is always recorded.
+        assert!(transfer_progress_due(&row(0, None), 0, Some(total)));
+        assert!(transfer_progress_due(&row(0, None), 65536, Some(total)));
+        assert!(transfer_progress_due(&row(total, Some(total)), 0, None));
+        // Within one step nothing new is written.
+        assert!(!transfer_progress_due(
+            &row(0, Some(total)),
+            65536,
+            Some(total)
+        ));
+        assert!(!transfer_progress_due(
+            &row(step, Some(total)),
+            step + 65536,
+            Some(total)
+        ));
+        // Step crossings, completion and backward moves are recorded.
+        assert!(transfer_progress_due(
+            &row(step - 1, Some(total)),
+            step,
+            Some(total)
+        ));
+        assert!(transfer_progress_due(
+            &row(10 * step, Some(total)),
+            total,
+            Some(total)
+        ));
+        assert!(transfer_progress_due(
+            &row(5 * step, Some(total)),
+            65536,
+            Some(total)
+        ));
+        // A maximum-size upload plus readback stays far below the per-range
+        // event volume (two callbacks per 64 KiB range in each direction).
+        let encrypted = (MAX_SOURCE_BYTES as u64 / 16 + 1) * 16;
+        let mut data = json!({"completedBytes": 0});
+        let mut writes = 0;
+        for _phase in 0..2 {
+            let mut start = 0;
+            while start < encrypted {
+                let end = (start + 65536).min(encrypted);
+                for done in [start, end] {
+                    if transfer_progress_due(&data, done, Some(encrypted)) {
+                        data = json!({"completedBytes": done, "totalBytes": encrypted});
+                        writes += 1;
+                    }
+                }
+                start = end;
+            }
+            data = json!({"completedBytes": encrypted, "totalBytes": null});
+        }
+        let ranges = encrypted.div_ceil(65536);
+        assert!(writes <= 2 * (encrypted / step + 3), "{writes}");
+        assert!(writes * 10 < 2 * ranges, "{writes} of {ranges}");
     }
 }
