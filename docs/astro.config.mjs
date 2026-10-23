@@ -26,6 +26,7 @@ const moved = {
   'operations/data': 'how-it-works/storage',
   'operations/restarting': 'how-it-works/sends',
   'reference/api': 'use/api',
+  'use/quoted-replies': 'use/cli',
   'reference/environment-vars': 'reference/configuration',
 };
 
