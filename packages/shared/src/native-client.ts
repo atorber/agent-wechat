@@ -6,6 +6,15 @@ import { NATIVE_MAX_SOURCE_BYTES } from "./native.generated.ts";
 import type { NativeGroupCreateRequest, NativeGroupMemberLookup } from "./native.generated.js";
 export type NativeListOptions = { cursor?: string; limit?: number; query?: string; kind?: string };
 export function isNativeTombstone(value: unknown): value is NativeTombstone { const item = value as Partial<NativeTombstone> | null; return item?.deleted === true && typeof item.id === "string" && typeof item.version === "string"; }
+/** Validate a derived official notice without interpreting it as identity metadata. */
+export function validateNativeRecallMetadata(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid native recall metadata");
+  const recall = value as { replacementText?: unknown };
+  if (recall.replacementText != null && (typeof recall.replacementText !== "string" || !recall.replacementText
+    || recall.replacementText.length > 16384 || new TextEncoder().encode(recall.replacementText).length > 16384
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ufffe\uffff]/.test(recall.replacementText))) throw new Error("Invalid native recall metadata");
+}
+function validateMessageRecall(message: NativeMessage): void { if (message.recall != null) validateNativeRecallMetadata(message.recall); }
 function listQuery(input?: string | NativeListOptions): string { const options = typeof input === "string" ? { cursor: input } : input; if (!options) return ""; if (options.limit != null && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 200)) throw new Error("Invalid native page limit"); const query = new URLSearchParams(); for (const [key, value] of Object.entries(options)) if (value != null) query.set(key, String(value)); return query.size ? `?${query}` : ""; }
 export type NativeLoginOptions = Partial<Omit<LoginRequest, "qrRefresh">> & { qrRefresh?: Partial<QrRefresh> };
 export type NativeClientOptions = { baseUrl: string; token: string; fetch?: typeof fetch; timeoutMs?: number; mediaTimeoutMs?: number; streamIdleTimeoutMs?: number };
@@ -180,12 +189,14 @@ export class NativeWeChatClient {
       if (isNativeTombstone(msg)) continue;
       if (typeof msg.id !== "string" || msg.accountId !== accountId || msg.threadId !== threadId
         || (msg.serverId != null && (typeof msg.serverId !== "string" || !/^\d+$/.test(msg.serverId)))) throw new Error("Invalid native message identity");
+      validateMessageRecall(msg);
     }
     return result;
   }
   async message(accountId: string, messageId: string): Promise<NativeMessage> {
     const message = await this.request<NativeMessage>(`v1/accounts/${id(accountId)}/messages/${id(messageId)}`);
     if (message.id !== messageId || message.accountId !== accountId || (message.serverId != null && (typeof message.serverId !== "string" || !/^\d+$/.test(message.serverId)))) throw new Error("Invalid native message identity");
+    validateMessageRecall(message);
     return message;
   }
   /** Resolve only the stored original in this message's own conversation. */
@@ -194,6 +205,7 @@ export class NativeWeChatClient {
     if (quote.accountId !== accountId || quote.messageId !== messageId || typeof quote.threadId !== "string"
       || !["resolved", "embedded", "missing", "invalid", "unsupported", "ambiguous", "recalled"].includes(quote.state)
       || (quote.state === "resolved" ? !quote.message || quote.message.accountId !== accountId || quote.message.threadId !== quote.threadId || quote.message.id === messageId : quote.message != null)) throw new Error("Invalid native quote identity");
+    if (quote.message) validateMessageRecall(quote.message);
     return quote;
   }
   /** Account-wide local search, with the daemon's query-bound opaque cursor. */
@@ -203,6 +215,7 @@ export class NativeWeChatClient {
       if (isNativeTombstone(message)) continue;
       if (typeof message.id !== "string" || message.accountId !== accountId || typeof message.threadId !== "string" || !message.threadId
         || (message.serverId != null && (typeof message.serverId !== "string" || !/^\d+$/.test(message.serverId)))) throw new Error("Invalid native archive message identity");
+      validateMessageRecall(message);
     }
     return result;
   }
@@ -291,7 +304,10 @@ export class NativeWeChatClient {
 
   events(accountId: string, after = "0", limit = 100): Promise<{ items: NativeEvent[]; nextCursor: string }> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("Invalid event page limit");
-    return this.request(`v1/accounts/${id(accountId)}/events?after=${decimal(after)}&limit=${limit}`);
+    return this.request<{ items: NativeEvent[]; nextCursor: string }>(`v1/accounts/${id(accountId)}/events?after=${decimal(after)}&limit=${limit}`).then(page => {
+      for (const event of page.items) if (event.kind === "message.recalled") validateNativeRecallMetadata(event.data);
+      return page;
+    });
   }
   ack(accountId: string, consumerId: string, cursor: string): Promise<unknown> {
     return this.request(`v1/accounts/${id(accountId)}/consumers/${id(consumerId)}/ack`, { method: "POST", body: JSON.stringify({ cursor: decimal(cursor) }) });
@@ -336,6 +352,7 @@ export class NativeWeChatClient {
               }
               const event = payload as NativeEvent;
               if (!event || typeof event.kind !== "string" || !event.data || typeof event.data !== "object") throw new Error("Invalid native event");
+              if (event.kind === "message.recalled") validateNativeRecallMetadata(event.data);
               event.cursor = decimal(event.cursor ?? eventCursor);
               yield event;
             }

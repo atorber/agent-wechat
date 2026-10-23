@@ -395,11 +395,12 @@ impl Core {
                 wechat_protocol::wire::decode_add_message(&command.payload, &state.own_username)?;
             if let Some(recall) = crate::recalls::incoming_recall(&message, &state.own_username)? {
                 self.retain_control_raw(account, command, receipt)?;
-                self.apply_confirmed_recall(
+                self.apply_confirmed_recall_with_notice(
                     account,
                     &recall.thread,
                     &recall.server,
                     recall.recalled_at,
+                    recall.replacement_text.as_deref(),
                     origin,
                     receipt,
                 )?;
@@ -657,7 +658,7 @@ impl Core {
                 &MessageSessionProjection {
                     source: source.clone(),
                     peer: message.peer.clone(),
-                    summary: crate::recalls::RECALLED_BODY.into(),
+                    summary: self.recall_preview(account, marker)?,
                     outgoing: message.outgoing,
                     unread: false,
                     sender: None,
@@ -962,14 +963,13 @@ impl Core {
             let existing = self
                 .profile_reader(account)?
                 .message(&source, Some(&state.own_username))?;
-            if let Some(marker) =
-                self.store
-                    .recall_marker(account, destination, server_message_id)?
-            {
-                self.project_recall_marker(account, &marker, receipt)?;
-            } else if existing.message_type != 1
-                || existing.sender.as_deref() != Some(&state.own_username)
-                || existing.content.text.as_deref() != Some(text)
+            if self
+                .store
+                .recall_marker(account, destination, server_message_id)?
+                .is_none()
+                && (existing.message_type != 1
+                    || existing.sender.as_deref() != Some(&state.own_username)
+                    || existing.content.text.as_deref() != Some(text))
             {
                 bail!("accepted_message_identity_conflict")
             }
@@ -1020,24 +1020,30 @@ impl Core {
             )?
             .source_id
         };
+        let recalled = if let Some(marker) =
+            self.store
+                .recall_marker(account, destination, server_message_id)?
+        {
+            self.project_recall_marker(account, &marker, receipt)?;
+            self.store
+                .recall_marker(account, destination, server_message_id)?
+        } else {
+            None
+        };
         wechat_profile::apply_message_session_projection(
             &location,
             &keys,
             &MessageSessionProjection {
                 source: source.clone(),
                 peer: destination.into(),
-                summary: if let Some(marker) =
-                    self.store
-                        .recall_marker(account, destination, server_message_id)?
-                {
-                    self.project_recall_marker(account, &marker, receipt)?;
-                    crate::recalls::RECALLED_BODY.into()
-                } else {
-                    text.into()
-                },
+                summary: recalled
+                    .as_ref()
+                    .map(|marker| self.recall_preview(account, marker))
+                    .transpose()?
+                    .unwrap_or_else(|| text.into()),
                 outgoing: true,
                 unread: false,
-                sender: Some(state.own_username.clone()),
+                sender: recalled.is_none().then(|| state.own_username.clone()),
                 sender_display: None,
                 created_by_this_intent: true,
             },
@@ -2255,14 +2261,13 @@ impl Core {
             let existing = self
                 .profile_reader(account)?
                 .message(&source, Some(&state.own_username))?;
-            if let Some(marker) =
-                self.store
-                    .recall_marker(account, destination, server_message_id)?
-            {
-                self.project_recall_marker(account, &marker, receipt)?;
-            } else if existing.local_type != local_type.to_string()
-                || existing.sender.as_deref() != Some(&state.own_username)
-                || existing.content.text.as_deref() != Some(content)
+            if self
+                .store
+                .recall_marker(account, destination, server_message_id)?
+                .is_none()
+                && (existing.local_type != local_type.to_string()
+                    || existing.sender.as_deref() != Some(&state.own_username)
+                    || existing.content.text.as_deref() != Some(content))
             {
                 bail!("accepted_media_identity_conflict")
             }
@@ -2322,24 +2327,30 @@ impl Core {
             )?
             .source_id
         };
+        let recalled = if let Some(marker) =
+            self.store
+                .recall_marker(account, destination, server_message_id)?
+        {
+            self.project_recall_marker(account, &marker, receipt)?;
+            self.store
+                .recall_marker(account, destination, server_message_id)?
+        } else {
+            None
+        };
         wechat_profile::apply_message_session_projection(
             &location,
             &keys,
             &MessageSessionProjection {
                 source: source.clone(),
                 peer: destination.into(),
-                summary: if let Some(marker) =
-                    self.store
-                        .recall_marker(account, destination, server_message_id)?
-                {
-                    self.project_recall_marker(account, &marker, receipt)?;
-                    crate::recalls::RECALLED_BODY.into()
-                } else {
-                    summary.into()
-                },
+                summary: recalled
+                    .as_ref()
+                    .map(|marker| self.recall_preview(account, marker))
+                    .transpose()?
+                    .unwrap_or_else(|| summary.into()),
                 outgoing: true,
                 unread: false,
-                sender: Some(state.own_username.clone()),
+                sender: recalled.is_none().then(|| state.own_username.clone()),
                 sender_display: None,
                 created_by_this_intent: true,
             },

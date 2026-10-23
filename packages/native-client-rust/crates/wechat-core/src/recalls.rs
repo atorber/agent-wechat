@@ -10,6 +10,7 @@ pub(crate) struct IncomingRecall {
     pub thread: String,
     pub server: String,
     pub recalled_at: Option<i64>,
+    pub replacement_text: Option<String>,
 }
 
 fn child<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
@@ -59,6 +60,24 @@ fn occurrence(revoke: roxmltree::Node<'_, '_>) -> Option<i64> {
         .and_then(leaf)
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|n| *n > 0 && chrono::DateTime::from_timestamp(*n, 0).is_some())
+}
+fn notice(revoke: roxmltree::Node<'_, '_>, name: &str) -> Result<Option<String>> {
+    let text = child(revoke, name)
+        .map(|node| leaf(node).context("unsupported_recall_notice"))
+        .transpose()?
+        .filter(|text| !text.is_empty());
+    if text.as_deref().is_some_and(|text| !valid_notice(text)) {
+        bail!("unsupported_recall_notice");
+    }
+    Ok(text)
+}
+fn valid_notice(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 16 * 1024
+        && !text.chars().any(|c| {
+            (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+                || matches!(c, '\u{fffe}' | '\u{ffff}')
+        })
 }
 pub(crate) fn incoming_recall(message: &AddMessage, own: &str) -> Result<Option<IncomingRecall>> {
     if message.message_type == 10000
@@ -177,6 +196,7 @@ pub(crate) fn incoming_recall(message: &AddMessage, own: &str) -> Result<Option<
         thread,
         server,
         recalled_at: occurrence(revoke),
+        replacement_text: notice(revoke, "replacemsg")?,
     }))
 }
 pub(crate) fn official_recall(message: &wechat_profile::Message) -> Option<Option<i64>> {
@@ -192,7 +212,7 @@ pub(crate) fn official_recall(message: &wechat_profile::Message) -> Option<Optio
     {
         return None;
     }
-    for name in ["newmsgid", "session", "revoketime"] {
+    for name in ["newmsgid", "session", "revoketime", "content"] {
         if revoke
             .children()
             .filter(|n| n.is_element() && n.tag_name().name() == name)
@@ -213,6 +233,14 @@ pub(crate) fn official_recall(message: &wechat_profile::Message) -> Option<Optio
         }
     }
     Some(occurrence(revoke))
+}
+fn official_notice(message: &wechat_profile::Message) -> Option<String> {
+    official_recall(message)?;
+    let doc = recall_xml(message.content.text.as_deref()?)?;
+    notice(child(doc.root_element(), "revokemsg")?, "content")
+        .ok()
+        .flatten()
+        .filter(|text| text != RECALLED_BODY)
 }
 pub(crate) fn public_recall(marker: &RecallMarker) -> Value {
     let mut value = json!({"observedAt":marker.observed_at});
@@ -262,24 +290,53 @@ impl Core {
         origin: &str,
         receipt: &str,
     ) -> Result<RecallMarker> {
-        // Suppression must survive missing keys, an unsupported writer, or a
-        // crash between independently committed official database transactions.
-        let source = (|| -> Result<Option<(String, i64)>> {
-            let options = self.write_options(account, receipt)?;
-            let (location, keys) = self.profile_location_keys(account)?;
-            let Some(source) =
-                wechat_profile::find_projected_message(&location, &keys, thread, server, &options)?
-            else {
-                return Ok(None);
-            };
-            let created = self
-                .profile_reader(account)?
-                .message(&source, None)?
-                .create_time;
-            Ok(Some((message_id(&source)?, created)))
-        })();
+        self.apply_confirmed_recall_with_notice(
+            account,
+            thread,
+            server,
+            recalled_at,
+            None,
+            origin,
+            receipt,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_confirmed_recall_with_notice(
+        &self,
+        account: &str,
+        thread: &str,
+        server: &str,
+        recalled_at: Option<i64>,
+        replacement_text: Option<&str>,
+        origin: &str,
+        receipt: &str,
+    ) -> Result<RecallMarker> {
+        ensure!(
+            replacement_text.is_none_or(valid_notice),
+            "unsupported_recall_notice"
+        );
+        // Operation receipts survive missing keys and partial official writes.
+        // They do not retain a second settled message or original-author field.
+        let source = self.recall_source(account, thread, server);
         let known = source.as_ref().ok().and_then(|s| s.as_ref());
-        let marker = self.store.record_recall(
+        let control = if replacement_text.is_some()
+            && self
+                .store
+                .runtime(account, &format!("sync-control:{receipt}"))?
+                .is_some()
+        {
+            let parsed = self.recall_control(account, receipt)?;
+            ensure!(
+                parsed.thread == thread
+                    && parsed.server == server
+                    && parsed.replacement_text.as_deref() == replacement_text,
+                "recall_control_target_mismatch"
+            );
+            Some(receipt)
+        } else {
+            None
+        };
+        let marker = self.store.record_recall_with_control(
             account,
             thread,
             server,
@@ -287,12 +344,85 @@ impl Core {
             known.map(|(_, created)| *created),
             recalled_at,
             origin,
+            control,
         )?;
         source?;
-        self.project_recall_marker(account, &marker, receipt)?;
+        self.project_recall_with_notice(account, &marker, receipt, replacement_text)?;
         self.store
             .recall_marker(account, thread, server)?
             .context("recall_marker_missing")
+    }
+    fn recall_source(
+        &self,
+        account: &str,
+        thread: &str,
+        server: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let messages = self
+            .profile_reader(account)?
+            .messages_by_server_id(thread, server, None)?;
+        ensure!(messages.len() <= 1, "recall_target_ambiguous");
+        messages
+            .into_iter()
+            .next()
+            .map(|message| Ok((message_id(&message.id)?, message.create_time)))
+            .transpose()
+    }
+    fn recall_control(&self, account: &str, receipt: &str) -> Result<IncomingRecall> {
+        let key = format!("sync-control:{receipt}");
+        let sealed = self
+            .store
+            .runtime(account, &key)?
+            .context("recall_control_receipt_missing")?;
+        let own = self
+            .profile_username(account)?
+            .context("recall_control_account_missing")?;
+        let payload = self.vault.open_record(account, &key, &sealed)?;
+        let message = wechat_protocol::wire::decode_add_message(&payload, &own)?;
+        incoming_recall(&message, &own)?.context("recall_control_receipt_invalid")
+    }
+    fn retained_recall_notice(
+        &self,
+        account: &str,
+        marker: &RecallMarker,
+    ) -> Result<Option<String>> {
+        let Some(receipt) =
+            self.store
+                .recall_control_receipt(account, &marker.thread_id, &marker.server_id)?
+        else {
+            return Ok(None);
+        };
+        let control = self.recall_control(account, &receipt)?;
+        ensure!(
+            control.thread == marker.thread_id && control.server == marker.server_id,
+            "recall_control_target_mismatch"
+        );
+        Ok(control.replacement_text)
+    }
+    fn recall_projection_notice(
+        &self,
+        account: &str,
+        marker: &RecallMarker,
+    ) -> Result<Option<String>> {
+        let reader = self.profile_reader(account)?;
+        let messages = reader.messages_by_server_id(&marker.thread_id, &marker.server_id, None)?;
+        ensure!(messages.len() <= 1, "recall_target_ambiguous");
+        // Settled text is read from the official message. A receipt is only a
+        // recovery input while that row is missing or unfinished.
+        if let Some(message) = messages
+            .first()
+            .filter(|message| official_recall(message).is_some())
+        {
+            return Ok(Some(
+                official_notice(message).unwrap_or_else(|| RECALLED_BODY.into()),
+            ));
+        }
+        self.retained_recall_notice(account, marker)
+    }
+    pub(crate) fn recall_preview(&self, account: &str, marker: &RecallMarker) -> Result<String> {
+        Ok(self
+            .recall_projection_notice(account, marker)?
+            .unwrap_or_else(|| RECALLED_BODY.into()))
     }
     pub(crate) fn project_recall_marker(
         &self,
@@ -300,16 +430,31 @@ impl Core {
         marker: &RecallMarker,
         receipt: &str,
     ) -> Result<()> {
+        self.project_recall_with_notice(account, marker, receipt, None)
+    }
+    fn project_recall_with_notice(
+        &self,
+        account: &str,
+        marker: &RecallMarker,
+        receipt: &str,
+        transient_notice: Option<&str>,
+    ) -> Result<()> {
         self.store
             .begin_recall_projection(account, &marker.thread_id, &marker.server_id)?;
+        let notice = self.recall_projection_notice(account, marker)?;
+        let notice = notice
+            .as_deref()
+            .or(transient_notice)
+            .unwrap_or(RECALLED_BODY);
         let options = self.write_options(account, receipt)?;
         let (location, keys) = self.profile_location_keys(account)?;
-        let source = wechat_profile::apply_recall_projection(
+        let source = wechat_profile::apply_recall_projection_with_notice(
             &location,
             &keys,
             &marker.thread_id,
             &marker.server_id,
             marker.recalled_at,
+            Some(notice),
             &options,
         )?;
         if let Some(source) = source {
@@ -353,6 +498,13 @@ impl Core {
         };
         if let Some(thread) = msg.peer.as_deref() {
             if let Some(marker) = self.store.recall_marker(account, thread, server)? {
+                if marker.projection_state == "applied" && official_recall(msg).is_none() {
+                    // An operation receipt is not canonical settled state. If
+                    // a restored row needs repair, track that obligation again.
+                    self.store
+                        .begin_recall_projection(account, thread, server)?;
+                    return self.store.recall_marker(account, thread, server);
+                }
                 return Ok(Some(marker));
             }
         }
@@ -432,7 +584,7 @@ impl Core {
     pub(crate) fn normalize_recalled(
         &self,
         account: &str,
-        msg: wechat_profile::Message,
+        mut msg: wechat_profile::Message,
         own: Option<&str>,
         generation: &str,
     ) -> Result<Value> {
@@ -451,11 +603,43 @@ impl Core {
         } else {
             false
         };
+        if let Some(marker) = recalled.as_ref() {
+            msg.peer = Some(marker.thread_id.clone());
+        }
+        let author = if recalled.is_some() {
+            // Optional attribution must not prevent reading the cleared row.
+            // Unavailable or unsupported receipt evidence leaves it unknown.
+            self.infer_recalled_author(account, &msg, own)
+                .unwrap_or_default()
+        } else {
+            None
+        };
+        let notice = if let Some(marker) = recalled.as_ref() {
+            // Read the official row first. Pending state uses only its existing
+            // sealed control receipt, without a copied settled notice column.
+            if official_recall(&msg).is_some() {
+                official_notice(&msg)
+            } else {
+                self.retained_recall_notice(account, marker)?
+            }
+        } else {
+            None
+        };
         let mut value = crate::profile::normalized_message(account, msg, own, generation)?;
         if let Some(marker) = recalled {
             value["threadId"] = json!(marker.thread_id);
             value["peerId"] = json!(marker.thread_id);
             value["type"] = json!(10000);
+            value["senderId"] = json!(author);
+            value["direction"] =
+                json!(author
+                    .as_deref()
+                    .zip(own)
+                    .map(|(sender, own)| if sender == own {
+                        "outgoing"
+                    } else {
+                        "incoming"
+                    }));
             value["body"] = json!(RECALLED_BODY);
             value["quote"] = Value::Null;
             value["link"] = Value::Null;
@@ -464,6 +648,9 @@ impl Core {
                 json!({"state":"known","userIds":[],"self":false,"all":false,"source":null});
             value["media"] = json!([]);
             value["recall"] = public_recall(&marker);
+            if let Some(notice) = notice {
+                value["recall"]["replacementText"] = json!(notice);
+            }
         } else if quoted_recalled {
             value["quote"] = Value::Null;
         }
