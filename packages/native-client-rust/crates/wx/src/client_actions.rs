@@ -122,18 +122,32 @@ pub async fn resource(r: &Remote, kind: &str, command: ResourceAction) -> Result
                 .await
             }
         }
-        ResourceAction::Retry { id } => {
+        ResourceAction::Retry {
+            id,
+            reuse_completed_upload,
+        } => {
             if kind != "jobs" {
                 bail!("unsupported_capability: an operation cannot be implicitly restarted");
             }
-            r.post(&r.path(&format!("jobs/{}/retry", encode(&id)))?, json!({}))
+            let body = if reuse_completed_upload {
+                json!({"reuseCompletedUpload":true})
+            } else {
+                json!({})
+            };
+            let action = if reuse_completed_upload {
+                "retry-completed-upload"
+            } else {
+                "retry"
+            };
+            r.post(&r.path(&format!("jobs/{}/{action}", encode(&id)))?, body)
                 .await
         }
     }
 }
 pub async fn wait_resource(r: &Remote, mut value: Value, kind: &str, wait: u64) -> Result<Value> {
-    if wait > 900 {
-        bail!("wait must be at most900seconds");
+    let max_wait = if kind == "jobs" { 3600 } else { 900 };
+    if wait > max_wait {
+        bail!("wait must be at most{max_wait}seconds");
     }
     if wait == 0 {
         return Ok(value);
@@ -180,6 +194,19 @@ fn receipt(
     key: &str,
     server_id: Option<&str>,
 ) -> Result<(PathBuf, Value)> {
+    receipt_with_video_quality(config, r, target, kind, hash, key, server_id, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn receipt_with_video_quality(
+    config: &settings::File,
+    r: &Remote,
+    target: &str,
+    kind: &str,
+    hash: &str,
+    key: &str,
+    server_id: Option<&str>,
+    video_quality: Option<&str>,
+) -> Result<(PathBuf, Value)> {
     if key.is_empty() || key.len() > 200 || key.chars().any(char::is_control) {
         bail!("invalid idempotency key");
     }
@@ -205,6 +232,9 @@ fn receipt(
     };
     let mut value = json!({"schemaVersion":1,"endpoint":r.base.as_str(),"accountId":r.account()?,"kind":kind,"sourceSha256":hash,"idempotencyKey":key,"state":"prepared"});
     value[target_field] = json!(target);
+    if let Some(quality) = video_quality {
+        value["videoQuality"] = json!(quality);
+    }
     if let Some(server_id) = server_id {
         value["serverId"] = json!(server_id);
     }
@@ -218,6 +248,7 @@ fn receipt(
             "sourceSha256",
             "idempotencyKey",
             "serverId",
+            "videoQuality",
         ] {
             if existing[field] != value[field] {
                 bail!("idempotency_conflict: receipt input changed");
@@ -325,6 +356,7 @@ pub async fn send(
     image: Option<PathBuf>,
     file: Option<PathBuf>,
     video: Option<PathBuf>,
+    video_quality: Option<String>,
     voice: Option<PathBuf>,
     key: Option<String>,
     detach: bool,
@@ -359,22 +391,20 @@ pub async fn send(
         ("text", text.into_bytes(), None)
     } else {
         let (kind, path) = &inputs[0];
+        let max_source_bytes = send_kind_source_limit(kind)?;
         let mut file = wechat_platform::OpenOptions::new()
             .read(true)
             .custom_flags(wechat_platform::NOFOLLOW)
             .open(path)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.len() == 0
-            || metadata.len() > wechat_core::MAX_SOURCE_BYTES as u64
-        {
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_source_bytes as u64 {
             bail!("source must be a nonempty regular file within the native source limit");
         }
-        let mut bytes = vec![];
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
         (&mut file)
-            .take(wechat_core::MAX_SOURCE_BYTES as u64 + 1)
+            .take(max_source_bytes as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > wechat_core::MAX_SOURCE_BYTES {
+        if bytes.len() > max_source_bytes {
             bail!("source exceeds native source limit");
         }
         (
@@ -390,7 +420,17 @@ pub async fn send(
     };
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let key = key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (path, mut receipt) = receipt(config, r, &thread, kind, &hash, &key, None)?;
+    let video_quality = (kind == "video").then(|| video_quality.unwrap_or_else(|| "normal".into()));
+    let (path, mut receipt) = receipt_with_video_quality(
+        config,
+        r,
+        &thread,
+        kind,
+        &hash,
+        &key,
+        None,
+        video_quality.as_deref(),
+    )?;
     eprintln!("Submission receipt: {}", path.display());
     if receipt["resourceId"].is_string() {
         let value = r
@@ -429,7 +469,7 @@ pub async fn send(
             id.to_string()
         } else {
             let source = r
-                .upload(&bytes, name.as_deref().context("source name missing")?)
+                .upload(bytes, name.as_deref().context("source name missing")?)
                 .await?;
             let id = source["id"]
                 .as_str()
@@ -443,7 +483,13 @@ pub async fn send(
             r.request(
                 reqwest::Method::POST,
                 &r.path("sends")?,
-                Some(json!({"threadId":thread,"kind":kind,"sourceId":source_id})),
+                Some({
+                    let mut request = json!({"threadId":thread,"kind":kind,"sourceId":source_id});
+                    if let Some(quality) = video_quality {
+                        request["videoQuality"] = quality.into();
+                    }
+                    request
+                }),
                 Some(&key),
             )
             .await
@@ -462,6 +508,17 @@ pub async fn send(
     result = wait_resource(r, result, resource, if detach { 0 } else { wait }).await?;
     result["receiptPath"] = json!(path);
     Ok(result)
+}
+fn send_kind_source_limit(kind: &str) -> Result<usize> {
+    use wechat_core::MediaKind;
+    let kind = match kind {
+        "file" => MediaKind::File,
+        "image" => MediaKind::Image,
+        "video" => MediaKind::Video,
+        "voice" => MediaKind::Voice,
+        _ => bail!("unsupported media send kind"),
+    };
+    Ok(kind.max_source_bytes())
 }
 #[allow(clippy::too_many_arguments)] // One command's identity, quality, output and wait policy.
 pub async fn media(
@@ -531,23 +588,200 @@ pub async fn media(
         }
         let id = asset["id"].as_str().context("media identity missing")?;
         let response = r
-            .response(
+            .response_with_timeout(
                 reqwest::Method::GET,
                 &r.path(&format!("media/{}/content", encode(id)))?,
                 None,
                 None,
+                Duration::from_secs(3600),
             )
             .await?;
-        let bytes = super::bounded_bytes(response, 128 * 1024 * 1024).await?;
-        if asset["sha256"].as_str() != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
-            || asset["byteLength"].as_u64() != Some(bytes.len() as u64)
-        {
-            bail!("media integrity check failed");
-        }
-        private_output(&path, &bytes)?;
+        let max_bytes = if asset["kind"] == "file" {
+            wechat_core::MAX_SOURCE_BYTES
+        } else {
+            128 * 1024 * 1024
+        };
+        super::private_media_output(
+            &path,
+            response,
+            max_bytes,
+            asset["byteLength"].as_u64(),
+            asset["sha256"].as_str(),
+        )
+        .await?;
         let mut asset = asset;
         asset["output"] = json!(path);
         return Ok(asset);
     }
     Ok(asset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn streamed_media_output_requires_complete_digest_and_preserves_existing_files() {
+        use axum::{body::Body, routing::get, Router};
+        let payload = b"synthetic streamed attachment";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(|| async {
+                        Body::from_stream(futures_util::stream::iter([
+                            Ok::<_, std::io::Error>(b"synthetic streamed ".as_slice()),
+                            Ok(b"attachment".as_slice()),
+                        ]))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("saved.bin");
+        let hash = format!("{:x}", Sha256::digest(payload));
+        for (size, digest) in [
+            (payload.len() as u64 + 1, hash.as_str()),
+            (
+                payload.len() as u64,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                crate::private_media_output(&output, response, 1024, Some(size), Some(digest))
+                    .await
+                    .is_err()
+            );
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        for succeeds in [true, false] {
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::private_media_output(
+                    &output,
+                    response,
+                    1024,
+                    Some(payload.len() as u64),
+                    Some(&hash)
+                )
+                .await
+                .is_ok(),
+                succeeds
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), payload);
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn video_receipt_binds_quality_before_any_network_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = Remote {
+            http: reqwest::Client::new(),
+            base: reqwest::Url::parse("http://127.0.0.1:1/").unwrap(),
+            token: "synthetic-token".into(),
+            account: Some("synthetic".into()),
+        };
+        let config = settings::File {
+            path: temp.path().join("client.toml"),
+            settings: Default::default(),
+        };
+        let make = |quality| {
+            receipt_with_video_quality(
+                &config,
+                &remote,
+                "filehelper",
+                "video",
+                "source-sha",
+                "quality-key",
+                None,
+                quality,
+            )
+        };
+        let (_, original) = make(Some("normal")).unwrap();
+        assert_eq!(original["sourceSha256"], "source-sha");
+        assert!(make(Some("normal")).is_ok());
+        assert!(make(Some("original"))
+            .unwrap_err()
+            .to_string()
+            .contains("idempotency_conflict"));
+        assert!(make(None).is_err());
+    }
+
+    #[test]
+    fn selected_payload_flag_controls_source_read_bound() {
+        assert_eq!(send_kind_source_limit("file").unwrap(), 536_870_912);
+        assert_eq!(send_kind_source_limit("video").unwrap(), 52_428_800);
+        for kind in ["image", "voice"] {
+            assert_eq!(send_kind_source_limit(kind).unwrap(), 26_214_383);
+        }
+        for unsupported in ["sticker", "text", "share", "unknown"] {
+            assert!(send_kind_source_limit(unsupported).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_ordinary_kinds_are_rejected_before_daemon_submission() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(wechat_core::MAX_ORDINARY_SOURCE_BYTES as u64 + 1)
+            .unwrap();
+        let remote = Remote {
+            http: reqwest::Client::new(),
+            base: reqwest::Url::parse("http://127.0.0.1:1/").unwrap(),
+            token: "synthetic-test-token".into(),
+            account: Some("synthetic".into()),
+        };
+        let config = settings::File {
+            path: temp.path().join("client.toml"),
+            settings: Default::default(),
+        };
+        for kind in ["image", "video", "voice"] {
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(send_kind_source_limit(kind).unwrap() as u64 + 1)
+                .unwrap();
+            let error = send(
+                &remote,
+                &config,
+                "filehelper".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                (kind == "image").then(|| path.clone()),
+                None,
+                (kind == "video").then(|| path.clone()),
+                None,
+                (kind == "voice").then(|| path.clone()),
+                Some("synthetic-key".into()),
+                false,
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("source must be a nonempty regular file"));
+        }
+    }
 }

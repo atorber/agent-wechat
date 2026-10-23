@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-pub const MAX_SOURCE_BYTES: usize = 25 * 1024 * 1024 - 17;
+/// Largest source accepted by staging; send limits depend on the selected kind.
+pub const MAX_SOURCE_BYTES: usize = wechat_media::MAX_FILE_BYTES;
+pub const MAX_ORDINARY_SOURCE_BYTES: usize = 25 * 1024 * 1024 - 17;
+pub const MAX_VIDEO_SOURCE_BYTES: usize = wechat_media::MAX_VIDEO_SOURCE_BYTES;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -12,6 +15,16 @@ pub enum MediaKind {
     Video,
     Voice,
     Sticker,
+}
+impl MediaKind {
+    pub fn max_source_bytes(self) -> usize {
+        match self {
+            Self::File => MAX_SOURCE_BYTES,
+            Self::Video => MAX_VIDEO_SOURCE_BYTES,
+            Self::Image | Self::Voice => MAX_ORDINARY_SOURCE_BYTES,
+            Self::Sticker => 0,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +45,13 @@ pub struct MediaTransferRequest {
     #[serde(default)]
     pub quality: MediaVariant,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSendQuality {
+    #[default]
+    Normal,
+    Original,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MediaSendRequest {
@@ -42,6 +62,9 @@ pub struct MediaSendRequest {
     pub thumbnail_source_id: Option<String>,
     pub play_seconds: Option<u32>,
     pub duration_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub video_quality: Option<VideoSendQuality>,
 }
 /// A separately hashed still image. Its bytes never replace the source asset.
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
@@ -113,4 +136,21 @@ pub struct MediaContent {
     pub sha256: String,
     pub filename: Option<String>,
     pub source_sha256: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_limit_does_not_expand_other_send_kinds() {
+        assert_eq!(MAX_SOURCE_BYTES, 536_870_912);
+        assert_eq!(MediaKind::File.max_source_bytes(), MAX_SOURCE_BYTES);
+        assert_eq!(MediaKind::Video.max_source_bytes(), 52_428_800);
+        for kind in [MediaKind::Image, MediaKind::Voice] {
+            assert_eq!(kind.max_source_bytes(), 26_214_383);
+            assert!(kind.max_source_bytes() < MAX_SOURCE_BYTES);
+        }
+        assert_eq!(MediaKind::Sticker.max_source_bytes(), 0);
+    }
 }

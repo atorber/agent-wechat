@@ -10,15 +10,56 @@ use std::{
     time::Duration,
 };
 use wechat_protocol::{
+    file_upload::FileUploadReservation,
     media::{
-        CdnClient, MediaDescriptor, MediaQuality, PreparedImageUpload, PreparedUpload,
-        PreparedVideoUpload, StickerDescriptor, UploadedImage, UploadedMedia, UploadedVideo,
+        CdnClient, LargeCdnRoute, MediaDescriptor, MediaQuality, PreparedImageUpload,
+        PreparedUpload, PreparedVideoUpload, StickerDescriptor, UploadedImage, UploadedMedia,
+        UploadedVideo,
     },
     NativeClient, NativeOptions,
 };
 use wechat_store::{MediaAssetRecord, MediaJobRecord, OwnedMediaSource};
 #[path = "media_identity.rs"]
 mod identity;
+#[path = "media_video.rs"]
+mod video;
+
+struct MediaAccountPermit {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    runtime: tokio::runtime::Handle,
+}
+impl MediaAccountPermit {
+    /// Video preparation and CDN I/O run without the account mutation guard. The independent
+    /// media-job guard remains held, so another queued file cannot start.
+    fn transfer<T>(
+        &mut self,
+        core: &Core,
+        account: &str,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        drop(self.guard.take().context("media account guard missing")?);
+        let result = action();
+        self.guard = Some(self.runtime.block_on(core.lock_account(account))?);
+        result
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct MediaAuthorizationFence {
+    authorization: [u8; 32],
+    logout_epoch: Option<Vec<u8>>,
+}
+fn cdn_transfer<T>(
+    permit: Option<&mut MediaAccountPermit>,
+    core: &Core,
+    account: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(permit) = permit {
+        permit.transfer(core, account, action)
+    } else {
+        action()
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
@@ -52,12 +93,15 @@ struct VoicePart {
 struct UploadMaterial {
     key: Vec<u8>,
     file_key: String,
+    #[serde(default)]
+    task_id: u64,
 }
 impl Drop for UploadMaterial {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.key.zeroize();
         self.file_key.zeroize();
+        self.task_id.zeroize();
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -66,15 +110,190 @@ struct SendPlan {
     client_id: String,
     created_at: u32,
     material: Option<UploadMaterial>,
+    #[serde(default)]
+    reservation: Option<FileUploadReservation>,
+    #[serde(default)]
+    file_upload_progress_id: Option<String>,
     uploaded_file: Option<UploadedMedia>,
     uploaded_image: Option<UploadedImage>,
     uploaded_video: Option<UploadedVideo>,
     #[serde(default)]
     prepared_video_thumbnail_source_id: Option<String>,
+    #[serde(default)]
+    prepared_video_source_id: Option<String>,
+    #[serde(default)]
+    original_video_material: Option<UploadMaterial>,
     voice: Vec<VoicePart>,
+    #[serde(default)]
+    reuse_completed_upload: Option<CompletedUploadReuse>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct CompletedUploadReuse {
+    version: u32,
+    source_sha256: String,
+    plan_binding_sha256: String,
+    authorization: MediaAuthorizationFence,
+}
+fn no_final_media_submission(row: &MediaJobRecord) -> bool {
+    row.data.is_object()
+        && (row.data["result"].is_null() || row.data["result"].is_object())
+        && row.data["serverMessageId"].is_null()
+        && row.data["result"]["nativeReceipt"].is_null()
+        && (row.data["result"]["messageIds"].is_null()
+            || row.data["result"]["messageIds"]
+                .as_array()
+                .is_some_and(|ids| ids.is_empty()))
+}
+fn validate_completed_upload_plan(
+    plan: &SendPlan,
+    source: &OwnedMediaSource,
+    source_md5: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        plan.request.kind == MediaKind::File
+            && plan.request.source_id == source.id
+            && plan.request.standard_source_id.is_none()
+            && plan.request.thumbnail_source_id.is_none()
+            && plan.uploaded_image.is_none()
+            && plan.uploaded_video.is_none()
+            && plan.voice.is_empty()
+            && source.byte_length > MAX_ORDINARY_SOURCE_BYTES as u64
+            && source.byte_length <= MAX_SOURCE_BYTES as u64,
+        "completed_upload_retry_not_admitted"
+    );
+    validate_destination(&plan.request.thread_id)?;
+    let uploaded = plan
+        .uploaded_file
+        .as_ref()
+        .context("completed_upload_retry_not_admitted")?;
+    let material = plan
+        .material
+        .as_ref()
+        .context("completed_upload_retry_not_admitted")?;
+    let reservation = plan
+        .reservation
+        .as_ref()
+        .context("completed_upload_retry_not_admitted")?;
+    reservation.validate()?;
+    let progress = plan
+        .file_upload_progress_id
+        .as_deref()
+        .context("completed_upload_retry_not_admitted")?;
+    let prefix = format!("{}_{}_", plan.request.thread_id, plan.created_at);
+    let suffix = progress
+        .strip_prefix(&prefix)
+        .context("completed_upload_retry_not_admitted")?;
+    let local = suffix
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .context("completed_upload_retry_not_admitted")?;
+    ensure!(
+        plan.created_at > 0
+            && suffix == local.to_string()
+            && plan.client_id == format!("{progress}_xwechat_1")
+            && plan.client_id.len() <= 1024
+            && material.task_id != 0
+            && material.key.len() == 16
+            && material.file_key.len() == 32
+            && material.file_key.bytes().all(|b| b.is_ascii_hexdigit())
+            && uploaded.descriptor.aes_key == material.key
+            && uploaded.descriptor.quality == file_upload_quality(source.byte_length as usize)
+            && uploaded.descriptor.strict_size
+            && uploaded.descriptor.expected_bytes == Some(source.byte_length)
+            && uploaded.descriptor.expected_md5.as_deref() == Some(uploaded.md5.as_str())
+            && !uploaded.descriptor.file_id.is_empty()
+            && uploaded.descriptor.file_id.len() <= 8192
+            && !uploaded.descriptor.file_id.chars().any(char::is_control)
+            && uploaded.plaintext_bytes as u64 == source.byte_length
+            && uploaded.file_name == source.name
+            && uploaded.sha256 == source.sha256
+            && source.sha256.len() == 64
+            && source.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            && uploaded.md5.len() == 32
+            && uploaded.md5.bytes().all(|b| b.is_ascii_hexdigit())
+            && source_md5.is_none_or(|value| value == uploaded.md5),
+        "completed_upload_retry_not_admitted"
+    );
+    if let Some(reuse) = &plan.reuse_completed_upload {
+        ensure!(
+            reuse.version == 1
+                && reuse.source_sha256 == source.sha256
+                && reuse.plan_binding_sha256 == completed_upload_binding(plan)?,
+            "completed_upload_retry_not_admitted"
+        );
+    }
+    Ok(())
+}
+fn completed_upload_binding(plan: &SendPlan) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&json!({
+        "request":plan.request,"clientId":plan.client_id,"createdAt":plan.created_at,
+        "material":plan.material,"reservation":plan.reservation,
+        "progressId":plan.file_upload_progress_id,"uploadedFile":plan.uploaded_file
+    }))?))
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+fn validate_send_source_sizes(
+    request: &MediaSendRequest,
+    primary: u64,
+    standard: Option<u64>,
+    thumbnail: Option<u64>,
+) -> Result<()> {
+    ensure!(
+        request.kind == MediaKind::Video || request.video_quality.is_none(),
+        "invalid_video_quality"
+    );
+    ensure!(
+        request.kind == MediaKind::Image || standard.is_none(),
+        "unsupported_standard_variant"
+    );
+    ensure!(
+        matches!(request.kind, MediaKind::Image | MediaKind::Video) || thumbnail.is_none(),
+        "unsupported_thumbnail_variant"
+    );
+    ensure!(
+        primary > 0 && primary <= request.kind.max_source_bytes() as u64,
+        "source_size_limit"
+    );
+    for size in [standard, thumbnail].into_iter().flatten() {
+        ensure!(
+            size > 0 && size <= MAX_ORDINARY_SOURCE_BYTES as u64,
+            "source_size_limit"
+        );
+    }
+    Ok(())
+}
+fn file_upload_quality(bytes: usize) -> MediaQuality {
+    if bytes > wechat_protocol::media::MAX_CDN_TRANSFER_BYTES {
+        MediaQuality::LargeFile
+    } else {
+        MediaQuality::File
+    }
+}
+fn file_uses_multiphase(bytes: usize) -> bool {
+    bytes > MAX_ORDINARY_SOURCE_BYTES
+}
+fn new_upload_task_id() -> Result<u64> {
+    Ok(u64::from_le_bytes(wechat_protocol::crypto::random::<8>()?).max(1))
+}
+fn initialize_file_upload_ids(plan: &mut SendPlan, source_bytes: usize) -> Result<bool> {
+    if plan.request.kind != MediaKind::File || source_bytes <= MAX_ORDINARY_SOURCE_BYTES {
+        return Ok(false);
+    }
+    if plan.file_upload_progress_id.is_some() {
+        return Ok(false);
+    }
+    ensure!(
+        plan.reservation.is_none() && plan.uploaded_file.is_none(),
+        "file_reservation_needs_review"
+    );
+    let local = u32::from_le_bytes(wechat_protocol::crypto::random::<4>()?).max(1);
+    let progress_id = format!("{}_{}_{local}", plan.request.thread_id, plan.created_at);
+    plan.client_id = format!("{progress_id}_xwechat_1");
+    plan.file_upload_progress_id = Some(progress_id);
+    Ok(true)
 }
 fn wxgf_preview_source_id(source_sha256: &str) -> String {
     format!("wxgf-preview-v1_{source_sha256}")
@@ -86,7 +305,10 @@ fn media_request_hash(
     thumbnail: Option<&str>,
     filename: Option<&str>,
 ) -> Result<String> {
-    let normalized = json!({"threadId":request.thread_id,"kind":request.kind,"playSeconds":request.play_seconds,"durationMs":request.duration_ms,"filename":filename,"sourceHashes":{"primary":primary,"standard":standard,"thumbnail":thumbnail}});
+    let mut normalized = json!({"threadId":request.thread_id,"kind":request.kind,"playSeconds":request.play_seconds,"durationMs":request.duration_ms,"filename":filename,"sourceHashes":{"primary":primary,"standard":standard,"thumbnail":thumbnail}});
+    if let Some(quality) = request.video_quality {
+        normalized["videoQuality"] = serde_json::to_value(quality)?;
+    }
     Ok(digest(&serde_json::to_vec(&normalized)?))
 }
 fn public_job(account: &str, row: &MediaJobRecord) -> MediaJob {
@@ -138,7 +360,9 @@ impl Core {
             "invalid_content_type"
         );
         let id = format!("upload_{}", uuid::Uuid::new_v4());
-        let sealed = self.vault.seal(account, &format!("source:{id}"), bytes)?;
+        let sealed = self
+            .vault
+            .seal_media(account, &format!("source:{id}"), bytes)?;
         self.store.create_media_source(
             account,
             &id,
@@ -151,10 +375,10 @@ impl Core {
     }
     fn source_bytes(&self, account: &str, id: &str) -> Result<(OwnedMediaSource, Vec<u8>)> {
         let (meta, sealed) = self.store.media_source(account, id)?;
-        let bytes = self
+        let mut opened = self
             .vault
-            .open_record(account, &format!("source:{id}"), &sealed)?
-            .to_vec();
+            .open_media_record(account, &format!("source:{id}"), &sealed)?;
+        let bytes = std::mem::take(&mut *opened);
         ensure!(
             bytes.len() as u64 == meta.byte_length && digest(&bytes) == meta.sha256,
             "source_integrity_failed"
@@ -167,15 +391,19 @@ impl Core {
         Ok(serde_json::from_value(row.metadata)?)
     }
     pub fn media_content(&self, account: &str, id: &str) -> Result<MediaContent> {
-        let row = self.store.media_asset(account, id)?;
+        let metadata = self.store.media_asset(account, id)?;
+        self.authorize_media_record(account, &metadata)?;
+        let asset: MediaAsset = serde_json::from_value(metadata.metadata)?;
+        ensure!(asset.state == "available", "media_not_available");
+        let row = self.store.media_asset_with_payload(account, id)?;
         self.authorize_media_record(account, &row)?;
         let asset: MediaAsset = serde_json::from_value(row.metadata.clone())?;
         ensure!(asset.state == "available", "media_not_available");
         let sealed = row.payload.as_deref().context("media_not_cached")?;
-        let bytes = self
+        let mut opened = self
             .vault
-            .open_record(account, &format!("asset:{id}"), sealed)?
-            .to_vec();
+            .open_media_record(account, &format!("asset:{id}"), sealed)?;
+        let bytes = std::mem::take(&mut *opened);
         ensure!(
             asset.byte_length == Some(bytes.len() as u64)
                 && asset.sha256.as_deref() == Some(&digest(&bytes)),
@@ -237,6 +465,86 @@ impl Core {
         let row = self.store.retry_media_job(account, id)?;
         self.spawn_media_worker(account, id);
         Ok(public_job(account, &row))
+    }
+    pub async fn retry_media_job_reuse_completed_upload(
+        self: &Arc<Self>,
+        account: &str,
+        id: &str,
+    ) -> Result<MediaJob> {
+        let guard = self.lock_account(account).await?;
+        let core = self.clone();
+        let account = account.to_owned();
+        let id = id.to_owned();
+        let (row, account) = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let row = core.queue_completed_upload_reuse(&account, &id)?;
+            Ok::<_, anyhow::Error>((row, account))
+        })
+        .await
+        .context("media_retry_admission_stopped")??;
+        self.spawn_media_worker(&account, &row.id);
+        Ok(public_job(&account, &row))
+    }
+    fn queue_completed_upload_reuse(&self, account: &str, id: &str) -> Result<MediaJobRecord> {
+        ensure!(
+            !self.media_network_suspended(account)? && !self.stopping.load(Ordering::Acquire),
+            "media_disconnected"
+        );
+        let expected = self.store.media_job(account, id)?;
+        ensure!(
+            expected.kind == "send"
+                && expected.state == "unsupported"
+                && expected.phase == "readback"
+                && expected.error_code.as_deref() == Some("unsupported_media")
+                && expected.attempts < 3
+                && !expected.cancel_requested
+                && no_final_media_submission(&expected),
+            "completed_upload_retry_not_admitted"
+        );
+        let mut plan: SendPlan = serde_json::from_slice(&self.vault.open_record(
+            account,
+            &format!("media-job:{id}"),
+            &expected.payload,
+        )?)?;
+        let source = self
+            .store
+            .media_source_metadata(account, &plan.request.source_id)?;
+        validate_completed_upload_plan(&plan, &source, None)?;
+        let authorization = self.media_authorization_fence(account)?;
+        plan.reuse_completed_upload = Some(CompletedUploadReuse {
+            version: 1,
+            source_sha256: source.sha256.clone(),
+            plan_binding_sha256: completed_upload_binding(&plan)?,
+            authorization: authorization.clone(),
+        });
+        let payload = self.vault.seal(
+            account,
+            &format!("media-job:{id}"),
+            &serde_json::to_vec(&plan)?,
+        )?;
+        let state_cipher = self
+            .store
+            .runtime(account, "account-state")?
+            .context("auth_required")?;
+        let request_hash = media_request_hash(
+            &plan.request,
+            &source.sha256,
+            None,
+            None,
+            Some(&source.name),
+        )?;
+        self.store.retry_media_job_completed_upload(
+            account,
+            wechat_store::CompletedUploadRetry {
+                expected: &expected,
+                source: &source,
+                request_hash: &request_hash,
+                expected_authorization: &state_cipher,
+                expected_logout_epoch: authorization.logout_epoch.as_deref(),
+                ownership_generation: &self.ownership_generation,
+                payload: &payload,
+            },
+        )
     }
     pub fn resume_media_jobs(self: &Arc<Self>) -> Result<usize> {
         let mut n = 0;
@@ -428,7 +736,7 @@ impl Core {
                     asset = self.cache_asset(
                         account,
                         &id,
-                        cached.media.bytes,
+                        &cached.media.bytes,
                         &cached.media.media_type,
                         match cached.quality {
                             wechat_profile::VerifiedImageQuality::Original => {
@@ -461,7 +769,7 @@ impl Core {
                                 asset = self.cache_asset(
                                     account,
                                     &id,
-                                    cached.bytes,
+                                    &cached.bytes,
                                     &mime,
                                     Some(variant),
                                     frames,
@@ -597,8 +905,15 @@ impl Core {
         self: &Arc<Self>,
         account: &str,
         key: &str,
-        request: MediaSendRequest,
+        mut request: MediaSendRequest,
     ) -> Result<MediaJob> {
+        ensure!(
+            request.kind == MediaKind::Video || request.video_quality.is_none(),
+            "invalid_video_quality"
+        );
+        if request.kind == MediaKind::Video {
+            request.video_quality = Some(request.video_quality.unwrap_or_default());
+        }
         self.account_state(account)?;
         if self.store.send_by_key(account, key).is_ok() {
             bail!("idempotency_conflict");
@@ -626,30 +941,44 @@ impl Core {
             "sticker_send_unsupported"
         );
         let (source, _) = self.source_bytes(account, &request.source_id)?;
-        let source_hash = |id: &Option<String>| -> Result<Option<String>> {
+        let extra_source = |id: &Option<String>| -> Result<Option<OwnedMediaSource>> {
             id.as_ref()
-                .map(|id| Ok(self.store.media_source(account, id)?.0.sha256))
+                .map(|id| self.store.media_source_metadata(account, id))
                 .transpose()
         };
+        let standard = extra_source(&request.standard_source_id)?;
+        let thumbnail = extra_source(&request.thumbnail_source_id)?;
+        validate_send_source_sizes(
+            &request,
+            source.byte_length,
+            standard.as_ref().map(|source| source.byte_length),
+            thumbnail.as_ref().map(|source| source.byte_length),
+        )?;
         let hash = media_request_hash(
             &request,
             &source.sha256,
-            source_hash(&request.standard_source_id)?.as_deref(),
-            source_hash(&request.thumbnail_source_id)?.as_deref(),
+            standard.as_ref().map(|source| source.sha256.as_str()),
+            thumbnail.as_ref().map(|source| source.sha256.as_str()),
             (request.kind == MediaKind::File).then_some(source.name.as_str()),
         )?;
         let id = format!("job_{}", uuid::Uuid::new_v4());
-        let plan = SendPlan {
+        let mut plan = SendPlan {
             request: request.clone(),
             client_id: format!("aw_{}", uuid::Uuid::new_v4().simple()),
             created_at: wechat_protocol::wire::unix_time()?,
             material: None,
+            reservation: None,
+            file_upload_progress_id: None,
             uploaded_file: None,
             uploaded_image: None,
             uploaded_video: None,
             prepared_video_thumbnail_source_id: None,
+            prepared_video_source_id: None,
+            original_video_material: None,
             voice: vec![],
+            reuse_completed_upload: None,
         };
+        initialize_file_upload_ids(&mut plan, source.byte_length as usize)?;
         let payload = self.vault.seal(
             account,
             &format!("media-job:{id}"),
@@ -673,7 +1002,7 @@ impl Core {
         &self,
         account: &str,
         id: &str,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         mime: &str,
         actual: Option<MediaVariant>,
         frames: Option<u32>,
@@ -684,14 +1013,14 @@ impl Core {
                 matches!(asset.kind, MediaKind::Image | MediaKind::Sticker),
                 "unsupported_media"
             );
-            Some(self.cache_wxgf_preview(account, id, &bytes)?)
+            Some(self.cache_wxgf_preview(account, id, bytes)?)
         } else {
             None
         };
         asset.state = "available".into();
         asset.content_type = Some(mime.into());
         asset.byte_length = Some(bytes.len() as u64);
-        asset.sha256 = Some(digest(&bytes));
+        asset.sha256 = Some(digest(bytes));
         asset.actual_variant = actual;
         asset.retryable = false;
         asset.reason = None;
@@ -700,7 +1029,9 @@ impl Core {
         if mime == "image/x-wxgf" {
             asset.filename = Some(format!("{id}.wxgf"));
         }
-        let sealed = self.vault.seal(account, &format!("asset:{id}"), &bytes)?;
+        let sealed = self
+            .vault
+            .seal_media(account, &format!("asset:{id}"), bytes)?;
         self.authorize_media_record(account, &self.store.media_asset(account, id)?)?;
         self.store
             .save_media_asset(account, id, &serde_json::to_value(&asset)?, Some(&sealed))?;
@@ -714,7 +1045,7 @@ impl Core {
     ) -> Result<MediaImagePreview> {
         let source_sha256 = digest(bytes);
         let id = wxgf_preview_source_id(&source_sha256);
-        let source = if self.store.media_source(account, &id).is_ok() {
+        let source = if self.store.media_source_metadata(account, &id).is_ok() {
             self.source_bytes(account, &id)?.0
         } else {
             let decoded = wechat_media::wxgf_preview(bytes)?;
@@ -778,30 +1109,32 @@ impl Core {
         Ok(disconnected || auto_disabled)
     }
     async fn run_media_worker(self: Arc<Self>, account: &str, id: &str) -> Result<()> {
-        let _guard = self.lock_account(account).await?;
+        let media_guard = self.lock_media_job(account).await?;
+        let guard = self.lock_account(account).await?;
         if self.media_network_suspended(account)? {
             return Ok(());
         }
         let core = self.clone();
         let account = account.to_string();
         let id = id.to_string();
+        let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
+            let _media_guard = media_guard;
+            let mut permit = MediaAccountPermit {
+                guard: Some(guard),
+                runtime,
+            };
             if !core.store.claim_media_job(&account, &id)? {
                 return Ok(());
             }
             let row = core.store.media_job(&account, &id)?;
             let outcome = if row.kind == "download" {
-                core.perform_download(&account, &id)
+                core.perform_download_guarded(&account, &id, Some(&mut permit))
             } else {
-                core.perform_media_send(&account, &id)
+                core.perform_media_send_guarded(&account, &id, Some(&mut permit))
             };
             if let Err(error) = outcome {
-                let mut row = core.store.media_job(&account, &id)?;
-                if let Some((stage, code)) = service_diagnostic(&error) {
-                    row.data["result"]["serviceStage"] = stage.into();
-                    row.data["result"]["serviceCode"] = code.into();
-                    core.store.save_media_job(&account, &row)?;
-                }
+                core.record_media_failure_diagnostics(&account, &id, &error)?;
                 core.fail_media_job(&account, &id, &classify_error(&error))?;
             }
             Ok(())
@@ -809,8 +1142,37 @@ impl Core {
         .await
         .context("media_worker_stopped")?
     }
-    fn progress_media(&self, account: &str, id: &str, done: u64, total: Option<u64>) -> Result<()> {
+    fn record_media_failure_diagnostics(
+        &self,
+        account: &str,
+        id: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let service = service_diagnostic(error);
+        let cdn = cdn_download_failure(error);
+        if service.is_none() && cdn.is_none() {
+            return Ok(());
+        }
         let mut row = self.store.media_job(account, id)?;
+        if let Some((stage, code)) = service {
+            row.data["result"]["serviceStage"] = stage.into();
+            row.data["result"]["serviceCode"] = code.into();
+        }
+        if let Some(detail) = cdn {
+            row.data["result"]["cdnDownloadFailure"] = detail;
+        }
+        self.store.save_media_job(account, &row)?;
+        Ok(())
+    }
+    fn progress_media(&self, account: &str, id: &str, done: u64, total: Option<u64>) -> Result<()> {
+        let mut row = self.active_media_job(account, id)?;
+        row.data["completedBytes"] = done.into();
+        row.data["totalBytes"] = total.into();
+        self.store.save_media_job(account, &row)?;
+        Ok(())
+    }
+    fn active_media_job(&self, account: &str, id: &str) -> Result<MediaJobRecord> {
+        let row = self.store.media_job(account, id)?;
         ensure!(!row.cancel_requested, "media_cancelled");
         ensure!(
             self.store.runtime(account, "logged-out")?.is_none(),
@@ -824,10 +1186,60 @@ impl Core {
             !self.stopping.load(Ordering::Acquire),
             "media_worker_stopping"
         );
-        row.data["completedBytes"] = done.into();
-        row.data["totalBytes"] = total.into();
-        self.store.save_media_job(account, &row)?;
-        Ok(())
+        Ok(row)
+    }
+    fn media_authorization_fence(&self, account: &str) -> Result<MediaAuthorizationFence> {
+        let logout_epoch = self.store.runtime(account, "logout-epoch")?;
+        let encrypted = self
+            .store
+            .runtime(account, "account-state")?
+            .context("auth_required")?;
+        ensure!(
+            self.store.saved_login_authorization_current(
+                account,
+                &encrypted,
+                logout_epoch.as_deref()
+            )?,
+            "media_authorization_changed"
+        );
+        Ok(MediaAuthorizationFence {
+            authorization: crate::runtime::authorization(&self.account_state(account)?)?,
+            logout_epoch,
+        })
+    }
+    fn resume_media_state(
+        &self,
+        account: &str,
+        id: &str,
+        fence: &MediaAuthorizationFence,
+    ) -> Result<wechat_protocol::AccountState> {
+        let current = self
+            .media_authorization_fence(account)
+            .map_err(|_| anyhow::anyhow!("media_authorization_changed"))?;
+        ensure!(
+            current.authorization == fence.authorization
+                && current.logout_epoch == fence.logout_epoch,
+            "media_authorization_changed"
+        );
+        self.active_media_job(account, id)?;
+        // Push can replace the cookie while CDN I/O is in progress. Never save
+        // the pre-transfer AccountState over that newly accepted state.
+        self.account_state(account)
+    }
+    fn complete_file_cdn_upload(
+        &self,
+        account: &str,
+        id: &str,
+        plan: &mut SendPlan,
+        uploaded: UploadedMedia,
+        fence: Option<&MediaAuthorizationFence>,
+    ) -> Result<Option<wechat_protocol::AccountState>> {
+        // Completion metadata survives a late cancellation or authorization fence.
+        plan.uploaded_file = Some(uploaded);
+        self.save_send_plan(account, id, plan)?;
+        fence
+            .map(|fence| self.resume_media_state(account, id, fence))
+            .transpose()
     }
     fn fail_media_job(&self, account: &str, id: &str, code: &str) -> Result<()> {
         let mut row = self.store.media_job(account, id)?;
@@ -837,8 +1249,12 @@ impl Core {
         ) {
             return Ok(());
         }
-        let uncertain =
-            row.kind == "send" && matches!(row.phase.as_str(), "uploading" | "submitting");
+        let uncertain = row.kind == "send"
+            && (matches!(row.phase.as_str(), "reserving" | "uploading" | "submitting")
+                || matches!(
+                    code,
+                    "file_reservation_needs_review" | "media_authorization_changed"
+                ));
         row.state = if uncertain {
             "needs_review"
         } else if code == "media_cancelled" {
@@ -887,7 +1303,16 @@ impl Core {
         row.phase = phase.into();
         self.store.save_media_job(account, &row)
     }
+    #[cfg(test)]
     pub(crate) fn perform_download(&self, account: &str, id: &str) -> Result<()> {
+        self.perform_download_guarded(account, id, None)
+    }
+    fn perform_download_guarded(
+        &self,
+        account: &str,
+        id: &str,
+        permit: Option<&mut MediaAccountPermit>,
+    ) -> Result<()> {
         let row = self.store.media_job(account, id)?;
         let asset_id = row.data["assetId"]
             .as_str()
@@ -919,17 +1344,41 @@ impl Core {
             } => {
                 let mut state = self.account_state(account)?;
                 let native = NativeClient::new(NativeOptions::default())?;
-                let conf = match native.cdn_config(&mut state) {
+                let load_config = |state: &mut wechat_protocol::AccountState| {
+                    if descriptor.quality == MediaQuality::LargeFile {
+                        native.large_cdn_config(state, LargeCdnRoute::Download)
+                    } else if descriptor.quality == MediaQuality::Video
+                        && descriptor
+                            .expected_bytes
+                            .is_some_and(|size| size > 25 * 1024 * 1024)
+                    {
+                        native.large_cdn_config(state, LargeCdnRoute::VideoDownload)
+                    } else {
+                        native.cdn_config(state)
+                    }
+                };
+                let conf = match load_config(&mut state) {
                     Ok(conf) => conf,
                     Err(error) if is_media_auth_rejected(&error) => {
                         state = native.renew_session(&state, "agent-wechat media")?;
-                        native.cdn_config(&mut state)?
+                        load_config(&mut state)?
                     }
                     Err(error) => return Err(error),
                 };
                 self.save_state(account, &state)?;
                 let cdn = CdnClient::new(conf, Duration::from_secs(25))?;
-                let media = cdn.download_with_progress(&descriptor, progress)?;
+                let unlocked =
+                    permit.is_some() && matches!(asset.kind, MediaKind::File | MediaKind::Video);
+                let fence = unlocked
+                    .then(|| self.media_authorization_fence(account))
+                    .transpose()?;
+                let media =
+                    cdn_transfer(if unlocked { permit } else { None }, self, account, || {
+                        cdn.download_with_progress(&descriptor, progress)
+                    })?;
+                if let Some(fence) = fence {
+                    self.resume_media_state(account, id, &fence)?;
+                }
                 if link_thumbnail {
                     ensure!(
                         media.bytes.len() <= wechat_protocol::media::MAX_LINK_THUMBNAIL_BYTES,
@@ -1037,7 +1486,7 @@ impl Core {
             DownloadPlan::CachedOnly => bail!("unsupported_media_transport"),
         };
         self.progress_media(account, id, bytes.len() as u64, Some(bytes.len() as u64))?;
-        let mut asset = self.cache_asset(account, asset_id, bytes, &mime, actual, frames)?;
+        let mut asset = self.cache_asset(account, asset_id, &bytes, &mime, actual, frames)?;
         if let Some(status) = official_writeback {
             asset.official_writeback = status.into();
             self.store
@@ -1088,13 +1537,13 @@ impl Core {
         if asset.actual_variant != Some(asset.variant) {
             return Ok(asset);
         }
-        let record = self.store.media_asset(account, &asset.id)?;
+        let record = self.store.media_asset_with_payload(account, &asset.id)?;
         let Some(sealed) = record.payload else {
             return Ok(asset);
         };
-        let bytes = self
-            .vault
-            .open_record(account, &format!("asset:{}", asset.id), &sealed)?;
+        let bytes =
+            self.vault
+                .open_media_record(account, &format!("asset:{}", asset.id), &sealed)?;
         ensure!(
             asset.byte_length == Some(bytes.len() as u64)
                 && asset.sha256.as_deref() == Some(digest(&bytes).as_str()),
@@ -1292,6 +1741,18 @@ impl Core {
 
 // Only a whole numeric suffix on these fixed library messages may cross the
 // protected boundary. General error strings can contain URLs or account data.
+fn cdn_download_failure(error: &anyhow::Error) -> Option<serde_json::Value> {
+    use wechat_protocol::media::LargeFileDownloadError;
+    let failure = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LargeFileDownloadError>())?;
+    Some(match failure {
+        LargeFileDownloadError::UnknownField => json!({"kind":"unknown_field"}),
+        LargeFileDownloadError::FixedControlMismatch { control, actual } => {
+            json!({"kind":"fixed_control_mismatch","field":control.field_name(),"actual":actual})
+        }
+    })
+}
 fn service_diagnostic(error: &anyhow::Error) -> Option<(&'static str, i32)> {
     for cause in error.chain() {
         let message = cause.to_string();
@@ -1337,6 +1798,9 @@ fn classify_error(error: &anyhow::Error) -> String {
     for cause in error.chain() {
         let message = cause.to_string();
         if [
+            "file_reservation_needs_review",
+            "media_authorization_changed",
+            "source_size_limit",
             "image_size_limit",
             "image_decode_limit",
             "image_decode_failed",
@@ -1688,7 +2152,9 @@ fn discover(msg: &wechat_profile::Message, content: &str) -> Result<Vec<Discover
                             .context("unsupported_attachment_transport")?
                             .into(),
                         aes_key: key(value("aeskey"))?,
-                        quality: MediaQuality::File,
+                        quality: file_upload_quality(usize::try_from(
+                            number(value("totallen")).unwrap_or(0),
+                        )?),
                         expected_bytes: number(value("totallen")),
                         expected_md5: child("md5").and_then(|n| n.text()).map(str::to_string),
                         strict_size: true,
@@ -1778,7 +2244,85 @@ impl Core {
         self.store.save_media_job(account, &row)?;
         Ok(())
     }
+    fn ensure_upload_material(&self, account: &str, id: &str, plan: &mut SendPlan) -> Result<()> {
+        let mut changed = if let Some(material) = plan.material.as_mut() {
+            if material.task_id == 0 {
+                material.task_id = new_upload_task_id()?;
+                true
+            } else {
+                false
+            }
+        } else {
+            plan.material = Some(UploadMaterial {
+                key: wechat_protocol::crypto::random::<16>()?.to_vec(),
+                file_key: hex_string(&wechat_protocol::crypto::random::<16>()?),
+                task_id: new_upload_task_id()?,
+            });
+            true
+        };
+        if plan.request.video_quality == Some(VideoSendQuality::Original) {
+            if let Some(material) = plan.original_video_material.as_mut() {
+                if material.task_id == 0 {
+                    material.task_id = new_upload_task_id()?;
+                    changed = true;
+                }
+            } else {
+                plan.original_video_material = Some(UploadMaterial {
+                    key: wechat_protocol::crypto::random::<16>()?.to_vec(),
+                    file_key: hex_string(&wechat_protocol::crypto::random::<16>()?),
+                    task_id: new_upload_task_id()?,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_send_plan(account, id, plan)?;
+        }
+        Ok(())
+    }
+    fn reserve_media_file_upload(
+        &self,
+        account: &str,
+        id: &str,
+        plan: &mut SendPlan,
+        source_bytes: usize,
+        reserve: impl FnOnce() -> Result<FileUploadReservation>,
+    ) -> Result<bool> {
+        if plan.request.kind != MediaKind::File || source_bytes <= MAX_ORDINARY_SOURCE_BYTES {
+            return Ok(false);
+        }
+        ensure!(
+            plan.file_upload_progress_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            "file_reservation_needs_review"
+        );
+        if let Some(reservation) = &plan.reservation {
+            reservation.validate()?;
+            return Ok(false);
+        }
+        ensure!(
+            self.store.media_job(account, id)?.phase != "reserving",
+            "file_reservation_needs_review"
+        );
+        // CGI6691 can create account state. Persist this boundary first and
+        // retain the receipt before any state write or transfer can fail.
+        self.phase_media(account, id, "reserving")?;
+        plan.reservation = Some(reserve()?);
+        plan.reservation.as_ref().unwrap().validate()?;
+        self.save_send_plan(account, id, plan)?;
+        Ok(true)
+    }
+    #[cfg(test)]
     fn perform_media_send(&self, account: &str, id: &str) -> Result<()> {
+        self.perform_media_send_guarded(account, id, None)
+    }
+    fn perform_media_send_guarded(
+        &self,
+        account: &str,
+        id: &str,
+        mut permit: Option<&mut MediaAccountPermit>,
+    ) -> Result<()> {
         let row = self.store.media_job(account, id)?;
         let mut plan: SendPlan = serde_json::from_slice(&self.vault.open_record(
             account,
@@ -1787,13 +2331,108 @@ impl Core {
         )?)?;
         self.progress_media(account, id, 0, None)?;
         let (source, bytes) = self.source_bytes(account, &plan.request.source_id)?;
+        let source_size = |id: &Option<String>| -> Result<Option<u64>> {
+            id.as_ref()
+                .map(|id| Ok(self.store.media_source_metadata(account, id)?.byte_length))
+                .transpose()
+        };
+        validate_send_source_sizes(
+            &plan.request,
+            source.byte_length,
+            source_size(&plan.request.standard_source_id)?,
+            source_size(&plan.request.thumbnail_source_id)?,
+        )?;
+        if let Some(id) = &plan.prepared_video_thumbnail_source_id {
+            ensure!(
+                self.store.media_source_metadata(account, id)?.byte_length
+                    <= MAX_ORDINARY_SOURCE_BYTES as u64,
+                "source_size_limit"
+            );
+        }
+        if row.phase == "readback"
+            && plan.request.kind == MediaKind::File
+            && bytes.len() > MAX_ORDINARY_SOURCE_BYTES
+        {
+            ensure!(
+                plan.reservation.is_some() && plan.uploaded_file.is_some(),
+                "file_reservation_needs_review"
+            );
+        }
+        if plan.reuse_completed_upload.is_some() {
+            // This protected mode branches before every material, reservation
+            // and upload path. Authenticate the source before any network I/O.
+            let source_md5 = hex_string(&wechat_protocol::crypto::md5(&bytes));
+            drop(bytes);
+            let native = NativeClient::new(NativeOptions::default())?;
+            return self.perform_reused_file_send(
+                account,
+                id,
+                &plan,
+                (&source, &source_md5),
+                |uploaded, state| {
+                    let conf = if uploaded.descriptor.quality == MediaQuality::LargeFile {
+                        native.large_cdn_config(state, LargeCdnRoute::Download)?
+                    } else {
+                        native.cdn_config(state)?
+                    };
+                    self.save_state(account, state)?;
+                    let cdn = CdnClient::new(conf, Duration::from_secs(25))?;
+                    let fence = self.media_authorization_fence(account)?;
+                    let downloaded = cdn_transfer(permit, self, account, || {
+                        cdn.download_with_progress(&uploaded.descriptor, |n, t| {
+                            self.progress_media(account, id, n, t)
+                        })
+                    })?;
+                    *state = self.resume_media_state(account, id, &fence)?;
+                    Ok(downloaded.sha256)
+                },
+                |plan, state| {
+                    native.send_file_with_reservation(
+                        state,
+                        &plan.request.thread_id,
+                        &plan.client_id,
+                        plan.created_at,
+                        plan.uploaded_file.as_ref().unwrap(),
+                        plan.reservation.as_ref(),
+                    )
+                },
+            );
+        }
         let native = NativeClient::new(NativeOptions::default())?;
         let mut state = self.account_state(account)?;
-        if plan.request.kind == MediaKind::Video && plan.request.play_seconds.is_none() {
-            plan.request.play_seconds = Some(video_duration(&bytes, || {
-                self.progress_media(account, id, 0, None)
-            })?);
-            self.save_send_plan(account, id, &plan)?;
+        if plan.request.kind == MediaKind::Video {
+            if plan.request.video_quality.is_some() && plan.prepared_video_source_id.is_none() {
+                ensure!(plan.uploaded_video.is_none(), "video_preparation_missing");
+                let fence = self.media_authorization_fence(account)?;
+                let (seconds, normal) = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                    let seconds =
+                        video_duration(&bytes, || self.progress_media(account, id, 0, None))?;
+                    let normal = video::prepare_normal(&bytes, seconds, || {
+                        self.progress_media(account, id, 0, None)
+                    })?;
+                    Ok((seconds, normal))
+                })?;
+                state = self.resume_media_state(account, id, &fence)?;
+                let prepared =
+                    self.upload_source(account, "video-normal.mp4", "video/mp4", &normal)?;
+                plan.request.play_seconds = Some(seconds);
+                plan.prepared_video_source_id = Some(prepared.id);
+                self.save_send_plan(account, id, &plan)?;
+                let mut row = self.store.media_job(account, id)?;
+                row.data["result"]["videoPreparation"] = json!({
+                    "quality": plan.request.video_quality,
+                    "sourceSha256": source.sha256,
+                    "normalSha256": digest(&normal),
+                    "normalBytes": normal.len(),
+                    "originalIncluded": plan.request.video_quality == Some(VideoSendQuality::Original)
+                });
+                self.store.save_media_job(account, &row)?;
+            } else if plan.request.play_seconds.is_none() {
+                plan.request.play_seconds = Some(video_duration(&bytes, || {
+                    self.progress_media(account, id, 0, None)
+                })?);
+                self.save_send_plan(account, id, &plan)?;
+            }
         }
         if plan.request.kind == MediaKind::Voice {
             if plan.voice.is_empty() {
@@ -1875,41 +2514,88 @@ impl Core {
                 },
             );
         }
-        if plan.material.is_none() {
-            plan.material = Some(UploadMaterial {
-                key: wechat_protocol::crypto::random::<16>()?.to_vec(),
-                file_key: hex_string(&wechat_protocol::crypto::random::<16>()?),
-            });
+        if initialize_file_upload_ids(&mut plan, bytes.len())? {
+            ensure!(
+                matches!(row.phase.as_str(), "queued" | "preparing"),
+                "file_reservation_needs_review"
+            );
             self.save_send_plan(account, id, &plan)?;
         }
-        let material = plan.material.as_ref().unwrap();
-        let mut conf = match native.cdn_config(&mut state) {
+        self.ensure_upload_material(account, id, &mut plan)?;
+        let modern_file = plan.request.kind == MediaKind::File && file_uses_multiphase(bytes.len());
+        let load_config = |state: &mut wechat_protocol::AccountState, route| {
+            if let Some(route) = route {
+                native.large_cdn_config(state, route)
+            } else {
+                native.cdn_config(state)
+            }
+        };
+        let upload_route = modern_file.then_some(LargeCdnRoute::Upload);
+        let mut conf = match load_config(&mut state, upload_route) {
             Ok(conf) => conf,
             Err(error) if is_media_auth_rejected(&error) => {
                 state = native.renew_session(&state, "agent-wechat media")?;
-                native.cdn_config(&mut state)?
+                load_config(&mut state, upload_route)?
             }
             Err(e) => return Err(e),
         };
         self.save_state(account, &state)?;
-        let cdn = CdnClient::new(conf.clone(), Duration::from_secs(25))?;
+        let mut cdn = CdnClient::new(conf.clone(), Duration::from_secs(25))?;
         conf.auth_key.fill(0);
+        let destination = plan.request.thread_id.clone();
+        let progress_id = plan.file_upload_progress_id.clone();
+        if self.reserve_media_file_upload(account, id, &mut plan, bytes.len(), || {
+            native.reserve_file_upload(
+                &mut state,
+                &destination,
+                progress_id
+                    .as_deref()
+                    .context("file_reservation_needs_review")?,
+                &source.name,
+                bytes.len(),
+                &hex_string(&wechat_protocol::crypto::md5(&bytes)),
+            )
+        })? {
+            self.save_state(account, &state)?;
+        }
+        let material = plan.material.as_ref().unwrap();
         let callback = |n, t| self.progress_media(account, id, n, t);
         match plan.request.kind {
             MediaKind::File => {
                 if plan.uploaded_file.is_none() {
                     let prepared = PreparedUpload::with_material(
                         &bytes,
-                        MediaQuality::File,
+                        file_upload_quality(bytes.len()),
                         &source.name,
                         &plan.request.thread_id,
                         &material.key,
                         &material.file_key,
                     )?;
                     self.phase_media(account, id, "uploading")?;
-                    let uploaded = cdn.upload_with_progress(&prepared, callback)?;
-                    plan.uploaded_file = Some(uploaded);
-                    self.save_send_plan(account, id, &plan)?;
+                    let fence = permit
+                        .is_some()
+                        .then(|| self.media_authorization_fence(account))
+                        .transpose()?;
+                    let uploaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                        if modern_file {
+                            cdn.upload_large_file_with_progress(
+                                &prepared,
+                                material.task_id,
+                                callback,
+                            )
+                        } else {
+                            cdn.upload_with_progress(&prepared, callback)
+                        }
+                    })?;
+                    if let Some(current) = self.complete_file_cdn_upload(
+                        account,
+                        id,
+                        &mut plan,
+                        uploaded,
+                        fence.as_ref(),
+                    )? {
+                        state = current;
+                    }
                 }
             }
             MediaKind::Image => {
@@ -1950,35 +2636,46 @@ impl Core {
                 }
             }
             MediaKind::Video => {
+                let normal = if let Some(source_id) = &plan.prepared_video_source_id {
+                    self.source_bytes(account, source_id)?.1
+                } else {
+                    ensure!(
+                        plan.request.video_quality.is_none(),
+                        "video_preparation_missing"
+                    );
+                    bytes.clone()
+                };
+                ensure!(
+                    normal.len() <= MAX_ORDINARY_SOURCE_BYTES,
+                    "source_size_limit"
+                );
                 if plan.uploaded_video.is_none() {
                     ensure!(
-                        bytes.len() >= 12 && bytes[4..8] == *b"ftyp",
+                        normal.len() >= 12 && normal[4..8] == *b"ftyp",
                         "unsupported_video_container"
                     );
-                    let thumb = if let Some(id) = plan
+                    let thumb = if let Some(source_id) = plan
                         .request
                         .thumbnail_source_id
                         .as_ref()
                         .or(plan.prepared_video_thumbnail_source_id.as_ref())
                     {
-                        self.source_bytes(account, id)?.1
+                        self.source_bytes(account, source_id)?.1
                     } else {
-                        let bytes =
-                            video_thumbnail(&bytes, || self.progress_media(account, id, 0, None))?;
+                        let thumbnail =
+                            video_thumbnail(&normal, || self.progress_media(account, id, 0, None))?;
                         let source = self.upload_source(
                             account,
                             "video-thumbnail.jpg",
                             "image/jpeg",
-                            &bytes,
+                            &thumbnail,
                         )?;
                         plan.prepared_video_thumbnail_source_id = Some(source.id);
-                        // Retain the exact prepared bytes before any upload. Recovery
-                        // never depends on regenerating a codec's thumbnail output.
                         self.save_send_plan(account, id, &plan)?;
-                        bytes
+                        thumbnail
                     };
                     let prepared = PreparedVideoUpload::with_material(
-                        &bytes,
+                        &normal,
                         &thumb,
                         &source.name,
                         &plan.request.thread_id,
@@ -1986,17 +2683,93 @@ impl Core {
                         &material.file_key,
                     )?;
                     self.phase_media(account, id, "uploading")?;
-                    let uploaded = cdn.upload_video_with_progress(&prepared, callback)?;
+                    let fence = self.media_authorization_fence(account)?;
+                    let uploaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                        cdn.upload_video_with_progress(&prepared, callback)
+                    })?;
                     plan.uploaded_video = Some(uploaded);
+                    // Retain accepted CDN objects before a late cancellation or logout check.
                     self.save_send_plan(account, id, &plan)?;
+                    state = self.resume_media_state(account, id, &fence)?;
+                }
+                if plan.request.video_quality == Some(VideoSendQuality::Original)
+                    && plan.uploaded_video.as_ref().unwrap().original.is_none()
+                {
+                    let raw_material = plan
+                        .original_video_material
+                        .as_ref()
+                        .context("video_preparation_missing")?;
+                    let prepared = PreparedUpload::with_material(
+                        &bytes,
+                        MediaQuality::Video,
+                        &source.name,
+                        &plan.request.thread_id,
+                        &raw_material.key,
+                        &raw_material.file_key,
+                    )?;
+                    let route = file_uses_multiphase(bytes.len()).then_some(LargeCdnRoute::Upload);
+                    let raw_conf = load_config(&mut state, route)?;
+                    self.save_state(account, &state)?;
+                    let raw_cdn = CdnClient::new(raw_conf, Duration::from_secs(25))?;
+                    self.phase_media(account, id, "uploading")?;
+                    let fence = self.media_authorization_fence(account)?;
+                    let uploaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                        raw_cdn.upload_video_original_with_progress(
+                            &prepared,
+                            raw_material.task_id,
+                            callback,
+                        )
+                    })?;
+                    plan.uploaded_video.as_mut().unwrap().original = Some(uploaded);
+                    self.save_send_plan(account, id, &plan)?;
+                    state = self.resume_media_state(account, id, &fence)?;
+                    ensure!(
+                        plan.uploaded_video
+                            .as_ref()
+                            .unwrap()
+                            .original
+                            .as_ref()
+                            .unwrap()
+                            .sha256
+                            == source.sha256,
+                        "media_integrity_failed"
+                    );
                 }
             }
             _ => bail!("unsupported_media_send"),
         }
+        drop(bytes);
         self.phase_media(account, id, "readback")?;
+        if modern_file {
+            let uploaded = plan
+                .uploaded_file
+                .as_ref()
+                .context("missing_uploaded_file")?;
+            let download_route = (uploaded.descriptor.quality == MediaQuality::LargeFile)
+                .then_some(LargeCdnRoute::Download);
+            let conf = match load_config(&mut state, download_route) {
+                Ok(conf) => conf,
+                Err(error) if is_media_auth_rejected(&error) => {
+                    state = native.renew_session(&state, "agent-wechat media")?;
+                    load_config(&mut state, download_route)?
+                }
+                Err(error) => return Err(error),
+            };
+            self.save_state(account, &state)?;
+            cdn = CdnClient::new(conf, Duration::from_secs(25))?;
+        }
         let mut verified = vec![];
         if let Some(u) = &plan.uploaded_file {
-            let downloaded = cdn.download_with_progress(&u.descriptor, callback)?;
+            let fence = permit
+                .is_some()
+                .then(|| self.media_authorization_fence(account))
+                .transpose()?;
+            let downloaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                cdn.download_with_progress(&u.descriptor, callback)
+            })?;
+            if let Some(fence) = fence {
+                state = self.resume_media_state(account, id, &fence)?;
+            }
             ensure!(downloaded.sha256 == u.sha256, "media_integrity_failed");
             verified.push(downloaded.sha256);
         }
@@ -2012,8 +2785,24 @@ impl Core {
             }
         }
         if let Some(u) = &plan.uploaded_video {
-            for variant in [&u.video, &u.thumbnail] {
-                let downloaded = cdn.download_with_progress(&variant.descriptor, callback)?;
+            for variant in [&u.video, &u.thumbnail]
+                .into_iter()
+                .chain(u.original.as_ref())
+            {
+                let route = (variant.descriptor.quality == MediaQuality::Video
+                    && variant
+                        .descriptor
+                        .expected_bytes
+                        .is_some_and(|length| length > 25 * 1024 * 1024))
+                .then_some(LargeCdnRoute::VideoDownload);
+                let download_conf = load_config(&mut state, route)?;
+                self.save_state(account, &state)?;
+                let download_cdn = CdnClient::new(download_conf, Duration::from_secs(25))?;
+                let fence = self.media_authorization_fence(account)?;
+                let downloaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
+                    download_cdn.download_with_progress(&variant.descriptor, callback)
+                })?;
+                state = self.resume_media_state(account, id, &fence)?;
                 ensure!(
                     downloaded.sha256 == variant.sha256,
                     "media_integrity_failed"
@@ -2027,12 +2816,13 @@ impl Core {
         self.store.save_media_job(account, &row)?;
         self.phase_media(account, id, "submitting")?;
         let result = match plan.request.kind {
-            MediaKind::File => native.send_file(
+            MediaKind::File => native.send_file_with_reservation(
                 &mut state,
                 &plan.request.thread_id,
                 &plan.client_id,
                 plan.created_at,
                 plan.uploaded_file.as_ref().unwrap(),
+                plan.reservation.as_ref(),
             ),
             MediaKind::Image => native.send_image(
                 &mut state,
@@ -2053,6 +2843,57 @@ impl Core {
             _ => bail!("unsupported_media_send"),
         };
         match result {
+            Ok(receipt) => {
+                self.finish_media_send(account, id, receipt)?;
+                self.save_state(account, &state)
+            }
+            Err(error) => {
+                let _ = self.save_state(account, &state);
+                Err(error)
+            }
+        }
+    }
+    /// A completed upload can only pass through readback and its first final
+    /// submission. This path has no reservation or upload transport callbacks.
+    fn perform_reused_file_send(
+        &self,
+        account: &str,
+        id: &str,
+        plan: &SendPlan,
+        source: (&OwnedMediaSource, &str),
+        readback: impl FnOnce(&UploadedMedia, &mut wechat_protocol::AccountState) -> Result<String>,
+        submit: impl FnOnce(
+            &SendPlan,
+            &mut wechat_protocol::AccountState,
+        ) -> Result<wechat_protocol::media_send::MediaSendResult>,
+    ) -> Result<()> {
+        let row = self.active_media_job(account, id)?;
+        ensure!(
+            row.kind == "send"
+                && row.state == "running"
+                && row.phase == "readback"
+                && row.attempts <= 3
+                && no_final_media_submission(&row),
+            "completed_upload_retry_not_admitted"
+        );
+        validate_completed_upload_plan(plan, source.0, Some(source.1))?;
+        let mode = plan
+            .reuse_completed_upload
+            .as_ref()
+            .context("completed_upload_retry_not_admitted")?;
+        let mut state = self.resume_media_state(account, id, &mode.authorization)?;
+        let uploaded = plan.uploaded_file.as_ref().unwrap();
+        let verified = readback(uploaded, &mut state)?;
+        ensure!(verified == uploaded.sha256, "media_integrity_failed");
+        // Re-read current accepted cookies and check cancellation/logout before
+        // crossing the journalled first business-submission boundary.
+        state = self.resume_media_state(account, id, &mode.authorization)?;
+        let mut row = self.store.media_job(account, id)?;
+        row.data["result"]["uploadReadbackVerified"] = true.into();
+        row.data["result"]["verifiedSha256"] = json!([verified]);
+        self.store.save_media_job(account, &row)?;
+        self.phase_media(account, id, "submitting")?;
+        match submit(plan, &mut state) {
             Ok(receipt) => {
                 self.finish_media_send(account, id, receipt)?;
                 self.save_state(account, &state)
@@ -2159,7 +3000,7 @@ impl Core {
                     let mut cached = self.cache_asset(
                         account,
                         &asset.id,
-                        bytes,
+                        &bytes,
                         mime,
                         Some(asset.variant),
                         None,
@@ -2182,11 +3023,12 @@ impl Core {
             let (kind, content, summary) = match plan.request.kind {
                 MediaKind::File => (
                     49,
-                    wechat_protocol::media_send::local_file_xml(
+                    wechat_protocol::media_send::local_file_xml_with_reservation(
                         &own,
                         plan.uploaded_file
                             .as_ref()
                             .context("uploaded_media_missing")?,
+                        plan.reservation.as_ref(),
                     )?,
                     source.name.clone(),
                 ),
@@ -2242,58 +3084,77 @@ impl Core {
                 None
             };
             for asset in self.media_assets(account, &message_id)? {
-                let (raw, expected, mime) = match plan.request.kind {
-                    MediaKind::Image => {
-                        let variants = image_bytes.as_ref().unwrap();
-                        let uploaded = plan.uploaded_image.as_ref().unwrap();
-                        match asset.variant {
-                            MediaVariant::Original => (
-                                variants.0.clone(),
-                                uploaded.original.sha256.clone(),
-                                "image/jpeg",
-                            ),
-                            MediaVariant::Standard => (
-                                variants.1.clone(),
-                                uploaded.standard.sha256.clone(),
-                                "image/jpeg",
-                            ),
-                            MediaVariant::Thumbnail => (
-                                variants.2.clone(),
-                                uploaded.thumbnail.sha256.clone(),
-                                "image/jpeg",
-                            ),
-                            _ => continue,
+                let (raw, expected, mime): (std::borrow::Cow<'_, [u8]>, String, &str) =
+                    match plan.request.kind {
+                        MediaKind::Image => {
+                            let variants = image_bytes.as_ref().unwrap();
+                            let uploaded = plan.uploaded_image.as_ref().unwrap();
+                            match asset.variant {
+                                MediaVariant::Original => (
+                                    variants.0.clone().into(),
+                                    uploaded.original.sha256.clone(),
+                                    "image/jpeg",
+                                ),
+                                MediaVariant::Standard => (
+                                    variants.1.clone().into(),
+                                    uploaded.standard.sha256.clone(),
+                                    "image/jpeg",
+                                ),
+                                MediaVariant::Thumbnail => (
+                                    variants.2.clone().into(),
+                                    uploaded.thumbnail.sha256.clone(),
+                                    "image/jpeg",
+                                ),
+                                _ => continue,
+                            }
                         }
-                    }
-                    MediaKind::File => (
-                        bytes.clone(),
-                        plan.uploaded_file.as_ref().unwrap().sha256.clone(),
-                        "application/octet-stream",
-                    ),
-                    MediaKind::Video => {
-                        let uploaded = plan.uploaded_video.as_ref().unwrap();
-                        if asset.variant == MediaVariant::Thumbnail {
-                            let raw = if let Some(id) = plan
-                                .request
-                                .thumbnail_source_id
-                                .as_ref()
-                                .or(plan.prepared_video_thumbnail_source_id.as_ref())
-                            {
-                                self.source_bytes(account, id)?.1
+                        MediaKind::File => (
+                            std::borrow::Cow::Borrowed(bytes.as_slice()),
+                            plan.uploaded_file.as_ref().unwrap().sha256.clone(),
+                            "application/octet-stream",
+                        ),
+                        MediaKind::Video => {
+                            let uploaded = plan.uploaded_video.as_ref().unwrap();
+                            if asset.variant == MediaVariant::Thumbnail {
+                                let raw = if let Some(id) = plan
+                                    .request
+                                    .thumbnail_source_id
+                                    .as_ref()
+                                    .or(plan.prepared_video_thumbnail_source_id.as_ref())
+                                {
+                                    self.source_bytes(account, id)?.1
+                                } else {
+                                    // Compatibility for a pre-thumbnail-checkpoint job:
+                                    // accept regenerated bytes only on exact saved SHA.
+                                    video_thumbnail(&bytes, || Ok(()))?
+                                };
+                                (raw.into(), uploaded.thumbnail.sha256.clone(), "image/jpeg")
+                            } else if asset.variant == MediaVariant::Normal {
+                                (
+                                    if let Some(source_id) = &plan.prepared_video_source_id {
+                                        self.source_bytes(account, source_id)?.1.into()
+                                    } else {
+                                        ensure!(
+                                            plan.request.video_quality.is_none(),
+                                            "video_preparation_missing"
+                                        );
+                                        bytes.clone().into()
+                                    },
+                                    uploaded.video.sha256.clone(),
+                                    "video/mp4",
+                                )
+                            } else if asset.variant == MediaVariant::Original {
+                                let original = uploaded
+                                    .original
+                                    .as_ref()
+                                    .context("uploaded_media_missing")?;
+                                (bytes.clone().into(), original.sha256.clone(), "video/mp4")
                             } else {
-                                // Compatibility for a pre-thumbnail-checkpoint job:
-                                // accept regenerated bytes only on exact saved SHA.
-                                video_thumbnail(&bytes, || Ok(()))?
-                            };
-                            (raw, uploaded.thumbnail.sha256.clone(), "image/jpeg")
-                        } else if asset.variant == MediaVariant::Normal {
-                            (bytes.clone(), uploaded.video.sha256.clone(), "video/mp4")
-                        } else {
-                            continue;
+                                continue;
+                            }
                         }
-                    }
-                    _ => continue,
-                };
+                        _ => continue,
+                    };
                 ensure!(digest(&raw) == expected, "media_integrity_failed");
                 let status = match plan.request.kind {
                     MediaKind::Image => self.project_received_image(account, id, &asset, &raw),
@@ -2306,7 +3167,7 @@ impl Core {
                     official_media_writeback = status;
                 }
                 let mut cached =
-                    self.cache_asset(account, &asset.id, raw, mime, Some(asset.variant), None)?;
+                    self.cache_asset(account, &asset.id, &raw, mime, Some(asset.variant), None)?;
                 cached.official_writeback = status.into();
                 self.store.save_media_asset(
                     account,
@@ -2658,6 +3519,685 @@ fn video_thumbnail(bytes: &[u8], cancelled: impl FnMut() -> Result<()>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_cdn_download_diagnostics_ignore_response_context_and_preserve_reason() {
+        use wechat_protocol::media::{
+            LargeFileDownloadControl as Control, LargeFileDownloadError as Failure,
+        };
+        for (index, failure, expected) in [
+            (0, Failure::UnknownField, json!({"kind":"unknown_field"})),
+            (
+                1,
+                Failure::FixedControlMismatch {
+                    control: Control::Version,
+                    actual: 1,
+                },
+                json!({"kind":"fixed_control_mismatch","field":"ver","actual":1}),
+            ),
+        ] {
+            let (_dir, core) = test_core();
+            let id = format!("diagnostic-{index}");
+            plan_job(&core, &id, &file_plan());
+            let mut row = core.store.media_job("one", &id).unwrap();
+            row.phase = "readback".into();
+            let payload = row.payload.clone();
+            core.store.save_media_job("one", &row).unwrap();
+            let secret = "private raw body route file-id auth-key value";
+            let error = anyhow::Error::new(failure).context(secret);
+            core.record_media_failure_diagnostics("one", &id, &error)
+                .unwrap();
+            core.fail_media_job("one", &id, &classify_error(&error))
+                .unwrap();
+            let saved = core.store.media_job("one", &id).unwrap();
+            assert_eq!(saved.data["result"]["cdnDownloadFailure"], expected);
+            assert_eq!(saved.error_code.as_deref(), Some("unsupported_media"));
+            assert_eq!(saved.state, "unsupported");
+            assert!(!saved.retryable);
+            assert_eq!(saved.payload, payload);
+            assert!(!serde_json::to_string(&saved.data).unwrap().contains(secret));
+            assert!(
+                !serde_json::to_string(&core.store.events("one", 0, 100).unwrap())
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+        assert!(cdn_download_failure(&anyhow::anyhow!(
+            "Unsupported large-file download response field with private details"
+        ))
+        .is_none());
+    }
+    // Large metadata with a tiny sealed fixture keeps admission tests from
+    // allocating hundreds of MiB. Full worker source authentication is tested
+    // separately; the readback/submit seam receives that authenticated proof.
+    fn completed_retry_fixture(core: &Core, id: &str) -> (SendPlan, OwnedMediaSource) {
+        core.save_state("one", &accepted_media_state()).unwrap();
+        core.store
+            .put_runtime("one", "desired", b"connected")
+            .unwrap();
+        core.store
+            .mark_validated_if_active("one", &core.ownership_generation)
+            .unwrap();
+        let bytes = b"owned fixture";
+        let source_id = format!("source-{id}");
+        let payload = core
+            .vault
+            .seal_media("one", &format!("source:{source_id}"), bytes)
+            .unwrap();
+        core.store
+            .create_media_source(
+                "one",
+                &source_id,
+                "fixture.bin",
+                "application/octet-stream",
+                (MAX_ORDINARY_SOURCE_BYTES + 1) as u64,
+                &digest(bytes),
+                &payload,
+            )
+            .unwrap();
+        let source = core.store.media_source_metadata("one", &source_id).unwrap();
+        let mut plan = file_plan();
+        plan.request.source_id = source_id;
+        initialize_file_upload_ids(&mut plan, source.byte_length as usize).unwrap();
+        plan.material = Some(UploadMaterial {
+            key: vec![4; 16],
+            file_key: "5".repeat(32),
+            task_id: 17,
+        });
+        plan.reservation = Some(reservation());
+        plan.uploaded_file = Some(UploadedMedia {
+            descriptor: MediaDescriptor {
+                file_id: "synthetic-owned-object".into(),
+                aes_key: vec![4; 16],
+                quality: file_upload_quality(source.byte_length as usize),
+                expected_bytes: Some(source.byte_length),
+                expected_md5: Some(hex_string(&wechat_protocol::crypto::md5(bytes))),
+                strict_size: true,
+                expires_at: None,
+            },
+            plaintext_bytes: source.byte_length as u32,
+            md5: hex_string(&wechat_protocol::crypto::md5(bytes)),
+            sha256: source.sha256.clone(),
+            file_name: source.name.clone(),
+            width: None,
+            height: None,
+        });
+        let payload = core
+            .vault
+            .seal(
+                "one",
+                &format!("media-job:{id}"),
+                &serde_json::to_vec(&plan).unwrap(),
+            )
+            .unwrap();
+        let hash = media_request_hash(
+            &plan.request,
+            &source.sha256,
+            None,
+            None,
+            Some(&source.name),
+        )
+        .unwrap();
+        core.store.create_media_job("one",id,&format!("send:{id}"),&hash,"send",
+            &json!({"sourceId":source.id,"threadId":"filehelper","result":{"cdnDownloadFailure":{"kind":"unknown_field"}}}),&payload).unwrap();
+        assert!(core.store.claim_media_job("one", id).unwrap());
+        let mut row = core.store.media_job("one", id).unwrap();
+        row.state = "unsupported".into();
+        row.phase = "readback".into();
+        row.error_code = Some("unsupported_media".into());
+        core.store.save_media_job("one", &row).unwrap();
+        (plan, source)
+    }
+    #[test]
+    fn completed_upload_retry_admission_rejects_unsafe_or_changed_proof() {
+        for case in [
+            "needs_review",
+            "unknown",
+            "submitting",
+            "server",
+            "receipt",
+            "message",
+            "malformed_messages",
+            "malformed_root",
+            "malformed_result",
+            "attempts",
+            "missing_material",
+            "missing_reservation",
+            "changed_aes",
+            "changed_source",
+            "changed_md5",
+            "missing_upload",
+            "wrong_request",
+            "malformed_client_id",
+        ] {
+            let (_dir, core) = test_core();
+            let (mut plan, _source) = completed_retry_fixture(&core, "retry");
+            let mut row = core.store.media_job("one", "retry").unwrap();
+            match case {
+                "needs_review" | "unknown" => row.state = case.into(),
+                "submitting" => row.phase = "submitting".into(),
+                "server" => row.data["serverMessageId"] = "123".into(),
+                "receipt" => row.data["result"]["nativeReceipt"] = json!({"status":"needs_review"}),
+                "message" => row.data["result"]["messageIds"] = json!(["local-message"]),
+                "malformed_messages" => {
+                    row.data["result"]["messageIds"] = json!({"unexpected":true})
+                }
+                "malformed_root" => row.data = json!(["unexpected"]),
+                "malformed_result" => row.data["result"] = json!("unexpected"),
+                "attempts" => {
+                    // Attempts are immutable through save_media_job.
+                    for _ in 0..2 {
+                        let mut queued = core.store.media_job("one", "retry").unwrap();
+                        queued.state = "queued".into();
+                        core.store.save_media_job("one", &queued).unwrap();
+                        assert!(core.store.claim_media_job("one", "retry").unwrap());
+                    }
+                }
+                "missing_material" => plan.material = None,
+                "missing_reservation" => plan.reservation = None,
+                "changed_aes" => plan.material.as_mut().unwrap().key[0] ^= 1,
+                "changed_source" => plan.uploaded_file.as_mut().unwrap().sha256 = "f".repeat(64),
+                "changed_md5" => {
+                    plan.uploaded_file.as_mut().unwrap().descriptor.expected_md5 =
+                        Some("f".repeat(32))
+                }
+                "missing_upload" => plan.uploaded_file = None,
+                "wrong_request" => plan.request.thread_id = "different_destination".into(),
+                "malformed_client_id" => plan.client_id.push_str("_unknown"),
+                _ => unreachable!(),
+            }
+            row.payload = core
+                .vault
+                .seal(
+                    "one",
+                    "media-job:retry",
+                    &serde_json::to_vec(&plan).unwrap(),
+                )
+                .unwrap();
+            core.store.save_media_job("one", &row).unwrap();
+            assert!(
+                core.queue_completed_upload_reuse("one", "retry").is_err(),
+                "{case}"
+            );
+            assert_ne!(
+                core.store.media_job("one", "retry").unwrap().state,
+                "queued",
+                "{case}"
+            );
+        }
+    }
+    #[test]
+    fn completed_upload_retry_preserves_identity_and_diagnostic_and_binds_every_saved_input() {
+        let (_dir, core) = test_core();
+        let (original, source) = completed_retry_fixture(&core, "retry");
+        assert!(core.retry_media_job("one", "retry").is_err());
+        let queued = core.queue_completed_upload_reuse("one", "retry").unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.phase, "readback");
+        assert_eq!(queued.attempts, 1);
+        assert_eq!(
+            queued.data["result"]["cdnDownloadFailure"]["kind"],
+            "unknown_field"
+        );
+        assert_eq!(
+            queued.data["result"]["completedUploadReuse"]["previousReason"],
+            "unsupported_media"
+        );
+        assert!(core.queue_completed_upload_reuse("one", "retry").is_err());
+        let saved = saved_plan(&core, "retry");
+        assert_eq!(saved.client_id, original.client_id);
+        assert_eq!(
+            saved.file_upload_progress_id,
+            original.file_upload_progress_id
+        );
+        assert_eq!(
+            completed_upload_binding(&saved).unwrap(),
+            completed_upload_binding(&original).unwrap()
+        );
+        for case in ["file_key", "task_id", "reservation", "client_id", "source"] {
+            let mut altered = saved.clone();
+            match case {
+                "file_key" => altered.material.as_mut().unwrap().file_key = "6".repeat(32),
+                "task_id" => altered.material.as_mut().unwrap().task_id += 1,
+                "reservation" => altered.reservation.as_mut().unwrap().overwrite_newmsgid -= 1,
+                "client_id" => altered.client_id.push('x'),
+                "source" => altered.request.source_id.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_completed_upload_plan(&altered, &source, None).is_err(),
+                "{case}"
+            );
+        }
+        // Even a valid AEAD record must authenticate the original byte count and
+        // source hash before this queued mode can reach any network call.
+        assert!(core.store.claim_media_job("one", "retry").unwrap());
+        assert!(core
+            .perform_media_send("one", "retry")
+            .unwrap_err()
+            .to_string()
+            .contains("source_integrity_failed"));
+        assert_eq!(
+            core.store.media_job("one", "retry").unwrap().phase,
+            "readback"
+        );
+    }
+    #[test]
+    fn completed_upload_worker_checks_saved_proof_and_login_before_readback() {
+        use std::cell::Cell;
+        for case in [
+            "missing_material",
+            "changed_reservation",
+            "keys",
+            "epoch",
+            "logout",
+        ] {
+            let (_dir, core) = test_core();
+            let (_original, source) = completed_retry_fixture(&core, "retry");
+            core.queue_completed_upload_reuse("one", "retry").unwrap();
+            assert!(core.store.claim_media_job("one", "retry").unwrap());
+            let mut plan = saved_plan(&core, "retry");
+            let md5 = plan.uploaded_file.as_ref().unwrap().md5.clone();
+            match case {
+                "missing_material" => plan.material = None,
+                "changed_reservation" => plan.reservation.as_mut().unwrap().overwrite_newmsgid -= 1,
+                "keys" => {
+                    let mut state = core.account_state("one").unwrap();
+                    state.request_key[0] ^= 1;
+                    core.save_state("one", &state).unwrap();
+                }
+                "epoch" => core
+                    .store
+                    .put_runtime("one", "logout-epoch", b"new epoch")
+                    .unwrap(),
+                "logout" => core
+                    .store
+                    .put_runtime("one", "logged-out", b"logged out")
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let readbacks = Cell::new(0);
+            let submissions = Cell::new(0);
+            let result = core.perform_reused_file_send(
+                "one",
+                "retry",
+                &plan,
+                (&source, &md5),
+                |_, _| {
+                    readbacks.set(readbacks.get() + 1);
+                    Ok(source.sha256.clone())
+                },
+                |_, _| {
+                    submissions.set(submissions.get() + 1);
+                    bail!("unexpected submission")
+                },
+            );
+            assert!(result.is_err(), "{case}");
+            assert_eq!(readbacks.get(), 0, "{case}");
+            assert_eq!(submissions.get(), 0, "{case}");
+            assert_eq!(
+                core.store.media_job("one", "retry").unwrap().phase,
+                "readback"
+            );
+        }
+    }
+    #[test]
+    fn completed_upload_worker_requires_full_strict_readback_before_first_submission() {
+        use std::cell::Cell;
+        for case in [
+            "verified", "cookie", "unknown", "checksum", "cancel", "keys",
+        ] {
+            let (_dir, core) = test_core();
+            let (_plan, source) = completed_retry_fixture(&core, "retry");
+            core.queue_completed_upload_reuse("one", "retry").unwrap();
+            assert!(core.store.claim_media_job("one", "retry").unwrap());
+            let plan = saved_plan(&core, "retry");
+            let binding = completed_upload_binding(&plan).unwrap();
+            let readbacks = Cell::new(0);
+            let submissions = Cell::new(0);
+            let outcome = core.perform_reused_file_send(
+                "one",
+                "retry",
+                &plan,
+                (&source, &plan.uploaded_file.as_ref().unwrap().md5),
+                |uploaded, _state| {
+                    readbacks.set(readbacks.get() + 1);
+                    if case == "unknown" {
+                        return Err(anyhow::Error::new(
+                            wechat_protocol::media::LargeFileDownloadError::UnknownField,
+                        ));
+                    }
+                    if case == "checksum" {
+                        return Ok("f".repeat(64));
+                    }
+                    if case == "cookie" {
+                        let mut state = core.account_state("one").unwrap();
+                        state.cookie = vec![7, 8, 9];
+                        core.save_state("one", &state).unwrap();
+                    }
+                    if case == "cancel" {
+                        core.store.cancel_media_job("one", "retry").unwrap();
+                    }
+                    if case == "keys" {
+                        let mut state = core.account_state("one").unwrap();
+                        state.request_key[0] ^= 1;
+                        core.save_state("one", &state).unwrap();
+                    }
+                    Ok(uploaded.sha256.clone())
+                },
+                |submitted, state| {
+                    if case == "cookie" {
+                        assert_eq!(state.cookie, vec![7, 8, 9]);
+                    }
+                    submissions.set(submissions.get() + 1);
+                    assert_eq!(completed_upload_binding(submitted).unwrap(), binding);
+                    let row = core.store.media_job("one", "retry").unwrap();
+                    assert_eq!(row.phase, "submitting");
+                    assert_eq!(row.data["result"]["uploadReadbackVerified"], true);
+                    Ok(wechat_protocol::media_send::MediaSendResult {
+                        status: wechat_protocol::media_send::SendStatus::Rejected,
+                        service_code: -1,
+                        server_message_id: None,
+                        client_id_matches: Some(true),
+                    })
+                },
+            );
+            assert_eq!(readbacks.get(), 1, "{case}");
+            assert_eq!(
+                submissions.get(),
+                u32::from(matches!(case, "verified" | "cookie")),
+                "{case}"
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                matches!(case, "verified" | "cookie"),
+                "{case}"
+            );
+            let saved = saved_plan(&core, "retry");
+            assert_eq!(completed_upload_binding(&saved).unwrap(), binding);
+            if case == "unknown" {
+                core.record_media_failure_diagnostics(
+                    "one",
+                    "retry",
+                    outcome.as_ref().unwrap_err(),
+                )
+                .unwrap();
+                core.fail_media_job(
+                    "one",
+                    "retry",
+                    &classify_error(outcome.as_ref().unwrap_err()),
+                )
+                .unwrap();
+                let row = core.store.media_job("one", "retry").unwrap();
+                assert_eq!(row.state, "unsupported");
+                assert_eq!(row.phase, "readback");
+                assert_eq!(
+                    row.data["result"]["cdnDownloadFailure"],
+                    json!({"kind":"unknown_field"})
+                );
+            }
+        }
+    }
+    fn accepted_media_state() -> wechat_protocol::AccountState {
+        wechat_protocol::AccountState {
+            schema: 1,
+            device: wechat_protocol::DeviceProfile {
+                device_id: [b"A".as_slice(), &[1u8; 15]].concat(),
+                device_type: "UnifiedPCLinux x86_64".into(),
+                client_version: -227271398,
+            },
+            uin: 1,
+            own_username: "synthetic_self".into(),
+            cookie: vec![],
+            session_key: vec![1; 16],
+            request_key: vec![2; 24],
+            response_key: vec![3; 24],
+            auto_auth_key: vec![],
+            key_info: vec![],
+            database_password: vec![],
+            auth_snapshot: Default::default(),
+            long_host: "long.weixin.qq.com".into(),
+            short_host: "short.weixin.qq.com".into(),
+        }
+    }
+    fn completed_test_upload() -> UploadedMedia {
+        UploadedMedia {
+            descriptor: MediaDescriptor {
+                file_id: "owned-complete-object".into(),
+                aes_key: vec![4; 16],
+                quality: MediaQuality::File,
+                expected_bytes: Some(8),
+                expected_md5: Some("0".repeat(32)),
+                strict_size: true,
+                expires_at: None,
+            },
+            plaintext_bytes: 8,
+            md5: "0".repeat(32),
+            sha256: "1".repeat(64),
+            file_name: "fixture.bin".into(),
+            width: None,
+            height: None,
+        }
+    }
+    #[tokio::test]
+    async fn paused_file_cdn_allows_account_work_but_preserves_receipts_across_late_fences() {
+        use std::future::Future;
+        for change in ["cookie", "cancel", "logout", "keys", "epoch", "disconnect"] {
+            let (_dir, core) = test_core();
+            core.save_state("one", &accepted_media_state()).unwrap();
+            core.store
+                .put_runtime("one", "desired", b"connected")
+                .unwrap();
+            core.store
+                .mark_validated_if_active("one", &core.ownership_generation)
+                .unwrap();
+            let source = core
+                .upload_source(
+                    "one",
+                    "fixture.bin",
+                    "application/octet-stream",
+                    b"original",
+                )
+                .unwrap();
+            let mut plan = file_plan();
+            plan.request.source_id = source.id.clone();
+            plan.reservation = Some(reservation());
+            plan_job(&core, "paused-file", &plan);
+            core.ensure_upload_material("one", "paused-file", &mut plan)
+                .unwrap();
+            core.phase_media("one", "paused-file", "uploading").unwrap();
+            let media_guard = core.lock_media_job("one").await.unwrap();
+            let guard = core.lock_account("one").await.unwrap();
+            let runtime = tokio::runtime::Handle::current();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let local = core.clone();
+            let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let final_submission = submitted.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _media_guard = media_guard;
+                let mut permit = MediaAccountPermit {
+                    guard: Some(guard),
+                    runtime,
+                };
+                let fence = local.media_authorization_fence("one").unwrap();
+                let uploaded = permit
+                    .transfer(&local, "one", || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().context("test transport stopped")?;
+                        Ok(completed_test_upload())
+                    })
+                    .unwrap();
+                match local.complete_file_cdn_upload(
+                    "one",
+                    "paused-file",
+                    &mut plan,
+                    uploaded,
+                    Some(&fence),
+                ) {
+                    Ok(state) => {
+                        // This stands for the next guarded business submission.
+                        final_submission.store(true, Ordering::SeqCst);
+                        Some(state.unwrap().cookie.clone())
+                    }
+                    Err(error) => {
+                        local
+                            .fail_media_job("one", "paused-file", &classify_error(&error))
+                            .unwrap();
+                        None
+                    }
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            // A second media worker stays serialized while heartbeat/sync work
+            // can acquire the ordinary account mutation guard immediately.
+            let mut second = Box::pin(core.lock_media_job("one"));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    second.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            drop(second);
+            let account_guard =
+                tokio::time::timeout(Duration::from_secs(5), core.lock_account("one"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            match change {
+                "cookie" => {
+                    let mut state = core.account_state("one").unwrap();
+                    state.cookie = vec![7, 8, 9];
+                    core.save_state("one", &state).unwrap();
+                }
+                "keys" => {
+                    let mut state = core.account_state("one").unwrap();
+                    state.request_key[0] ^= 1;
+                    core.save_state("one", &state).unwrap();
+                }
+                "epoch" => core
+                    .store
+                    .put_runtime("one", "logout-epoch", b"new-login-epoch")
+                    .unwrap(),
+                "disconnect" => {
+                    core.disconnect("one").unwrap();
+                }
+                "cancel" => {
+                    core.store.cancel_media_job("one", "paused-file").unwrap();
+                }
+                "logout" => {
+                    let stamp = chrono::Utc::now().to_rfc3339();
+                    core.store
+                        .begin_logout(
+                            &wechat_store::Operation {
+                                id: "logout-test".into(),
+                                account_id: "one".into(),
+                                kind: "logout".into(),
+                                state: "queued".into(),
+                                result: json!({}),
+                                created_at: stamp.clone(),
+                                updated_at: stamp,
+                            },
+                            b"new-logout-epoch",
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(account_guard);
+            release_tx.send(()).unwrap();
+            let cookie = tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(submitted.load(Ordering::SeqCst), change == "cookie");
+            if change == "cookie" {
+                assert_eq!(cookie, Some(vec![7, 8, 9]));
+            }
+            let saved = saved_plan(&core, "paused-file");
+            assert_eq!(
+                saved.uploaded_file.unwrap().descriptor.file_id,
+                "owned-complete-object"
+            );
+            assert!(saved.material.is_some());
+            assert!(saved.reservation.is_some());
+            assert_eq!(core.source_bytes("one", &source.id).unwrap().1, b"original");
+            if change != "cookie" {
+                assert_eq!(
+                    core.store.media_job("one", "paused-file").unwrap().state,
+                    "needs_review"
+                );
+                assert!(core.store.retry_media_job("one", "paused-file").is_err());
+            }
+        }
+    }
+    fn file_plan() -> SendPlan {
+        SendPlan {
+            request: MediaSendRequest {
+                thread_id: "filehelper".into(),
+                kind: MediaKind::File,
+                source_id: "source-test".into(),
+                standard_source_id: None,
+                thumbnail_source_id: None,
+                play_seconds: None,
+                duration_ms: None,
+                video_quality: None,
+            },
+            client_id: "persisted-client-id".into(),
+            created_at: 123,
+            material: None,
+            reservation: None,
+            file_upload_progress_id: None,
+            uploaded_file: None,
+            uploaded_image: None,
+            uploaded_video: None,
+            prepared_video_thumbnail_source_id: None,
+            prepared_video_source_id: None,
+            original_video_material: None,
+            voice: vec![],
+            reuse_completed_upload: None,
+        }
+    }
+    fn plan_job(core: &Core, id: &str, plan: &SendPlan) {
+        let payload = core
+            .vault
+            .seal(
+                "one",
+                &format!("media-job:{id}"),
+                &serde_json::to_vec(plan).unwrap(),
+            )
+            .unwrap();
+        core.store
+            .create_media_job(
+                "one",
+                id,
+                &format!("send:{id}"),
+                &"0".repeat(64),
+                "send",
+                &json!({}),
+                &payload,
+            )
+            .unwrap();
+        assert!(core.store.claim_media_job("one", id).unwrap());
+    }
+    fn saved_plan(core: &Core, id: &str) -> SendPlan {
+        let row = core.store.media_job("one", id).unwrap();
+        serde_json::from_slice(
+            &core
+                .vault
+                .open_record("one", &format!("media-job:{id}"), &row.payload)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    fn reservation() -> FileUploadReservation {
+        FileUploadReservation {
+            file_upload_token: "v1_c3ludGhldGljLXByaXZhdGU=".into(),
+            overwrite_newmsgid: u64::MAX,
+        }
+    }
     fn test_core() -> (tempfile::TempDir, Arc<Core>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(wechat_store::Store::open(&dir.path().join("data")).unwrap());
@@ -2679,6 +4219,448 @@ mod tests {
             "line\nbreak",
         ] {
             assert!(validate_destination(value).is_err());
+        }
+    }
+    #[test]
+    fn source_limits_follow_kind_and_variant_roles_on_queue_and_replay() {
+        let mut plan = file_plan();
+        assert!(
+            validate_send_source_sizes(&plan.request, MAX_SOURCE_BYTES as u64, None, None).is_ok()
+        );
+        assert!(
+            validate_send_source_sizes(&plan.request, MAX_SOURCE_BYTES as u64 + 1, None, None)
+                .is_err()
+        );
+        assert!(validate_send_source_sizes(&plan.request, 1, Some(1), None).is_err());
+        assert!(validate_send_source_sizes(&plan.request, 1, None, Some(1)).is_err());
+        for kind in [MediaKind::Image, MediaKind::Video, MediaKind::Voice] {
+            plan.request.kind = kind;
+            assert!(validate_send_source_sizes(
+                &plan.request,
+                MAX_ORDINARY_SOURCE_BYTES as u64,
+                None,
+                None
+            )
+            .is_ok());
+            assert!(validate_send_source_sizes(
+                &plan.request,
+                kind.max_source_bytes() as u64 + 1,
+                None,
+                None
+            )
+            .is_err());
+        }
+        plan.request.kind = MediaKind::Image;
+        for (standard, thumbnail) in [
+            (Some(MAX_ORDINARY_SOURCE_BYTES as u64 + 1), None),
+            (None, Some(MAX_ORDINARY_SOURCE_BYTES as u64 + 1)),
+            (Some(0), None),
+        ] {
+            assert!(validate_send_source_sizes(&plan.request, 1, standard, thumbnail).is_err());
+        }
+        let (_dir, core) = test_core();
+        let source = core
+            .upload_source(
+                "one",
+                "large.bin",
+                "application/octet-stream",
+                &vec![3; MAX_ORDINARY_SOURCE_BYTES + 1],
+            )
+            .unwrap();
+        plan.request.kind = MediaKind::Image;
+        plan.request.source_id = source.id;
+        plan_job(&core, "oversized-image", &plan);
+        assert_eq!(
+            core.perform_media_send("one", "oversized-image")
+                .unwrap_err()
+                .to_string(),
+            "source_size_limit"
+        );
+        assert_eq!(
+            core.store
+                .media_job("one", "oversized-image")
+                .unwrap()
+                .phase,
+            "preparing"
+        );
+        assert!(saved_plan(&core, "oversized-image").material.is_none());
+    }
+    #[test]
+    fn protected_plan_backwards_decode_repairs_task_once_without_changing_material() {
+        let (_dir, core) = test_core();
+        let mut value = serde_json::to_value(file_plan()).unwrap();
+        value.as_object_mut().unwrap().remove("reservation");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("file_upload_progress_id");
+        value["material"] =
+            json!({"key":vec![4u8;16],"file_key":"00112233445566778899aabbccddeeff"});
+        let mut plan: SendPlan = serde_json::from_value(value).unwrap();
+        assert!(plan.reservation.is_none());
+        assert!(plan.file_upload_progress_id.is_none());
+        assert_eq!(plan.material.as_ref().unwrap().task_id, 0);
+        plan_job(&core, "legacy-plan", &plan);
+        core.ensure_upload_material("one", "legacy-plan", &mut plan)
+            .unwrap();
+        let restored = saved_plan(&core, "legacy-plan");
+        let material = restored.material.as_ref().unwrap();
+        assert_ne!(material.task_id, 0);
+        assert_eq!(material.key, vec![4; 16]);
+        assert_eq!(material.file_key, "00112233445566778899aabbccddeeff");
+        assert_eq!(restored.client_id, "persisted-client-id");
+        let sealed = core.store.media_job("one", "legacy-plan").unwrap().payload;
+        core.ensure_upload_material("one", "legacy-plan", &mut plan)
+            .unwrap();
+        assert_eq!(
+            core.store.media_job("one", "legacy-plan").unwrap().payload,
+            sealed
+        );
+        assert!(core
+            .vault
+            .open_record("two", "media-job:legacy-plan", &sealed)
+            .is_err());
+    }
+    #[test]
+    fn video_material_and_prepared_sources_survive_replay_without_rotation() {
+        let (_dir, core) = test_core();
+        let mut plan = file_plan();
+        plan.request.kind = MediaKind::Video;
+        plan.request.video_quality = Some(VideoSendQuality::Original);
+        let normal = core
+            .upload_source("one", "normal.mp4", "video/mp4", b"owned normal bytes")
+            .unwrap();
+        plan.prepared_video_source_id = Some(normal.id.clone());
+        plan_job(&core, "video-original-material", &plan);
+        core.ensure_upload_material("one", "video-original-material", &mut plan)
+            .unwrap();
+        let before = saved_plan(&core, "video-original-material");
+        let main = before.material.as_ref().unwrap();
+        let raw = before.original_video_material.as_ref().unwrap();
+        assert_ne!(main.key, raw.key);
+        assert_ne!(main.file_key, raw.file_key);
+        assert_ne!(main.task_id, raw.task_id);
+        core.ensure_upload_material("one", "video-original-material", &mut plan)
+            .unwrap();
+        let after = saved_plan(&core, "video-original-material");
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        assert_eq!(
+            core.source_bytes("one", after.prepared_video_source_id.as_ref().unwrap())
+                .unwrap()
+                .1,
+            b"owned normal bytes"
+        );
+        let mut legacy = serde_json::to_value(file_plan()).unwrap();
+        for key in ["prepared_video_source_id", "original_video_material"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        legacy["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("videoQuality");
+        let legacy: SendPlan = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.request.video_quality.is_none());
+        assert!(legacy.prepared_video_source_id.is_none());
+        assert!(legacy.original_video_material.is_none());
+    }
+
+    #[test]
+    fn video_quality_is_bound_to_content_and_rejected_on_other_kinds() {
+        let mut plan = file_plan();
+        plan.request.kind = MediaKind::Video;
+        plan.request.video_quality = Some(VideoSendQuality::Normal);
+        let normal = media_request_hash(&plan.request, "source", None, None, None).unwrap();
+        plan.request.video_quality = Some(VideoSendQuality::Original);
+        assert_ne!(
+            normal,
+            media_request_hash(&plan.request, "source", None, None, None).unwrap()
+        );
+        assert!(validate_send_source_sizes(
+            &plan.request,
+            MAX_VIDEO_SOURCE_BYTES as u64,
+            None,
+            None
+        )
+        .is_ok());
+        assert!(validate_send_source_sizes(
+            &plan.request,
+            MAX_VIDEO_SOURCE_BYTES as u64 + 1,
+            None,
+            None
+        )
+        .is_err());
+        for kind in [MediaKind::File, MediaKind::Image, MediaKind::Voice] {
+            plan.request.kind = kind;
+            assert_eq!(
+                validate_send_source_sizes(&plan.request, 1, None, None)
+                    .unwrap_err()
+                    .to_string(),
+                "invalid_video_quality"
+            );
+        }
+    }
+
+    #[test]
+    fn file_progress_and_final_ids_are_generated_once_and_never_rebuilt_from_receipts() {
+        let mut small = file_plan();
+        assert!(!initialize_file_upload_ids(&mut small, MAX_ORDINARY_SOURCE_BYTES).unwrap());
+        assert_eq!(small.client_id, "persisted-client-id");
+        assert!(small.file_upload_progress_id.is_none());
+        let mut plan = file_plan();
+        assert!(initialize_file_upload_ids(&mut plan, MAX_ORDINARY_SOURCE_BYTES + 1).unwrap());
+        let progress = plan.file_upload_progress_id.as_ref().unwrap().clone();
+        assert!(progress.starts_with("filehelper_123_"));
+        assert_ne!(
+            progress.rsplit('_').next().unwrap().parse::<u32>().unwrap(),
+            0
+        );
+        assert_eq!(plan.client_id, format!("{progress}_xwechat_1"));
+        let saved = serde_json::to_vec(&plan).unwrap();
+        assert!(!initialize_file_upload_ids(&mut plan, MAX_SOURCE_BYTES).unwrap());
+        assert_eq!(serde_json::to_vec(&plan).unwrap(), saved);
+        let mut missing_id = file_plan();
+        missing_id.reservation = Some(reservation());
+        assert!(initialize_file_upload_ids(&mut missing_id, MAX_SOURCE_BYTES).is_err());
+        assert_eq!(missing_id.client_id, "persisted-client-id");
+        assert!(missing_id.file_upload_progress_id.is_none());
+    }
+    #[test]
+    fn reservation_is_saved_before_transfer_and_reused_without_another_rpc() {
+        let (_dir, core) = test_core();
+        let mut plan = file_plan();
+        initialize_file_upload_ids(&mut plan, MAX_SOURCE_BYTES).unwrap();
+        plan_job(&core, "reserved-plan", &plan);
+        let calls = std::cell::Cell::new(0);
+        assert!(core
+            .reserve_media_file_upload(
+                "one",
+                "reserved-plan",
+                &mut plan,
+                MAX_ORDINARY_SOURCE_BYTES + 1,
+                || {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(
+                        core.store.media_job("one", "reserved-plan")?.phase,
+                        "reserving"
+                    );
+                    assert!(saved_plan(&core, "reserved-plan").reservation.is_none());
+                    Ok(reservation())
+                }
+            )
+            .unwrap());
+        let restored = saved_plan(&core, "reserved-plan");
+        assert_eq!(
+            restored.reservation.as_ref().unwrap().overwrite_newmsgid,
+            u64::MAX
+        );
+        let row = core.store.media_job("one", "reserved-plan").unwrap();
+        let token = reservation().file_upload_token.clone();
+        assert!(!row
+            .payload
+            .windows(token.len())
+            .any(|bytes| bytes == token.as_bytes()));
+        assert!(!serde_json::to_string(&row.data).unwrap().contains(&token));
+        assert!(!core
+            .reserve_media_file_upload("one", "reserved-plan", &mut plan, MAX_SOURCE_BYTES, || {
+                calls.set(calls.get() + 1);
+                bail!("must not reserve twice")
+            })
+            .unwrap());
+        assert_eq!(calls.get(), 1);
+        plan.uploaded_file = Some(UploadedMedia {
+            descriptor: MediaDescriptor {
+                file_id: "persisted-object".into(),
+                aes_key: vec![4; 16],
+                quality: MediaQuality::LargeFile,
+                expected_bytes: Some(MAX_SOURCE_BYTES as u64),
+                expected_md5: Some("0".repeat(32)),
+                strict_size: true,
+                expires_at: None,
+            },
+            plaintext_bytes: MAX_SOURCE_BYTES as u32,
+            md5: "0".repeat(32),
+            sha256: "1".repeat(64),
+            file_name: "large.bin".into(),
+            width: None,
+            height: None,
+        });
+        core.save_send_plan("one", "reserved-plan", &plan).unwrap();
+        core.phase_media("one", "reserved-plan", "readback")
+            .unwrap();
+        core.store.recover_media_jobs("one").unwrap();
+        assert_eq!(
+            core.store.media_job("one", "reserved-plan").unwrap().state,
+            "queued"
+        );
+        let mut replay = saved_plan(&core, "reserved-plan");
+        assert!(replay.uploaded_file.is_some());
+        assert!(!core
+            .reserve_media_file_upload(
+                "one",
+                "reserved-plan",
+                &mut replay,
+                MAX_SOURCE_BYTES,
+                || {
+                    calls.set(calls.get() + 1);
+                    bail!("readback must reuse both persisted receipts")
+                }
+            )
+            .unwrap());
+        assert_eq!(calls.get(), 1);
+    }
+    #[test]
+    fn uncertain_reservation_is_never_repeated_and_cancellation_preserves_receipt() {
+        let (_dir, core) = test_core();
+        let mut plan = file_plan();
+        initialize_file_upload_ids(&mut plan, MAX_SOURCE_BYTES).unwrap();
+        plan_job(&core, "uncertain-reservation", &plan);
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert!(core
+                .reserve_media_file_upload(
+                    "one",
+                    "uncertain-reservation",
+                    &mut plan,
+                    MAX_SOURCE_BYTES,
+                    || {
+                        calls.set(calls.get() + 1);
+                        bail!("transport_unavailable")
+                    }
+                )
+                .is_err());
+        }
+        assert_eq!(calls.get(), 1);
+        core.fail_media_job("one", "uncertain-reservation", "transport_unavailable")
+            .unwrap();
+        assert_eq!(
+            core.store
+                .media_job("one", "uncertain-reservation")
+                .unwrap()
+                .state,
+            "needs_review"
+        );
+        assert!(core
+            .store
+            .retry_media_job("one", "uncertain-reservation")
+            .is_err());
+        for during_rpc in [false, true] {
+            let id = if during_rpc {
+                "cancel-during-reservation"
+            } else {
+                "cancel-before-reservation"
+            };
+            let mut plan = file_plan();
+            initialize_file_upload_ids(&mut plan, MAX_SOURCE_BYTES).unwrap();
+            plan_job(&core, id, &plan);
+            if !during_rpc {
+                core.store.cancel_media_job("one", id).unwrap();
+            }
+            let mut called = false;
+            let outcome =
+                core.reserve_media_file_upload("one", id, &mut plan, MAX_SOURCE_BYTES, || {
+                    called = true;
+                    core.store.cancel_media_job("one", id)?;
+                    Ok(reservation())
+                });
+            assert_eq!(called, during_rpc);
+            assert_eq!(outcome.is_ok(), during_rpc);
+            assert_eq!(saved_plan(&core, id).reservation.is_some(), during_rpc);
+            assert!(core.progress_media("one", id, 0, None).is_err());
+            core.fail_media_job("one", id, "media_cancelled").unwrap();
+            assert_eq!(
+                core.store.media_job("one", id).unwrap().state,
+                if during_rpc {
+                    "needs_review"
+                } else {
+                    "cancelled"
+                }
+            );
+        }
+    }
+    #[test]
+    fn logout_during_reservation_retains_receipt_and_blocks_transfer() {
+        let (_dir, core) = test_core();
+        let mut plan = file_plan();
+        initialize_file_upload_ids(&mut plan, MAX_SOURCE_BYTES).unwrap();
+        plan_job(&core, "logout-reservation", &plan);
+        assert!(core
+            .reserve_media_file_upload(
+                "one",
+                "logout-reservation",
+                &mut plan,
+                MAX_SOURCE_BYTES,
+                || {
+                    core.store.put_runtime("one", "logged-out", b"1")?;
+                    Ok(reservation())
+                }
+            )
+            .unwrap());
+        assert_eq!(
+            saved_plan(&core, "logout-reservation")
+                .reservation
+                .as_ref()
+                .unwrap()
+                .overwrite_newmsgid,
+            u64::MAX
+        );
+        assert_eq!(
+            core.phase_media("one", "logout-reservation", "uploading")
+                .err()
+                .unwrap()
+                .to_string(),
+            "auth_required"
+        );
+        core.fail_media_job("one", "logout-reservation", "auth_required")
+            .unwrap();
+        let row = core.store.media_job("one", "logout-reservation").unwrap();
+        assert_eq!(row.state, "needs_review");
+        assert_eq!(row.phase, "reserving");
+        assert!(!row.retryable);
+    }
+    #[test]
+    fn file_quality_has_separate_plaintext_and_ciphertext_boundaries() {
+        let boundary = wechat_protocol::media::MAX_CDN_TRANSFER_BYTES;
+        for bytes in [boundary - 17, boundary - 16, boundary - 1, boundary] {
+            assert_eq!(file_upload_quality(bytes), MediaQuality::File);
+        }
+        assert!(!file_uses_multiphase(boundary - 17));
+        for bytes in [
+            boundary - 16,
+            boundary - 1,
+            boundary,
+            boundary + 1,
+            MAX_SOURCE_BYTES,
+        ] {
+            assert!(file_uses_multiphase(bytes));
+        }
+        assert_eq!(file_upload_quality(boundary + 1), MediaQuality::LargeFile);
+        assert_eq!(
+            file_upload_quality(MAX_SOURCE_BYTES),
+            MediaQuality::LargeFile
+        );
+        let xml = file_message_xml(
+            "<encryver>1</encryver>",
+            "<cdnattachurl>synthetic-large-file</cdnattachurl>",
+        );
+        for (length, quality) in [
+            (boundary, MediaQuality::File),
+            (boundary + 1, MediaQuality::LargeFile),
+            (MAX_SOURCE_BYTES, MediaQuality::LargeFile),
+        ] {
+            let xml = xml.replace(
+                "<totallen>8260</totallen>",
+                &format!("<totallen>{length}</totallen>"),
+            );
+            let plans = discover(&message(49), &xml).unwrap();
+            let DownloadPlan::Cdn { descriptor } = &plans[0].2 else {
+                panic!("expected file CDN plan")
+            };
+            assert_eq!(descriptor.quality, quality);
+            assert_eq!(descriptor.expected_bytes, Some(length as u64));
+            assert!(descriptor.strict_size);
         }
     }
     #[test]
@@ -2713,6 +4695,7 @@ mod tests {
             thumbnail_source_id: None,
             play_seconds: None,
             duration_ms: None,
+            video_quality: None,
         };
         let before = media_request_hash(
             &request,
@@ -2816,7 +4799,7 @@ mod tests {
             .cache_asset(
                 "one",
                 "asset_synthetic",
-                raw.to_vec(),
+                raw,
                 "text/plain",
                 Some(MediaVariant::Original),
                 None,
@@ -2872,7 +4855,7 @@ mod tests {
             .cache_asset(
                 "one",
                 &asset.id,
-                raw.to_vec(),
+                raw,
                 "image/x-wxgf",
                 Some(MediaVariant::Original),
                 Some(1),
@@ -2898,7 +4881,7 @@ mod tests {
             .cache_asset(
                 "one",
                 &asset.id,
-                raw.to_vec(),
+                raw,
                 "image/x-wxgf",
                 Some(MediaVariant::Original),
                 None,

@@ -1,6 +1,7 @@
 //! Final media-message metadata. CDN upload and message submission are separate
 //! steps; persist source bytes, generated keys and intent before either step.
 use crate::{
+    file_upload::{FileUploadReservation, MAX_RESERVED_FILE_BYTES},
     media::{MediaQuality, UploadedImage, UploadedMedia, UploadedVideo},
     protobuf as p, silk,
     wire::base_request,
@@ -23,11 +24,14 @@ fn hex32(value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 fn descriptor(v: &UploadedMedia, kind: MediaQuality) -> Result<()> {
+    descriptor_bound(v, kind, 25 * 1024 * 1024)
+}
+fn descriptor_bound(v: &UploadedMedia, kind: MediaQuality, max_bytes: usize) -> Result<()> {
     ensure!(
         v.descriptor.quality == kind
             && v.descriptor.aes_key.len() == 16
             && v.plaintext_bytes > 0
-            && v.plaintext_bytes <= 25 * 1024 * 1024,
+            && v.plaintext_bytes as usize <= max_bytes,
         "Invalid uploaded media descriptor"
     );
     clean(&v.descriptor.file_id, 8192)?;
@@ -135,8 +139,27 @@ pub fn share_send_request(
     ])
 }
 pub fn file_xml(sender: &str, upload: &UploadedMedia) -> Result<String> {
+    file_xml_with_reservation(sender, upload, None)
+}
+pub fn file_xml_with_reservation(
+    sender: &str,
+    upload: &UploadedMedia,
+    reservation: Option<&FileUploadReservation>,
+) -> Result<String> {
     clean(sender, 1024)?;
-    descriptor(upload, MediaQuality::File)?;
+    if let Some(reservation) = reservation {
+        reservation.validate()?;
+        ensure!(
+            matches!(
+                upload.descriptor.quality,
+                MediaQuality::File | MediaQuality::LargeFile
+            ),
+            "Expected an uploaded file descriptor"
+        );
+        descriptor_bound(upload, upload.descriptor.quality, MAX_RESERVED_FILE_BYTES)?;
+    } else {
+        descriptor(upload, MediaQuality::File)?;
+    }
     let name = &upload.file_name;
     clean(name, 255)?;
     ensure!(
@@ -164,12 +187,20 @@ pub fn file_xml(sender: &str, upload: &UploadedMedia) -> Result<String> {
     }
     app.push_str("<appattach>");
     app.push_str(&tag("totallen", upload.plaintext_bytes));
-    app.push_str(&tag("attachid", ""));
+    let aes_key = hex::encode(&upload.descriptor.aes_key);
+    let attach_id = reservation
+        .map(|_| format!("@cdn_{}_{aes_key}_1", upload.descriptor.file_id))
+        .unwrap_or_default();
+    app.push_str(&tag("attachid", attach_id));
     app.push_str(&tag("emoticonmd5", ""));
     app.push_str(&tag("fileext", extension));
     app.push_str(&tag("cdnattachurl", &upload.descriptor.file_id));
-    app.push_str(&tag("aeskey", hex::encode(&upload.descriptor.aes_key)));
-    app.push_str(&tag("encryver", 1));
+    app.push_str(&tag("aeskey", aes_key));
+    app.push_str(&tag("encryver", if reservation.is_some() { 0 } else { 1 }));
+    if let Some(reservation) = reservation {
+        app.push_str(&tag("overwrite_newmsgid", reservation.overwrite_newmsgid));
+        app.push_str(&tag("fileuploadtoken", &reservation.file_upload_token));
+    }
     app.push_str("</appattach>");
     for name in ["extinfo", "sourceusername", "sourcedisplayname", "thumburl"] {
         app.push_str(&tag(name, ""));
@@ -232,33 +263,47 @@ pub fn local_video_xml(video: &UploadedVideo, seconds: u32) -> Result<String> {
     descriptor(&video.video, MediaQuality::Video)?;
     descriptor(&video.thumbnail, MediaQuality::Thumbnail)?;
     ensure!(seconds > 0, "Invalid video duration");
-    Ok(local_element(
-        "videomsg",
-        vec![
-            ("aeskey", hex::encode(&video.video.descriptor.aes_key)),
-            ("cdnvideourl", video.video.descriptor.file_id.clone()),
-            ("length", video.video.plaintext_bytes.to_string()),
-            ("md5", hex32(&video.video.md5)?),
-            ("playlength", seconds.to_string()),
-            ("cdnthumburl", video.thumbnail.descriptor.file_id.clone()),
+    let mut fields = vec![
+        ("aeskey", hex::encode(&video.video.descriptor.aes_key)),
+        ("cdnvideourl", video.video.descriptor.file_id.clone()),
+        ("length", video.video.plaintext_bytes.to_string()),
+        ("md5", hex32(&video.video.md5)?),
+        ("playlength", seconds.to_string()),
+        ("cdnthumburl", video.thumbnail.descriptor.file_id.clone()),
+        (
+            "cdnthumbaeskey",
+            hex::encode(&video.thumbnail.descriptor.aes_key),
+        ),
+        (
+            "cdnthumblength",
+            video.thumbnail.plaintext_bytes.to_string(),
+        ),
+        (
+            "cdnthumbwidth",
+            video.thumbnail.width.unwrap_or(0).to_string(),
+        ),
+        (
+            "cdnthumbheight",
+            video.thumbnail.height.unwrap_or(0).to_string(),
+        ),
+    ];
+    if let Some(original) = &video.original {
+        descriptor_bound(
+            original,
+            MediaQuality::Video,
+            wechat_media::MAX_VIDEO_SOURCE_BYTES,
+        )?;
+        fields.extend([
+            ("cdnrawvideourl", original.descriptor.file_id.clone()),
             (
-                "cdnthumbaeskey",
-                hex::encode(&video.thumbnail.descriptor.aes_key),
+                "cdnrawvideoaeskey",
+                hex::encode(&original.descriptor.aes_key),
             ),
-            (
-                "cdnthumblength",
-                video.thumbnail.plaintext_bytes.to_string(),
-            ),
-            (
-                "cdnthumbwidth",
-                video.thumbnail.width.unwrap_or(0).to_string(),
-            ),
-            (
-                "cdnthumbheight",
-                video.thumbnail.height.unwrap_or(0).to_string(),
-            ),
-        ],
-    ))
+            ("rawlength", original.plaintext_bytes.to_string()),
+            ("rawmd5", hex32(&original.md5)?),
+        ]);
+    }
+    Ok(local_element("videomsg", fields))
 }
 pub fn local_voice_xml(encoded_bytes: usize, duration_ms: u32) -> Result<String> {
     ensure!(
@@ -278,7 +323,17 @@ pub fn local_voice_xml(encoded_bytes: usize, duration_ms: u32) -> Result<String>
     ))
 }
 pub fn local_file_xml(sender: &str, upload: &UploadedMedia) -> Result<String> {
-    Ok(format!("<msg>{}</msg>", file_xml(sender, upload)?))
+    local_file_xml_with_reservation(sender, upload, None)
+}
+pub fn local_file_xml_with_reservation(
+    sender: &str,
+    upload: &UploadedMedia,
+    reservation: Option<&FileUploadReservation>,
+) -> Result<String> {
+    Ok(format!(
+        "<msg>{}</msg>",
+        file_xml_with_reservation(sender, upload, reservation)?
+    ))
 }
 pub fn file_send_request(
     state: &AccountState,
@@ -287,10 +342,20 @@ pub fn file_send_request(
     created_at: u32,
     upload: &UploadedMedia,
 ) -> Result<Vec<u8>> {
+    file_send_request_with_reservation(state, destination, client_id, created_at, upload, None)
+}
+pub fn file_send_request_with_reservation(
+    state: &AccountState,
+    destination: &str,
+    client_id: &str,
+    created_at: u32,
+    upload: &UploadedMedia,
+    reservation: Option<&FileUploadReservation>,
+) -> Result<Vec<u8>> {
     clean(destination, 512)?;
     clean(client_id, 1024)?;
     ensure!(created_at > 0, "Invalid media timestamp");
-    let content = file_xml(&state.own_username, upload)?;
+    let content = file_xml_with_reservation(&state.own_username, upload, reservation)?;
     let app = p::message(&[
         p::bytes(1, state.own_username.as_bytes()),
         p::bytes(2, &[]),
@@ -305,14 +370,16 @@ pub fn file_send_request(
         p::bytes(14, &[]),
         p::bytes(15, &[]),
     ])?;
-    p::message(&[
+    let mut fields = vec![
         p::bytes(1, &base_request(&state.device, state.uin, 0)?),
         p::bytes(2, &app),
         p::bytes(5, hex32(&upload.md5)?.as_bytes()),
-        p::uint(9, 0),
-        p::uint(10, 0),
-        p::uint(11, 2),
-    ])
+    ];
+    if upload.plaintext_bytes > 25 * 1024 * 1024 {
+        fields.push(p::uint(6, 7));
+    }
+    fields.extend([p::uint(9, 0), p::uint(10, 0), p::uint(11, 2)]);
+    p::message(&fields)
 }
 pub fn image_send_request(
     state: &AccountState,
@@ -399,7 +466,7 @@ pub fn video_send_request(
         width > 0 && height > 0 && width <= 8192 && height <= 8192,
         "Invalid video thumbnail dimensions"
     );
-    p::message(&[
+    let mut fields = vec![
         p::bytes(1, &base_request(&state.device, state.uin, 0)?),
         p::bytes(2, client_id.as_bytes()),
         p::bytes(3, state.own_username.as_bytes()),
@@ -426,7 +493,23 @@ pub fn video_send_request(
         p::bytes(26, hex32(&v.md5)?.as_bytes()),
         p::bytes(37, &[]),
         p::uint(38, 0),
-    ])
+    ];
+    if let Some(original) = &video.original {
+        descriptor_bound(
+            original,
+            MediaQuality::Video,
+            wechat_media::MAX_VIDEO_SOURCE_BYTES,
+        )?;
+        // Linux 4.1.13.26 CGI149's generated M7 serializer emits these
+        // separately from the normal rendition (0x7d094d8..0x7d0954a).
+        fields.extend([
+            p::bytes(48, hex32(&original.md5)?.as_bytes()),
+            p::bytes(49, original.descriptor.file_id.as_bytes()),
+            p::bytes(50, hex::encode(&original.descriptor.aes_key).as_bytes()),
+            p::uint(51, u64::from(original.plaintext_bytes)),
+        ]);
+    }
+    p::message(&fields)
 }
 /// Encoded SILK bytes carried by one `uploadvoice` request. A short-link
 /// request travels in one MMTLS record of at most 65,519 plaintext bytes,
@@ -638,6 +721,40 @@ pub fn decode_file_send(input: &[u8], client_id: &str) -> Result<MediaSendResult
         client_id_matches: matches.then_some(true),
     })
 }
+/// Correlate the final reply for a reserved file with its submitted intent.
+pub fn decode_file_send_correlated(
+    input: &[u8],
+    client_id: &str,
+    sender: &str,
+    destination: &str,
+    aes_key: &[u8],
+) -> Result<MediaSendResult> {
+    ensure!(aes_key.len() == 16, "Invalid file AES key");
+    let mut result = decode_file_send(input, client_id)?;
+    if result.status == SendStatus::Rejected {
+        return Ok(result);
+    }
+    let fields = p::decode(input)?;
+    let base = p::decode(p::data(&fields, 1)?)?;
+    ensure!(p::scalar(&base, 1)? == 0, "Invalid file response status");
+    let key = hex::encode(aes_key);
+    let mut correlated = true;
+    for (number, expected) in [
+        (3, sender.as_bytes()),
+        (4, destination.as_bytes()),
+        (6, client_id.as_bytes()),
+        (10, key.as_bytes()),
+    ] {
+        correlated &= p::optional_data(&fields, number)? == Some(expected);
+    }
+    result.status = if correlated {
+        SendStatus::ServerAccepted
+    } else {
+        SendStatus::NeedsReview
+    };
+    result.client_id_matches = Some(correlated);
+    Ok(result)
+}
 pub fn decode_image_send(
     input: &[u8],
     client_id: &str,
@@ -779,6 +896,348 @@ mod tests {
             short_host: "short.weixin.qq.com".into(),
         }
     }
+    fn synthetic_file(size: usize, quality: MediaQuality) -> UploadedMedia {
+        UploadedMedia {
+            descriptor: crate::media::MediaDescriptor {
+                file_id: "synthetic-file-id".into(),
+                aes_key: vec![1; 16],
+                quality,
+                expected_bytes: Some(size as u64),
+                expected_md5: Some("a".repeat(32)),
+                strict_size: true,
+                expires_at: None,
+            },
+            plaintext_bytes: size.try_into().unwrap(),
+            md5: "a".repeat(32),
+            sha256: "b".repeat(64),
+            file_name: "synthetic&file.txt".into(),
+            width: None,
+            height: None,
+        }
+    }
+    fn synthetic_reservation() -> FileUploadReservation {
+        FileUploadReservation {
+            file_upload_token: "v1_c3ludGhldGlj".into(),
+            overwrite_newmsgid: u64::MAX,
+        }
+    }
+    #[test]
+    fn file_upload_reservation_ordinary_request_schema() {
+        let state = synthetic_state();
+        let raw = crate::file_upload::file_upload_request(
+            &state,
+            "filehelper",
+            "filehelper_1234567_42",
+            "synthetic&file.TXT",
+            32 * 1024 * 1024,
+            &"A".repeat(32),
+        )
+        .unwrap();
+        let fields = p::decode(&raw).unwrap();
+        assert_eq!(
+            fields.iter().map(|f| f.number).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 7, 12]
+        );
+        assert_eq!(p::data(&fields, 2).unwrap(), b"filehelper");
+        assert_eq!(p::data(&fields, 3).unwrap(), b"filehelper_1234567_42");
+        assert_ne!(p::data(&fields, 2).unwrap(), state.own_username.as_bytes());
+        assert_eq!(p::scalar(&fields, 4).unwrap(), 1);
+        assert_eq!(p::scalar(&fields, 7).unwrap(), 0);
+        assert_eq!(p::scalar(&fields, 12).unwrap(), 0);
+        let base = p::decode(p::data(&fields, 1).unwrap()).unwrap();
+        assert_eq!(p::scalar(&base, 2).unwrap(), 123);
+        assert_eq!(p::scalar(&base, 6).unwrap(), 0);
+        let info = p::decode(p::data(&fields, 5).unwrap()).unwrap();
+        assert_eq!(
+            info.iter().map(|f| f.number).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(p::data(&info, 1).unwrap(), b"synthetic&file.TXT");
+        assert_eq!(p::data(&info, 2).unwrap(), b"TXT");
+        assert_eq!(
+            p::data(&info, 3).unwrap(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(p::scalar(&info, 4).unwrap(), 33_554_432);
+        let final_client_id = "filehelper_1234567_42_xwechat_1";
+        let final_request = file_send_request_with_reservation(
+            &state,
+            "filehelper",
+            final_client_id,
+            1_234_567,
+            &synthetic_file(MAX_RESERVED_FILE_BYTES, MediaQuality::LargeFile),
+            Some(&synthetic_reservation()),
+        )
+        .unwrap();
+        let final_fields = p::decode(&final_request).unwrap();
+        let final_app = p::decode(p::data(&final_fields, 2).unwrap()).unwrap();
+        assert_eq!(p::data(&final_app, 8).unwrap(), final_client_id.as_bytes());
+        assert_ne!(
+            p::data(&fields, 3).unwrap(),
+            p::data(&final_app, 8).unwrap()
+        );
+        assert!(
+            final_client_id.starts_with(std::str::from_utf8(p::data(&fields, 3).unwrap()).unwrap())
+        );
+        assert!(crate::file_upload::file_upload_request(
+            &state,
+            "bad\npeer",
+            "filehelper_1234567_42",
+            "file.txt",
+            1,
+            &"a".repeat(32)
+        )
+        .is_err());
+        for progress_id in ["", "bad\nidentity", &"a".repeat(1025)] {
+            assert!(crate::file_upload::file_upload_request(
+                &state,
+                "filehelper",
+                progress_id,
+                "file.txt",
+                1,
+                &"a".repeat(32)
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn reserved_file_metadata_and_plaintext_boundary_flag() {
+        let state = synthetic_state();
+        let reservation = synthetic_reservation();
+        let threshold = 25 * 1024 * 1024;
+        for size in [
+            threshold - 17,
+            threshold - 16,
+            threshold - 15,
+            threshold - 1,
+            threshold,
+            threshold + 1,
+            MAX_RESERVED_FILE_BYTES,
+        ] {
+            let upload = synthetic_file(size, MediaQuality::LargeFile);
+            let raw = file_send_request_with_reservation(
+                &state,
+                "filehelper",
+                "synthetic-client",
+                1,
+                &upload,
+                Some(&reservation),
+            )
+            .unwrap();
+            let fields = p::decode(&raw).unwrap();
+            assert_eq!(p::optional(&fields, 6).unwrap().is_some(), size > threshold);
+            if size > threshold {
+                assert_eq!(p::scalar(&fields, 6).unwrap(), 7);
+            }
+            let app = p::decode(p::data(&fields, 2).unwrap()).unwrap();
+            let xml = std::str::from_utf8(p::data(&app, 6).unwrap()).unwrap();
+            assert!(xml.contains("<encryver>0</encryver>"));
+            assert!(xml.contains(
+                "<attachid>@cdn_synthetic-file-id_01010101010101010101010101010101_1</attachid>"
+            ));
+            assert!(xml.contains("<fileuploadtoken>v1_c3ludGhldGlj</fileuploadtoken>"));
+            assert!(xml.contains("<overwrite_newmsgid>18446744073709551615</overwrite_newmsgid>"));
+            assert!(xml.contains("<title>synthetic&amp;file.txt</title>"));
+            assert_eq!(
+                local_file_xml_with_reservation(&state.own_username, &upload, Some(&reservation))
+                    .unwrap(),
+                format!("<msg>{xml}</msg>")
+            );
+            assert!(
+                file_send_request(&state, "filehelper", "synthetic-client", 1, &upload).is_err()
+            );
+        }
+        // Upload routing changes at an AES-padding boundary; the app-message
+        // field6 still follows plaintext size, including at exactly 25 MiB.
+        assert_eq!(((threshold - 17) / 16 + 1) * 16, threshold - 16);
+        assert_eq!(((threshold - 16) / 16 + 1) * 16, threshold);
+        let small = synthetic_file(1, MediaQuality::File);
+        assert!(file_xml("synthetic-user", &small)
+            .unwrap()
+            .contains("<encryver>1</encryver>"));
+        assert!(!file_xml("synthetic-user", &small)
+            .unwrap()
+            .contains("fileuploadtoken"));
+        let too_large = synthetic_file(MAX_RESERVED_FILE_BYTES + 1, MediaQuality::LargeFile);
+        assert!(
+            file_xml_with_reservation("synthetic-user", &too_large, Some(&reservation)).is_err()
+        );
+        let mut mismatch = synthetic_file(MAX_RESERVED_FILE_BYTES, MediaQuality::LargeFile);
+        mismatch.descriptor.expected_md5 = Some("0".repeat(32));
+        assert!(
+            file_xml_with_reservation("synthetic-user", &mismatch, Some(&reservation)).is_err()
+        );
+    }
+    #[test]
+    fn reserved_file_acceptance_requires_all_correlations() {
+        let response = |sender: &[u8], destination: &[u8], client: &[u8], key: &[u8]| {
+            p::message(&[
+                p::bytes(1, &p::int32(1, 0)),
+                p::bytes(3, sender),
+                p::bytes(4, destination),
+                p::uint(5, 1),
+                p::bytes(6, client),
+                p::uint(7, 1),
+                p::uint(9, u64::MAX),
+                p::bytes(10, key),
+                p::bytes(13, b"synthetic-client"),
+            ])
+            .unwrap()
+        };
+        let key = b"01010101010101010101010101010101";
+        for (sender, destination, client, aes, status) in [
+            (
+                &b"synthetic-user"[..],
+                &b"filehelper"[..],
+                &b"synthetic-client"[..],
+                &key[..],
+                SendStatus::ServerAccepted,
+            ),
+            (
+                &b"wrong"[..],
+                &b"filehelper"[..],
+                &b"synthetic-client"[..],
+                &key[..],
+                SendStatus::NeedsReview,
+            ),
+            (
+                &b"synthetic-user"[..],
+                &b"wrong"[..],
+                &b"synthetic-client"[..],
+                &key[..],
+                SendStatus::NeedsReview,
+            ),
+            (
+                &b"synthetic-user"[..],
+                &b"filehelper"[..],
+                &b"wrong"[..],
+                &key[..],
+                SendStatus::NeedsReview,
+            ),
+            (
+                &b"synthetic-user"[..],
+                &b"filehelper"[..],
+                &b"synthetic-client"[..],
+                &b"00000000000000000000000000000000"[..],
+                SendStatus::NeedsReview,
+            ),
+        ] {
+            let raw = response(sender, destination, client, aes);
+            let result = decode_file_send_correlated(
+                &raw,
+                "synthetic-client",
+                "synthetic-user",
+                "filehelper",
+                &[1; 16],
+            )
+            .unwrap();
+            assert_eq!(result.status, status);
+            assert_eq!(result.server_message_id, Some(u64::MAX.to_string()));
+        }
+        let rejected = p::bytes(1, &p::int32(1, -13));
+        assert_eq!(
+            decode_file_send_correlated(
+                &rejected,
+                "synthetic-client",
+                "synthetic-user",
+                "filehelper",
+                &[1; 16]
+            )
+            .unwrap()
+            .status,
+            SendStatus::Rejected
+        );
+    }
+    #[test]
+    fn video_original_metadata_is_independent_and_old_plans_still_decode() {
+        use crate::media::MediaDescriptor;
+        let uploaded = |quality, id: &str, key: u8, size: u32, digest: &str| UploadedMedia {
+            descriptor: MediaDescriptor {
+                file_id: id.into(),
+                aes_key: vec![key; 16],
+                quality,
+                expected_bytes: Some(u64::from(size)),
+                expected_md5: Some(digest.into()),
+                strict_size: true,
+                expires_at: None,
+            },
+            plaintext_bytes: size,
+            md5: digest.into(),
+            sha256: "c".repeat(64),
+            file_name: "synthetic.mp4".into(),
+            width: Some(16),
+            height: Some(12),
+        };
+        let mut video = UploadedVideo {
+            video: uploaded(MediaQuality::Video, "normal-object", 1, 30, &"1".repeat(32)),
+            thumbnail: uploaded(
+                MediaQuality::Thumbnail,
+                "thumbnail-object",
+                2,
+                20,
+                &"2".repeat(32),
+            ),
+            original: None,
+        };
+        let mut old_plan = serde_json::to_value(&video).unwrap();
+        old_plan.as_object_mut().unwrap().remove("original");
+        let cold: UploadedVideo = serde_json::from_value(old_plan).unwrap();
+        assert!(cold.original.is_none());
+        let normal =
+            video_send_request(&synthetic_state(), "filehelper", "client", &cold, 4).unwrap();
+        let normal = p::decode(&normal).unwrap();
+        for number in 48..=51 {
+            assert!(!normal.iter().any(|field| field.number == number));
+        }
+        video.original = Some(uploaded(
+            MediaQuality::Video,
+            "raw-object",
+            3,
+            wechat_media::MAX_VIDEO_SOURCE_BYTES as u32,
+            &"A".repeat(32),
+        ));
+        let request =
+            video_send_request(&synthetic_state(), "filehelper", "client", &video, 4).unwrap();
+        let fields = p::decode(&request).unwrap();
+        assert_eq!(p::data(&fields, 16).unwrap(), b"normal-object");
+        assert_eq!(p::data(&fields, 17).unwrap(), "01".repeat(16).as_bytes());
+        assert_eq!(p::scalar(&fields, 8).unwrap(), 30);
+        assert_eq!(p::data(&fields, 26).unwrap(), "1".repeat(32).as_bytes());
+        assert_eq!(p::data(&fields, 48).unwrap(), "a".repeat(32).as_bytes());
+        assert_eq!(p::data(&fields, 49).unwrap(), b"raw-object");
+        assert_eq!(p::data(&fields, 50).unwrap(), "03".repeat(16).as_bytes());
+        assert_eq!(p::scalar(&fields, 51).unwrap(), 52_428_800);
+        let xml = local_video_xml(&video, 4).unwrap();
+        for expected in [
+            "cdnvideourl=\"normal-object\"",
+            "length=\"30\"",
+            "cdnrawvideourl=\"raw-object\"",
+            "rawlength=\"52428800\"",
+            "rawmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        ] {
+            assert!(xml.contains(expected));
+        }
+        assert!(xml.contains(&format!("cdnrawvideoaeskey=\"{}\"", "03".repeat(16))));
+        for corruption in 0..4 {
+            let mut altered = video.clone();
+            let original = altered.original.as_mut().unwrap();
+            match corruption {
+                0 => original.descriptor.quality = MediaQuality::LargeFile,
+                1 => original.descriptor.expected_md5 = Some("0".repeat(32)),
+                2 => {
+                    original.plaintext_bytes += 1;
+                    original.descriptor.expected_bytes = Some(u64::from(original.plaintext_bytes));
+                }
+                _ => original.descriptor.expected_bytes = None,
+            }
+            assert!(
+                video_send_request(&synthetic_state(), "filehelper", "client", &altered, 4)
+                    .is_err()
+            );
+            assert!(local_video_xml(&altered, 4).is_err());
+        }
+    }
+
     #[test]
     fn metadata_matches_independent_synthetic_wire_vectors() {
         use crate::media::MediaDescriptor;
@@ -851,6 +1310,7 @@ mod tests {
         let video = UploadedVideo {
             video: descriptor(MediaQuality::Video, "video.mp4"),
             thumbnail: descriptor(MediaQuality::Thumbnail, "thumb.jpg"),
+            original: None,
         };
         assert_eq!(
             hex::encode(

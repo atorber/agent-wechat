@@ -15,11 +15,11 @@ Run `wx COMMAND --help` for the full options of any command. Output is JSON.
 | `wx accounts` | `list`, `get`, `default ID`, `alias ID NAME` |
 | `wx account` | `status`, `capabilities`, `connect`, `disconnect` |
 | `wx chats` | `list`, `get ID`, `find TEXT`, `read ID --expected-version V` |
-| `wx messages` | `list CHAT`, `get CHAT ID`, `send CHAT --text/--image/--file/--video/--voice/--share`, `media CHAT ID`, `recall ID --server-id S`, `sends lookup/get/cancel` |
+| `wx messages` | `list CHAT`, `get CHAT ID`, `send CHAT --text/--image/--file/--video/--voice/--share`, `media CHAT ID`, `--video-quality normal/original` with `--video`, `recall ID --server-id S`, `sends lookup/get/cancel` |
 | `wx contacts` | `list`, `find TEXT`, `get ID`, `refresh ID`, `sync`, `avatar ID` |
 | `wx groups` | `list`, `get ID`, `members ID`, `refresh ID`, `sync` |
 | `wx events` | `watch [--cursor-file F]`, `list`, `ack --consumer NAME --through CURSOR` |
-| `wx jobs` | `get ID`, `cancel ID`, `retry ID`, `repair-writeback` |
+| `wx jobs` | `get ID`, `cancel ID`, `retry ID [--reuse-completed-upload]`, `repair-writeback` |
 | `wx operations` | `get ID` |
 | `wx sync` | Fetch new messages now |
 | `wx tokens` | `list`, `create NAME --accounts ID --scopes S`, `revoke ID` |
@@ -41,6 +41,8 @@ Run `wx COMMAND --help` for the full options of any command. Output is JSON.
 | `--json` | | Machine-readable errors and progress; no terminal QR code |
 
 Flags win over environment variables, which win over saved settings. Commands that start background work (sends, downloads, login, recall) also take `--detach` to return as soon as the work is queued.
+
+`messages send --wait SECONDS` waits up to 3,600 seconds for attachment jobs and 900 seconds for text or shared links (default 30). Use `--wait 3600` for a larger file. A wait ending returns exit code 7 while the same job continues; inspect it with `wx jobs get JOB_ID`. See [Send attachments](/use/media/).
 
 ## Exit codes
 

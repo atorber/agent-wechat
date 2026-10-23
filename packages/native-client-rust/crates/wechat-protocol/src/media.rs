@@ -5,7 +5,10 @@ use crate::{
     protobuf as p, AccountState,
 };
 use anyhow::{bail, ensure, Result};
-use openssl::symm::Cipher;
+use openssl::{
+    hash::{Hasher, MessageDigest},
+    symm::{Cipher, Crypter, Mode},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, io::Read, net::Ipv4Addr, time::Duration};
 use zeroize::Zeroize;
@@ -14,6 +17,12 @@ const MAX_CDN_BODY: usize = 2 * 1024 * 1024;
 const UPLOAD_CHUNK: usize = 65536;
 pub const MAX_CDN_TRANSFER_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_NATIVE_UPLOAD_BYTES: usize = 25 * 1024 * 1024 - 17;
+pub const MAX_LARGE_FILE_BYTES: usize = wechat_media::MAX_FILE_BYTES;
+#[path = "large_cdn_config.rs"]
+mod large_cdn_config;
+#[path = "large_file.rs"]
+mod large_file;
+pub use large_cdn_config::{decode_large_cdn_config, LargeCdnRoute};
 #[path = "avatar.rs"]
 mod avatar;
 pub use avatar::*;
@@ -24,6 +33,12 @@ pub use link_thumbnail::*;
 mod sticker;
 pub use sticker::*;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct CdnLocation {
+    pub province: u32,
+    pub city: u32,
+    pub isp: u32,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CdnConfig {
     pub version: u32,
@@ -32,6 +47,10 @@ pub struct CdnConfig {
     pub client_os_type: String,
     pub auth_key: Vec<u8>,
     pub server_ips: Vec<Ipv4Addr>,
+    #[serde(default)]
+    pub front_id: u32,
+    #[serde(default)]
+    pub location: Option<CdnLocation>,
 }
 impl Drop for CdnConfig {
     fn drop(&mut self) {
@@ -87,6 +106,8 @@ pub fn decode_cdn_config(input: &[u8], account: &AccountState) -> Result<CdnConf
         client_os_type: account.device.device_type.clone(),
         auth_key,
         server_ips,
+        front_id: 0,
+        location: None,
     };
     conf.validate()?;
     Ok(conf)
@@ -105,7 +126,9 @@ fn public_ipv4(ip: Ipv4Addr) -> bool {
         || (a == 203 && b == 0 && c == 113))
 }
 pub fn pack_cdn(fields: &CdnFields) -> Result<Vec<u8>> {
-    ensure!(fields.len() <= 256, "Too many CDN fields");
+    // A 512 MiB completion can contain 1025 ordered block etags. The byte
+    // envelope remains independently bounded, including individual values.
+    ensure!(fields.len() <= 2048, "Too many CDN fields");
     let mut out = vec![];
     for (k, v) in fields {
         ensure!(
@@ -228,7 +251,7 @@ pub fn decrypt_cdn(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         key.len() == 16
             && !encrypted.is_empty()
             && encrypted.len().is_multiple_of(16)
-            && encrypted.len() <= MAX_CDN_TRANSFER_BYTES + 16,
+            && encrypted.len() <= MAX_LARGE_FILE_BYTES + 16,
         "Invalid CDN ciphertext"
     );
     Ok(openssl::symm::decrypt(
@@ -247,6 +270,7 @@ pub enum MediaQuality {
     Thumbnail,
     Video,
     File,
+    LargeFile,
 }
 impl MediaQuality {
     pub fn filetype(self) -> u32 {
@@ -256,7 +280,16 @@ impl MediaQuality {
             Self::Thumbnail => 3,
             Self::Video => 4,
             Self::File => 5,
+            Self::LargeFile => 7,
         }
+    }
+}
+fn upload_plaintext_limit(kind: MediaQuality) -> usize {
+    match kind {
+        MediaQuality::File => MAX_CDN_TRANSFER_BYTES,
+        MediaQuality::LargeFile => MAX_LARGE_FILE_BYTES,
+        MediaQuality::Video => wechat_media::MAX_VIDEO_SOURCE_BYTES,
+        _ => MAX_NATIVE_UPLOAD_BYTES,
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -349,9 +382,10 @@ impl PreparedUpload {
     ) -> Result<Self> {
         ensure!(
             !raw.is_empty()
-                && raw.len() <= MAX_NATIVE_UPLOAD_BYTES
+                && raw.len() <= upload_plaintext_limit(kind)
                 && [
                     MediaQuality::File,
+                    MediaQuality::LargeFile,
                     MediaQuality::Original,
                     MediaQuality::Video
                 ]
@@ -392,15 +426,31 @@ impl PreparedUpload {
                 && self.file_key.len() == 32
                 && self.file_key.bytes().all(|b| b.is_ascii_hexdigit())
                 && self.plaintext_bytes > 0
-                && self.plaintext_bytes <= MAX_NATIVE_UPLOAD_BYTES as u32
+                && self.plaintext_bytes as usize <= upload_plaintext_limit(self.kind)
                 && self.encrypted.len() == ((self.plaintext_bytes as usize / 16) + 1) * 16,
             "Invalid prepared upload"
         );
-        let raw = decrypt_cdn(&self.encrypted, &self.aes_key)?;
+        // Validate persisted ciphertext without allocating a second whole file.
+        let mut decryptor =
+            Crypter::new(Cipher::aes_128_ecb(), Mode::Decrypt, &self.aes_key, None)?;
+        let mut buffer = zeroize::Zeroizing::new(vec![0; 128 * 1024 + 16]);
+        let mut md5 = Hasher::new(MessageDigest::md5())?;
+        let mut sha256 = Hasher::new(MessageDigest::sha256())?;
+        let mut plaintext_bytes = 0usize;
+        for chunk in self.encrypted.chunks(128 * 1024) {
+            let written = decryptor.update(chunk, &mut buffer)?;
+            md5.update(&buffer[..written])?;
+            sha256.update(&buffer[..written])?;
+            plaintext_bytes += written;
+        }
+        let written = decryptor.finalize(&mut buffer)?;
+        md5.update(&buffer[..written])?;
+        sha256.update(&buffer[..written])?;
+        plaintext_bytes += written;
         ensure!(
-            raw.len() == self.plaintext_bytes as usize
-                && hex::encode(md5(&raw)) == self.md5
-                && hex::encode(sha256(&raw)) == self.sha256,
+            plaintext_bytes == self.plaintext_bytes as usize
+                && hex::encode(md5.finish()?) == self.md5
+                && hex::encode(sha256.finish()?) == self.sha256,
             "Prepared upload digest mismatch"
         );
         Ok(())
@@ -420,6 +470,17 @@ pub struct CdnClient {
     config: CdnConfig,
     timeout: Duration,
 }
+fn large_file_path(path: &str, uin: u64, sequence: u32) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    parts.len() == 6
+        && parts[0].is_empty()
+        && parts[1] == "cdn"
+        && parts[2] == uin.to_string()
+        && sequence > 0
+        && parts[3] == sequence.to_string()
+        && matches!(parts[4], "4" | "5" | "7")
+        && matches!(parts[5], "apply" | "uploadblock" | "fin" | "complete")
+}
 impl CdnClient {
     pub fn new(config: CdnConfig, timeout: Duration) -> Result<Self> {
         config.validate()?;
@@ -430,8 +491,11 @@ impl CdnClient {
         Ok(Self { config, timeout })
     }
     fn post(&self, path: &str, fields: &CdnFields) -> Result<CdnFields> {
+        let sequence = u32::try_from(integer(fields, "seq")?)?;
+        ensure!(sequence != 0, "Invalid CDN sequence");
         ensure!(
-            ["/download", "/uploadv3"].contains(&path),
+            ["/download", "/downloadbig", "/uploadv3"].contains(&path)
+                || large_file_path(path, self.config.uin, sequence),
             "Invalid CDN path"
         );
         let body = pack_cdn(fields)?;
@@ -446,6 +510,7 @@ impl CdnClient {
             .header("Content-Type", "application/octet-stream")
             .header("User-Agent", "MicroMessenger Client")
             .header("Connection", "close")
+            .header("C-Seq", sequence)
             .body(body)
             .send()?;
         ensure!(
@@ -466,7 +531,15 @@ impl CdnClient {
     pub fn download_with_progress(
         &self,
         descriptor: &MediaDescriptor,
+        progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<DownloadedMedia> {
+        self.download_with_transport(descriptor, progress, |path, fields| self.post(path, fields))
+    }
+    fn download_with_transport(
+        &self,
+        descriptor: &MediaDescriptor,
         mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+        mut post: impl FnMut(&str, &CdnFields) -> Result<CdnFields>,
     ) -> Result<DownloadedMedia> {
         ensure!(
             !descriptor.file_id.is_empty()
@@ -478,37 +551,88 @@ impl CdnClient {
         if let Some(expiry) = descriptor.expires_at {
             ensure!(expiry > crate::wire::unix_time()? as u64, "media_expired");
         }
+        let large = descriptor.quality == MediaQuality::LargeFile;
+        let large_video = descriptor.quality == MediaQuality::Video
+            && descriptor.expected_bytes.unwrap_or(0) > MAX_CDN_TRANSFER_BYTES as u64;
+        let strict_transfer = large || large_video;
+        let plaintext_limit = if large {
+            MAX_LARGE_FILE_BYTES
+        } else if descriptor.quality == MediaQuality::Video && descriptor.expected_bytes.is_some() {
+            wechat_media::MAX_VIDEO_SOURCE_BYTES
+        } else {
+            MAX_CDN_TRANSFER_BYTES
+        };
+        let chunk_bytes = if strict_transfer { 512 * 1024 } else { 65536 };
+        let ciphertext_limit = (plaintext_limit / 16 + 1) * 16;
+        let expected_ciphertext = if strict_transfer {
+            let expected = usize::try_from(
+                descriptor
+                    .expected_bytes
+                    .ok_or_else(|| anyhow::anyhow!("Large file size is required"))?,
+            )?;
+            ensure!(
+                expected > 0 && expected <= plaintext_limit,
+                "Invalid large file size"
+            );
+            Some((expected / 16 + 1) * 16)
+        } else {
+            ensure!(
+                descriptor
+                    .expected_bytes
+                    .is_none_or(|size| size <= plaintext_limit as u64),
+                "Advertised media size outside limit"
+            );
+            None
+        };
+        if large_video {
+            ensure!(
+                descriptor.expected_md5.as_ref().is_some_and(
+                    |md5| md5.len() == 32 && md5.bytes().all(|b| b.is_ascii_hexdigit())
+                ),
+                "Large video source checksum is required"
+            );
+        }
         let mut position = 0usize;
         let mut total = 0usize;
         let mut encrypted = vec![];
         let mut substituted_filetype = None;
         let mut picture_format = None;
-        for sequence in 1..=401u32 {
+        let mut server_md5 = None;
+        for sequence in 1..=u32::try_from(ciphertext_limit.div_ceil(chunk_bytes))? {
             progress(
                 position as u64,
                 if total == 0 { None } else { Some(total as u64) },
             )?;
             let mut fields = shared(&self.config, sequence, descriptor.quality.filetype());
+            let requested_end = if total == 0 {
+                chunk_bytes - 1
+            } else {
+                (total - 1).min(position + chunk_bytes - 1)
+            };
             for (k, v) in [
                 ("wxautostart", 0),
                 ("downpicformat", 1),
                 ("rangestart", position as u64),
-                (
-                    "rangeend",
-                    if total == 0 {
-                        65535
-                    } else {
-                        (total - 1).min(position + 65535)
-                    } as u64,
-                ),
+                ("rangeend", requested_end as u64),
             ] {
                 put(&mut fields, k, v);
             }
             fields.insert("wxmsgflag".into(), vec![]);
             fields.insert("fileid".into(), descriptor.file_id.as_bytes().to_vec());
-            let reply = self.post("/download", &fields)?;
+            let reply = post(if large { "/downloadbig" } else { "/download" }, &fields)?;
             let code = integer(&reply, "retcode")?;
             ensure!(code == 0, "CDN download returned {code}");
+            if strict_transfer || reply.contains_key("seq") {
+                ensure!(
+                    integer(&reply, "seq")? == i64::from(sequence),
+                    "CDN download reply sequence mismatch"
+                );
+            }
+            if large {
+                validate_large_download_reply(&reply, descriptor, &mut server_md5)?;
+            } else if large_video {
+                validate_large_video_download_reply(&reply, descriptor, &mut server_md5)?;
+            }
             let start = usize::try_from(integer(&reply, "rangestart")?)?;
             let end = usize::try_from(integer(&reply, "rangeend")?)?;
             let size = usize::try_from(integer(&reply, "totalsize")?)?;
@@ -519,30 +643,38 @@ impl CdnClient {
                 start == position
                     && !data.is_empty()
                     && size > 0
-                    && size <= MAX_CDN_TRANSFER_BYTES + 16
+                    && size <= ciphertext_limit
+                    && expected_ciphertext.is_none_or(|expected| expected == size)
                     && size >= position
                     && data.len() <= size - position
+                    && end <= requested_end
+                    && (!strict_transfer || data.len() == (size - position).min(chunk_bytes))
                     && (total == 0 || total == size)
                     && end == start + data.len() - 1,
                 "Inconsistent CDN range response"
             );
             total = size;
+            if encrypted.is_empty() {
+                encrypted.try_reserve_exact(total)?;
+            }
             position += data.len();
             encrypted.extend(data);
-            progress(position as u64, Some(total as u64))?;
-            for (key, target) in [
-                ("substituteftype", &mut substituted_filetype),
-                ("rsppicformat", &mut picture_format),
-            ] {
-                if reply.contains_key(key) {
-                    let value = u32::try_from(integer(&reply, key)?)?;
-                    ensure!(
-                        target.is_none_or(|previous| previous == value),
-                        "CDN representation changed during transfer"
-                    );
-                    *target = Some(value);
+            if !large {
+                for (key, target) in [
+                    ("substituteftype", &mut substituted_filetype),
+                    ("rsppicformat", &mut picture_format),
+                ] {
+                    if reply.contains_key(key) {
+                        let value = u32::try_from(integer(&reply, key)?)?;
+                        ensure!(
+                            target.is_none_or(|previous| previous == value),
+                            "CDN representation changed during transfer"
+                        );
+                        *target = Some(value);
+                    }
                 }
             }
+            progress(position as u64, Some(total as u64))?;
             if position == total {
                 break;
             }
@@ -552,13 +684,10 @@ impl CdnClient {
             "CDN transfer did not finish within bound"
         );
         let bytes = decrypt_cdn(&encrypted, &descriptor.aes_key)?;
-        ensure!(
-            bytes.len() <= MAX_CDN_TRANSFER_BYTES,
-            "Decoded CDN body too large"
-        );
+        ensure!(bytes.len() <= plaintext_limit, "Decoded CDN body too large");
         let size_matches = descriptor.expected_bytes.map(|n| n == bytes.len() as u64);
         ensure!(
-            !descriptor.strict_size || size_matches != Some(false),
+            !(strict_transfer || descriptor.strict_size) || size_matches != Some(false),
             "Advertised media size mismatch"
         );
         let digest = hex::encode(md5(&bytes));
@@ -568,6 +697,12 @@ impl CdnClient {
                     && expected.bytes().all(|b| b.is_ascii_hexdigit())
                     && digest.eq_ignore_ascii_case(expected),
                 "Advertised media checksum mismatch"
+            );
+        }
+        if let Some(expected) = server_md5 {
+            ensure!(
+                digest.eq_ignore_ascii_case(&expected),
+                "CDN source checksum mismatch"
             );
         }
         let sha = hex::encode(sha256(&bytes));
@@ -587,9 +722,22 @@ impl CdnClient {
     pub fn upload_with_progress(
         &self,
         prepared: &PreparedUpload,
+        progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<UploadedMedia> {
+        self.upload_with_transport(prepared, progress, |path, fields| self.post(path, fields))
+    }
+    fn upload_with_transport(
+        &self,
+        prepared: &PreparedUpload,
         mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+        mut post: impl FnMut(&str, &CdnFields) -> Result<CdnFields>,
     ) -> Result<UploadedMedia> {
         prepared.validate()?;
+        let path = legacy_upload_path(
+            prepared.kind,
+            prepared.plaintext_bytes as usize,
+            prepared.encrypted.len(),
+        )?;
         let mut file_id = None;
         for (sequence, chunk) in prepared.encrypted.chunks(UPLOAD_CHUNK).enumerate() {
             let start = sequence * UPLOAD_CHUNK;
@@ -598,9 +746,13 @@ impl CdnClient {
             let mut fields =
                 upload_fields(&self.config, prepared, sequence as u32 + 1, start, end)?;
             fields.insert("filedata".into(), chunk.to_vec());
-            let reply = self.post("/uploadv3", &fields)?;
+            let reply = post(path, &fields)?;
             validate_upload_reply(&reply, sequence as u32 + 1, start, end, &mut file_id)?;
-            progress((end + 1) as u64, Some(prepared.encrypted.len() as u64))?;
+            // The final correlated acknowledgement must reach the caller so it
+            // can save completion before applying cancellation/logout fences.
+            if end + 1 < prepared.encrypted.len() {
+                progress((end + 1) as u64, Some(prepared.encrypted.len() as u64))?;
+            }
         }
         let file_id =
             file_id.ok_or_else(|| anyhow::anyhow!("CDN upload returned no file identifier"))?;
@@ -622,6 +774,237 @@ impl CdnClient {
             height: None,
         })
     }
+}
+/// Only these fixed, nonsecret numeric controls can enter a stored diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeFileDownloadControl {
+    Version,
+    VideoFormat,
+}
+impl LargeFileDownloadControl {
+    pub const fn field_name(self) -> &'static str {
+        match self {
+            Self::Version => "ver",
+            Self::VideoFormat => "videoformat",
+        }
+    }
+}
+/// Strict rejection details. Unknown keys and response bytes are never retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeFileDownloadError {
+    UnknownField,
+    FixedControlMismatch {
+        control: LargeFileDownloadControl,
+        actual: i64,
+    },
+}
+impl fmt::Display for LargeFileDownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownField => "Unsupported large-file download response field",
+            Self::FixedControlMismatch { .. } => "Unsupported large-file download control",
+        })
+    }
+}
+impl std::error::Error for LargeFileDownloadError {}
+
+// Type 4 retains the normal download endpoint. Unlike file7, representation
+// and routing metadata cannot be ignored for a byte-exact original video.
+fn validate_large_video_download_reply(
+    reply: &CdnFields,
+    descriptor: &MediaDescriptor,
+    server_md5: &mut Option<String>,
+) -> Result<()> {
+    const FIELDS: &[&str] = &[
+        "ver",
+        "seq",
+        "retcode",
+        "filedata",
+        "rangestart",
+        "rangeend",
+        "totalsize",
+        "retrysec",
+        "isretry",
+        "isoverload",
+        "isgetcdn",
+        "istrans",
+        "backsrcnum",
+        "rawfilesize",
+        "rawfilemd5",
+        "substituteftype",
+        "rsppicformat",
+        "videoformat",
+        "x-ClientIp",
+    ];
+    ensure!(
+        reply.keys().all(|key| FIELDS.contains(&key.as_str())),
+        "Unsupported large-video download response field"
+    );
+    ensure!(
+        integer(reply, "ver")? == 0,
+        "Unsupported large-video download version"
+    );
+    for key in [
+        "retrysec",
+        "isretry",
+        "isoverload",
+        "isgetcdn",
+        "backsrcnum",
+        "rsppicformat",
+    ] {
+        if reply.contains_key(key) {
+            ensure!(
+                integer(reply, key)? == 0,
+                "Unsupported large-video download control"
+            );
+        }
+    }
+    // Linux 4.1.13.26's normal pipeline response map discards `istrans`.
+    // Its success handler's format lookup is literal `KEY_VIDEOFORMAT`
+    // (CRC fb520bf9), not the retained wire key `videoformat` (dbe097e1).
+    // Neither affects the selected ECB/range writer. Admit only the values
+    // observed with byte-identical original-video ciphertext; retain the
+    // independent representation, source size and digest checks below.
+    for (key, observed) in [("istrans", 999), ("videoformat", 1)] {
+        if reply.contains_key(key) {
+            let value = integer(reply, key)?;
+            ensure!(
+                value == 0 || value == observed,
+                "Unsupported large-video download control"
+            );
+        }
+    }
+    if reply.contains_key("substituteftype") {
+        ensure!(
+            matches!(integer(reply, "substituteftype")?, 0 | 4),
+            "Unsupported large-video download representation"
+        );
+    }
+    if reply.contains_key("rawfilesize") {
+        ensure!(
+            u64::try_from(integer(reply, "rawfilesize")?)?
+                == descriptor.expected_bytes.unwrap_or(0),
+            "Large-video download source size mismatch"
+        );
+    }
+    if let Some(raw) = reply.get("rawfilemd5") {
+        ensure!(
+            raw.len() == 32 && raw.iter().all(u8::is_ascii_hexdigit),
+            "Invalid CDN source checksum"
+        );
+        let value = std::str::from_utf8(raw)?;
+        ensure!(
+            server_md5
+                .as_ref()
+                .is_none_or(|previous| previous.eq_ignore_ascii_case(value))
+                && descriptor
+                    .expected_md5
+                    .as_ref()
+                    .is_some_and(|expected| expected.eq_ignore_ascii_case(value)),
+            "CDN source checksum changed"
+        );
+        *server_md5 = Some(value.to_string());
+    }
+    Ok(())
+}
+
+fn validate_large_download_reply(
+    reply: &CdnFields,
+    descriptor: &MediaDescriptor,
+    server_md5: &mut Option<String>,
+) -> Result<()> {
+    const FIELDS: &[&str] = &[
+        "ver",
+        "seq",
+        "retcode",
+        "filedata",
+        "rangestart",
+        "rangeend",
+        "totalsize",
+        "retrysec",
+        "isretry",
+        "isoverload",
+        "isgetcdn",
+        "istrans",
+        "backsrcnum",
+        "rawfilesize",
+        "rawfilemd5",
+        "substituteftype",
+        "rsppicformat",
+        "videoformat",
+        "x-ClientIp",
+    ];
+    if !reply.keys().all(|key| FIELDS.contains(&key.as_str())) {
+        return Err(LargeFileDownloadError::UnknownField.into());
+    }
+    use LargeFileDownloadControl as Control;
+    for (control, expected) in [(Control::Version, 0), (Control::VideoFormat, 0)] {
+        let actual = integer(reply, control.field_name())?;
+        if actual != expected {
+            return Err(LargeFileDownloadError::FixedControlMismatch { control, actual }.into());
+        }
+    }
+    // Linux 4.1.13.26's file7 pipeline (0x8d12d60 -> 0x8ce3000 ->
+    // 0x8ca0ec0) does not consume these on a valid retcode-zero response.
+    // The first four are optional template values; the remaining four never
+    // enter its response template. They do not trigger retries or substitution.
+    for key in [
+        "retrysec",
+        "isretry",
+        "isoverload",
+        "isgetcdn",
+        "istrans",
+        "backsrcnum",
+        "substituteftype",
+        "rsppicformat",
+    ] {
+        if let Some(raw) = reply.get(key) {
+            // Keep the existing 16-byte integer parser bound, with unsigned
+            // syntax. This is a native parsing policy, not a service limit.
+            ensure!(
+                raw.iter().all(u8::is_ascii_digit),
+                "Invalid large-file metadata integer"
+            );
+            integer(reply, key)?;
+        }
+    }
+    ensure!(
+        u64::try_from(integer(reply, "rawfilesize")?)? == descriptor.expected_bytes.unwrap_or(0),
+        "Large-file download source size mismatch"
+    );
+    let raw = reply
+        .get("rawfilemd5")
+        .ok_or_else(|| anyhow::anyhow!("Missing CDN source checksum"))?;
+    ensure!(
+        raw.len() == 32 && raw.iter().all(u8::is_ascii_hexdigit),
+        "Invalid CDN source checksum"
+    );
+    let value = std::str::from_utf8(raw)?;
+    ensure!(
+        server_md5
+            .as_ref()
+            .is_none_or(|previous| previous.eq_ignore_ascii_case(value))
+            && descriptor
+                .expected_md5
+                .as_ref()
+                .is_none_or(|expected| expected.eq_ignore_ascii_case(value)),
+        "CDN source checksum changed"
+    );
+    *server_md5 = Some(value.to_string());
+    Ok(())
+}
+fn legacy_upload_path(
+    kind: MediaQuality,
+    plaintext: usize,
+    ciphertext: usize,
+) -> Result<&'static str> {
+    ensure!(
+        kind != MediaQuality::LargeFile
+            && (kind != MediaQuality::File || plaintext <= MAX_NATIVE_UPLOAD_BYTES)
+            && ciphertext < MAX_CDN_TRANSFER_BYTES,
+        "File requires multiphase upload"
+    );
+    Ok("/uploadv3")
 }
 fn escaped_component(s: &str) -> String {
     s.bytes()
@@ -752,6 +1135,8 @@ pub struct UploadedImage {
 pub struct UploadedVideo {
     pub video: UploadedMedia,
     pub thumbnail: UploadedMedia,
+    #[serde(default)]
+    pub original: Option<UploadedMedia>,
 }
 fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     use image::GenericImageView;
@@ -1041,10 +1426,22 @@ impl CdnClient {
     pub fn upload_video_with_progress(
         &self,
         p: &PreparedVideoUpload,
+        progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<UploadedVideo> {
+        self.upload_video_with_transport(p, progress, |path, fields| self.post(path, fields))
+    }
+    fn upload_video_with_transport(
+        &self,
+        p: &PreparedVideoUpload,
         mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+        mut post: impl FnMut(&str, &CdnFields) -> Result<CdnFields>,
     ) -> Result<UploadedVideo> {
         p.video.validate()?;
-        ensure!(p.video.kind == MediaQuality::Video, "Invalid video kind");
+        ensure!(
+            p.video.kind == MediaQuality::Video
+                && p.video.plaintext_bytes as usize <= MAX_NATIVE_UPLOAD_BYTES,
+            "Invalid normal video upload profile"
+        );
         p.thumbnail.validate(&p.video.aes_key)?;
         ensure!(
             p.thumbnail.width <= 320 && p.thumbnail.height <= 320,
@@ -1062,15 +1459,18 @@ impl CdnClient {
                 add_thumbnail(&mut fields, &p.thumbnail);
             }
             put(&mut fields, "smallvideoflag", 0);
-            let reply = self.post("/uploadv3", &fields)?;
+            let reply = post("/uploadv3", &fields)?;
             validate_upload_reply(&reply, sequence as u32 + 1, start, end, &mut file_id)?;
-            progress((end + 1) as u64, Some(p.video.encrypted.len() as u64))?;
+            if end + 1 < p.video.encrypted.len() {
+                progress((end + 1) as u64, Some(p.video.encrypted.len() as u64))?;
+            }
         }
         let id =
             file_id.ok_or_else(|| anyhow::anyhow!("Video upload returned no file identifier"))?;
         Ok(UploadedVideo {
             video: uploaded_primary(&p.video, &id, None, None),
             thumbnail: uploaded_variant(&p.video, &p.thumbnail, &id, MediaQuality::Thumbnail),
+            original: None,
         })
     }
 }
@@ -1078,6 +1478,869 @@ impl CdnClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn client() -> CdnClient {
+        CdnClient::new(
+            CdnConfig {
+                version: 1,
+                uin: 12345,
+                client_version: 456,
+                client_os_type: "synthetic-client".into(),
+                auth_key: b"synthetic-auth".to_vec(),
+                server_ips: vec![Ipv4Addr::new(1, 1, 1, 1)],
+                front_id: 0,
+                location: None,
+            },
+            Duration::from_secs(25),
+        )
+        .unwrap()
+    }
+    fn download_fixture(size: usize, quality: MediaQuality) -> (MediaDescriptor, Vec<u8>, Vec<u8>) {
+        let raw = vec![0x5a; size];
+        let key = vec![0x31; 16];
+        let ciphertext = ecb_encrypt(&raw, &key).unwrap();
+        let descriptor = MediaDescriptor {
+            file_id: "synthetic-object".into(),
+            aes_key: key,
+            quality,
+            expected_bytes: Some(size as u64),
+            expected_md5: Some(hex::encode(md5(&raw))),
+            strict_size: true,
+            expires_at: None,
+        };
+        (descriptor, raw, ciphertext)
+    }
+    fn download_reply(
+        fields: &CdnFields,
+        descriptor: &MediaDescriptor,
+        ciphertext: &[u8],
+    ) -> CdnFields {
+        let mut reply = CdnFields::new();
+        let start = integer(fields, "rangestart").unwrap() as usize;
+        let end = (integer(fields, "rangeend").unwrap() as usize).min(ciphertext.len() - 1);
+        assert_eq!(fields["fileid"], descriptor.file_id.as_bytes());
+        assert_eq!(integer(fields, "weixinnum").unwrap(), 12345);
+        assert!(!fields.contains_key("aeskey"));
+        for (key, value) in [
+            ("ver", 0),
+            ("seq", integer(fields, "seq").unwrap()),
+            ("retcode", 0),
+            ("rangestart", start as i64),
+            ("rangeend", end as i64),
+            ("totalsize", ciphertext.len() as i64),
+        ] {
+            put(&mut reply, key, value);
+        }
+        reply.insert("filedata".into(), ciphertext[start..=end].to_vec());
+        if descriptor.quality == MediaQuality::LargeFile {
+            for (key, value) in [
+                ("retrysec", 0),
+                ("isretry", 0),
+                ("isoverload", 0),
+                ("isgetcdn", 0),
+                ("istrans", 999),
+                ("backsrcnum", 0),
+                ("substituteftype", 7),
+                ("rsppicformat", 0),
+                ("videoformat", 0),
+                ("rawfilesize", descriptor.expected_bytes.unwrap() as i64),
+            ] {
+                put(&mut reply, key, value);
+            }
+            reply.insert(
+                "rawfilemd5".into(),
+                descriptor
+                    .expected_md5
+                    .as_ref()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            );
+        }
+        reply
+    }
+    #[test]
+    fn large_video_keeps_normal_endpoint_type_and_exact_source_bytes() {
+        let (descriptor, raw, ciphertext) =
+            download_fixture(MAX_CDN_TRANSFER_BYTES + 17, MediaQuality::Video);
+        let mut requests = 0;
+        let downloaded = client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |path, fields| {
+                    requests += 1;
+                    assert_eq!(path, "/download");
+                    assert_eq!(integer(fields, "filetype")?, 4);
+                    assert_eq!(integer(fields, "seq")?, requests);
+                    assert_eq!(integer(fields, "rangestart")?, (requests - 1) * 512 * 1024);
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    put(&mut reply, "substituteftype", 4);
+                    put(&mut reply, "videoformat", 1);
+                    put(&mut reply, "istrans", 999);
+                    Ok(reply)
+                },
+            )
+            .unwrap();
+        assert_eq!(requests, 51);
+        assert_eq!(downloaded.bytes, raw);
+        assert_eq!(downloaded.md5, descriptor.expected_md5.as_deref().unwrap());
+        assert_eq!(downloaded.sha256, hex::encode(sha256(&raw)));
+        assert_eq!(downloaded.substituted_filetype, Some(4));
+    }
+
+    #[test]
+    fn large_video_rejects_unknown_controls_substitution_and_unbound_source() {
+        let (mut descriptor, _, ciphertext) = download_fixture(16, MediaQuality::Video);
+        descriptor.expected_bytes = Some(MAX_CDN_TRANSFER_BYTES as u64 + 1);
+        let fields = BTreeMap::from([
+            ("rangestart".into(), b"0".to_vec()),
+            ("rangeend".into(), b"31".to_vec()),
+            ("seq".into(), b"1".to_vec()),
+            ("weixinnum".into(), b"12345".to_vec()),
+            ("fileid".into(), descriptor.file_id.as_bytes().to_vec()),
+        ]);
+        let valid = download_reply(&fields, &descriptor, &ciphertext);
+        for (key, value) in [
+            ("unknown", "private"),
+            ("ver", "1"),
+            ("videoformat", "2"),
+            ("istrans", "1"),
+            ("KEY_VIDEOFORMAT", "1"),
+            ("isretry", "1"),
+            ("isgetcdn", "1"),
+            ("rsppicformat", "3"),
+            ("substituteftype", "7"),
+            ("rawfilesize", "1"),
+            ("rawfilemd5", "00000000000000000000000000000000"),
+        ] {
+            let mut reply = valid.clone();
+            reply.insert(key.into(), value.as_bytes().to_vec());
+            let error = validate_large_video_download_reply(&reply, &descriptor, &mut None)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("private"));
+        }
+        for (size, checksum) in [
+            (
+                Some(wechat_media::MAX_VIDEO_SOURCE_BYTES as u64 + 1),
+                descriptor.expected_md5.clone(),
+            ),
+            (descriptor.expected_bytes, None),
+        ] {
+            descriptor.expected_bytes = size;
+            descriptor.expected_md5 = checksum;
+            let mut requests = 0;
+            assert!(client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |_, _| {
+                        requests += 1;
+                        bail!("must not request")
+                    }
+                )
+                .is_err());
+            assert_eq!(requests, 0);
+        }
+    }
+
+    #[test]
+    fn cold_large_descriptor_downloads_with_padding_and_hashes() {
+        let (descriptor, raw, ciphertext) =
+            download_fixture(32 * 1024 * 1024, MediaQuality::LargeFile);
+        assert_eq!(ciphertext.len(), 32 * 1024 * 1024 + 16);
+        let stored = serde_json::to_vec(&descriptor).unwrap();
+        let cold: MediaDescriptor = serde_json::from_slice(&stored).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut requests = 0;
+        let mut previous = 0;
+        let downloaded = client()
+            .download_with_transport(
+                &cold,
+                |done, total| {
+                    events.borrow_mut().push("progress");
+                    assert!(done >= previous);
+                    previous = done;
+                    if let Some(total) = total {
+                        assert_eq!(total, ciphertext.len() as u64);
+                    }
+                    Ok(())
+                },
+                |path, fields| {
+                    events.borrow_mut().push("request");
+                    requests += 1;
+                    assert_eq!(path, "/downloadbig");
+                    assert_eq!(integer(fields, "filetype")?, 7);
+                    assert_eq!(integer(fields, "seq")?, requests);
+                    assert_eq!(integer(fields, "rangestart")?, (requests - 1) * 512 * 1024);
+                    Ok(download_reply(fields, &cold, &ciphertext))
+                },
+            )
+            .unwrap();
+        assert_eq!(requests, 65);
+        assert_eq!(previous, ciphertext.len() as u64);
+        for chunk in events.borrow().chunks(3) {
+            assert_eq!(chunk, ["progress", "request", "progress"]);
+        }
+        assert_eq!(downloaded.bytes, raw);
+        assert_eq!(
+            downloaded.md5,
+            descriptor.expected_md5.as_ref().unwrap().as_str()
+        );
+        assert_eq!(downloaded.sha256, hex::encode(sha256(&raw)));
+        assert_eq!(downloaded.requested_quality, MediaQuality::LargeFile);
+        assert_eq!(downloaded.substituted_filetype, None);
+        assert_eq!(downloaded.picture_format, None);
+        assert_eq!(downloaded.advertised_size_matches, Some(true));
+    }
+    #[test]
+    fn large_download_rejections_expose_only_typed_static_control_details() {
+        use LargeFileDownloadControl as Control;
+        let (descriptor, _, ciphertext) =
+            download_fixture(512 * 1024 + 17, MediaQuality::LargeFile);
+        for (control, actual) in [(Control::Version, 1), (Control::VideoFormat, 1)] {
+            let mut calls = 0;
+            let error = client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |_, fields| {
+                        calls += 1;
+                        let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                        put(&mut reply, control.field_name(), actual);
+                        Ok(reply)
+                    },
+                )
+                .err()
+                .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(
+                error.downcast_ref::<LargeFileDownloadError>(),
+                Some(&LargeFileDownloadError::FixedControlMismatch { control, actual })
+            );
+            assert_eq!(error.to_string(), "Unsupported large-file download control");
+        }
+        let secret = "private-response-token-and-file-id";
+        let error = client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| {
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    reply.insert(secret.into(), secret.as_bytes().to_vec());
+                    Ok(reply)
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<LargeFileDownloadError>(),
+            Some(&LargeFileDownloadError::UnknownField)
+        );
+        assert_eq!(
+            error.to_string(),
+            "Unsupported large-file download response field"
+        );
+        assert!(!format!("{error:?}").contains(secret));
+    }
+    #[test]
+    fn large_download_rejects_correlation_format_unknown_fields_and_ranges() {
+        let (descriptor, _, ciphertext) =
+            download_fixture(512 * 1024 + 17, MediaQuality::LargeFile);
+        for (key, value) in [
+            ("seq", 2),
+            ("ver", 1),
+            ("retcode", -1),
+            ("videoformat", 1),
+            ("rangestart", 1),
+            ("rangeend", 512 * 1024),
+            ("totalsize", ciphertext.len() as i64 + 16),
+            ("rawfilesize", 1),
+            ("futureauth", 1),
+        ] {
+            let mut requests = 0;
+            let outcome = client().download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| {
+                    requests += 1;
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    put(&mut reply, key, value);
+                    Ok(reply)
+                },
+            );
+            assert!(outcome.is_err(), "Accepted invalid {key}");
+            assert_eq!(requests, 1);
+        }
+        for missing in ["seq", "ver", "videoformat", "rawfilemd5", "filedata"] {
+            assert!(
+                client()
+                    .download_with_transport(
+                        &descriptor,
+                        |_, _| Ok(()),
+                        |_, fields| {
+                            let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                            reply.remove(missing);
+                            Ok(reply)
+                        }
+                    )
+                    .is_err(),
+                "Accepted missing {missing}"
+            );
+        }
+    }
+    #[test]
+    fn file7_success_metadata_is_optional_and_does_not_change_verified_bytes() {
+        // These eight names come from the reference template/consumer join,
+        // independently of the native validator's allowlist.
+        let metadata = [
+            "isretry",
+            "retrysec",
+            "isoverload",
+            "isgetcdn",
+            "istrans",
+            "backsrcnum",
+            "substituteftype",
+            "rsppicformat",
+        ];
+        let (descriptor, raw, ciphertext) = download_fixture(1024 * 1024, MediaQuality::LargeFile);
+        assert_eq!(ciphertext.len(), 1024 * 1024 + 16);
+        // Each field may be absent or vary independently on the first, middle,
+        // and final padding-only ranges, without creating another request.
+        for selected in metadata.into_iter().map(Some).chain([None]) {
+            for omit in [false, true] {
+                let mut requests = 0;
+                let result = client()
+                    .download_with_transport(
+                        &descriptor,
+                        |_, _| Ok(()),
+                        |path, fields| {
+                            requests += 1;
+                            assert_eq!(path, "/downloadbig");
+                            assert_eq!(integer(fields, "seq")?, requests);
+                            let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                            for key in metadata {
+                                if selected.is_none_or(|selected| selected == key) {
+                                    if omit {
+                                        reply.remove(key);
+                                    } else {
+                                        put(
+                                            &mut reply,
+                                            key,
+                                            match requests {
+                                                1 => 1,
+                                                2 => 999,
+                                                3 => 9_999_999_999_999_999i64,
+                                                _ => panic!("Unexpected retry or extra range"),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(reply)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(requests, 3);
+                assert_eq!(result.bytes, raw);
+                assert_eq!(result.md5, descriptor.expected_md5.as_deref().unwrap());
+                assert_eq!(result.sha256, hex::encode(sha256(&raw)));
+                assert_eq!(result.requested_quality, MediaQuality::LargeFile);
+                assert_eq!(result.substituted_filetype, None);
+                assert_eq!(result.picture_format, None);
+            }
+        }
+    }
+    #[test]
+    fn file7_metadata_parser_bounds_and_errors_remain_strict() {
+        let (descriptor, _, ciphertext) = download_fixture(512 * 1024, MediaQuality::LargeFile);
+        for key in [
+            "isretry",
+            "retrysec",
+            "isoverload",
+            "isgetcdn",
+            "istrans",
+            "backsrcnum",
+            "substituteftype",
+            "rsppicformat",
+        ] {
+            for malformed in [
+                b"".as_slice(),
+                b"-1",
+                b"-0",
+                b"+1",
+                b" 1",
+                b"1x",
+                b"99999999999999999",
+                b"\xff",
+            ] {
+                let mut requests = 0;
+                assert!(
+                    client()
+                        .download_with_transport(
+                            &descriptor,
+                            |_, _| Ok(()),
+                            |_, fields| {
+                                requests += 1;
+                                let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                                reply.insert(key.into(), malformed.to_vec());
+                                Ok(reply)
+                            },
+                        )
+                        .is_err(),
+                    "Accepted malformed {key}"
+                );
+                assert_eq!(requests, 1);
+            }
+        }
+        let mut requests = 0;
+        let error = client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| {
+                    requests += 1;
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    for key in ["isretry", "retrysec", "isoverload", "isgetcdn"] {
+                        put(&mut reply, key, 1);
+                    }
+                    put(&mut reply, "retcode", -1);
+                    Ok(reply)
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "CDN download returned -1");
+        assert_eq!(requests, 1);
+    }
+    #[test]
+    fn normal_download_keeps_representation_metadata_and_consistency_checks() {
+        let (descriptor, raw, ciphertext) = download_fixture(65536, MediaQuality::File);
+        let result = client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |path, fields| {
+                    assert_eq!(path, "/download");
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    put(&mut reply, "substituteftype", 5);
+                    put(&mut reply, "rsppicformat", 3);
+                    Ok(reply)
+                },
+            )
+            .unwrap();
+        assert_eq!(result.bytes, raw);
+        assert_eq!(result.substituted_filetype, Some(5));
+        assert_eq!(result.picture_format, Some(3));
+        let mut requests = 0;
+        assert!(client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| {
+                    requests += 1;
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    put(&mut reply, "rsppicformat", requests);
+                    Ok(reply)
+                },
+            )
+            .is_err());
+        assert_eq!(requests, 2);
+    }
+    #[test]
+    fn download_refuses_truncated_overlong_and_changing_source_bytes() {
+        let (descriptor, _, ciphertext) =
+            download_fixture(512 * 1024 + 17, MediaQuality::LargeFile);
+        for failure in [
+            "empty",
+            "overlong",
+            "source-checksum",
+            "changed-checksum",
+            "changed-total",
+            "short-nonfinal",
+        ] {
+            let mut requests = 0;
+            let outcome = client().download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| {
+                    requests += 1;
+                    let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                    match failure {
+                        "empty" => {
+                            reply.insert("filedata".into(), vec![]);
+                        }
+                        "overlong" => {
+                            reply.get_mut("filedata").unwrap().push(1);
+                            put(&mut reply, "rangeend", 512 * 1024);
+                        }
+                        "source-checksum" => {
+                            reply.insert(
+                                "rawfilemd5".into(),
+                                b"0123456789abcdef0123456789abcdef".to_vec(),
+                            );
+                        }
+                        "changed-checksum" if requests == 2 => {
+                            reply.insert(
+                                "rawfilemd5".into(),
+                                b"0123456789abcdef0123456789abcdef".to_vec(),
+                            );
+                        }
+                        "changed-total" if requests == 2 => {
+                            put(&mut reply, "totalsize", ciphertext.len() + 16)
+                        }
+                        "short-nonfinal" => {
+                            reply.insert("filedata".into(), vec![1]);
+                            put(&mut reply, "rangeend", integer(fields, "rangestart")?);
+                        }
+                        _ => {}
+                    }
+                    Ok(reply)
+                },
+            );
+            assert!(outcome.is_err(), "Accepted {failure}");
+            assert!(requests <= 2);
+        }
+    }
+    #[test]
+    fn large_download_checks_padding_actual_size_and_digest_independently() {
+        let (descriptor, _, ciphertext) =
+            download_fixture(512 * 1024 + 17, MediaQuality::LargeFile);
+        let mut invalid_padding = ciphertext.clone();
+        let mut encoder = openssl::symm::Crypter::new(
+            Cipher::aes_128_ecb(),
+            openssl::symm::Mode::Encrypt,
+            &descriptor.aes_key,
+            None,
+        )
+        .unwrap();
+        encoder.pad(false);
+        let mut block = [0u8; 32];
+        let written = encoder.update(&[0u8; 16], &mut block).unwrap();
+        assert_eq!(
+            written + encoder.finalize(&mut block[written..]).unwrap(),
+            16
+        );
+        let last = invalid_padding.len() - 16;
+        invalid_padding[last..].copy_from_slice(&block[..16]);
+        assert!(client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| Ok(download_reply(fields, &descriptor, &invalid_padding))
+            )
+            .is_err());
+        let mut without_advertised_md5 = descriptor.clone();
+        without_advertised_md5.expected_md5 = None;
+        for change_later in [false, true] {
+            let mut requests = 0;
+            assert!(client()
+                .download_with_transport(
+                    &without_advertised_md5,
+                    |_, _| Ok(()),
+                    |_, fields| {
+                        requests += 1;
+                        let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                        if !change_later || requests == 2 {
+                            reply.insert(
+                                "rawfilemd5".into(),
+                                b"0123456789abcdef0123456789abcdef".to_vec(),
+                            );
+                        }
+                        Ok(reply)
+                    }
+                )
+                .is_err());
+            assert_eq!(requests, 2);
+        }
+        let mut wrong_source = ciphertext.clone();
+        wrong_source[0] ^= 1;
+        assert!(client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, fields| Ok(download_reply(fields, &descriptor, &wrong_source))
+            )
+            .is_err());
+        let mut wrong_size = descriptor.clone();
+        wrong_size.expected_bytes = Some(descriptor.expected_bytes.unwrap() + 1);
+        wrong_size.strict_size = false;
+        assert!(client()
+            .download_with_transport(
+                &wrong_size,
+                |_, _| Ok(()),
+                |_, fields| Ok(download_reply(fields, &wrong_size, &ciphertext))
+            )
+            .is_err());
+    }
+    #[test]
+    fn cancellation_and_transport_failure_never_start_another_download_request() {
+        let (descriptor, _, ciphertext) =
+            download_fixture(512 * 1024 + 17, MediaQuality::LargeFile);
+        for stop in [1, 2, 3, 4] {
+            let mut callbacks = 0;
+            let mut requests = 0;
+            let outcome = client().download_with_transport(
+                &descriptor,
+                |_, _| {
+                    callbacks += 1;
+                    ensure!(callbacks != stop, "cancelled");
+                    Ok(())
+                },
+                |_, fields| {
+                    requests += 1;
+                    Ok(download_reply(fields, &descriptor, &ciphertext))
+                },
+            );
+            assert!(outcome.is_err());
+            assert_eq!(callbacks, stop);
+            assert_eq!(requests, stop / 2);
+        }
+        let mut requests = 0;
+        assert!(client()
+            .download_with_transport(
+                &descriptor,
+                |_, _| Ok(()),
+                |_, _| {
+                    requests += 1;
+                    bail!("transport failure")
+                }
+            )
+            .is_err());
+        assert_eq!(requests, 1);
+    }
+    #[test]
+    fn normal_download_keeps_optional_sequence_and_original_limits() {
+        for quality in [
+            MediaQuality::Original,
+            MediaQuality::Standard,
+            MediaQuality::Thumbnail,
+            MediaQuality::Video,
+            MediaQuality::File,
+        ] {
+            let (descriptor, raw, ciphertext) = download_fixture(65536 + 17, quality);
+            let mut requests = 0;
+            let downloaded = client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |path, fields| {
+                        requests += 1;
+                        assert_eq!(path, "/download");
+                        assert_eq!(
+                            integer(fields, "rangeend")? - integer(fields, "rangestart")? + 1,
+                            if requests == 1 { 65536 } else { 32 }
+                        );
+                        let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                        reply.remove("seq");
+                        Ok(reply)
+                    },
+                )
+                .unwrap();
+            assert_eq!(downloaded.bytes, raw);
+            assert_eq!(requests, 2);
+            assert!(client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |_, fields| {
+                        let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                        put(&mut reply, "seq", 99);
+                        Ok(reply)
+                    }
+                )
+                .is_err());
+            assert!(client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |_, fields| {
+                        let mut reply = download_reply(fields, &descriptor, &ciphertext);
+                        put(&mut reply, "totalsize", MAX_CDN_TRANSFER_BYTES + 32);
+                        Ok(reply)
+                    }
+                )
+                .is_err());
+        }
+        assert!(unpack_cdn(&vec![0; MAX_CDN_BODY + 1]).is_err());
+    }
+    #[test]
+    fn large_descriptor_limits_fail_before_transport() {
+        let (descriptor, _, _) = download_fixture(16, MediaQuality::LargeFile);
+        for expected in [
+            None,
+            Some(0),
+            Some(MAX_LARGE_FILE_BYTES as u64 + 1),
+            Some(u64::MAX),
+        ] {
+            let mut descriptor = descriptor.clone();
+            descriptor.expected_bytes = expected;
+            let mut requests = 0;
+            assert!(client()
+                .download_with_transport(
+                    &descriptor,
+                    |_, _| Ok(()),
+                    |_, _| {
+                        requests += 1;
+                        bail!("must not request")
+                    }
+                )
+                .is_err());
+            assert_eq!(requests, 0);
+        }
+    }
+
+    #[test]
+    fn legacy_completion_receipt_survives_cancellation_after_final_ack() {
+        let prepared = PreparedUpload::prepare(
+            b"synthetic source",
+            MediaQuality::File,
+            "source.bin",
+            "filehelper",
+        )
+        .unwrap();
+        let cancelled = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0);
+        let upload = client()
+            .upload_with_transport(
+                &prepared,
+                |_, _| {
+                    ensure!(!cancelled.get(), "cancelled");
+                    Ok(())
+                },
+                |path, fields| {
+                    assert_eq!(path, "/uploadv3");
+                    calls.set(calls.get() + 1);
+                    let mut reply = CdnFields::new();
+                    put(&mut reply, "retcode", 0);
+                    for key in ["seq", "rangestart", "rangeend"] {
+                        reply.insert(key.into(), fields[key].clone());
+                    }
+                    reply.insert("fileid".into(), b"synthetic-completed-object".to_vec());
+                    cancelled.set(true);
+                    Ok(reply)
+                },
+            )
+            .unwrap();
+        assert!(cancelled.get());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(upload.descriptor.file_id, "synthetic-completed-object");
+    }
+
+    #[test]
+    fn paired_video_preserves_final_receipt_and_does_not_admit_large_normal() {
+        let mut thumbnail = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut thumbnail)
+            .encode_image(&image::DynamicImage::new_rgb8(16, 12))
+            .unwrap();
+        let p = PreparedVideoUpload::with_material(
+            b"\0\0\0\x0cftypisom",
+            &thumbnail,
+            "normal.mp4",
+            "filehelper",
+            &[0x31; 16],
+            "00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        let cancelled = std::cell::Cell::new(false);
+        let uploaded = client()
+            .upload_video_with_transport(
+                &p,
+                |_, _| {
+                    ensure!(!cancelled.get(), "cancelled");
+                    Ok(())
+                },
+                |path, fields| {
+                    assert_eq!(path, "/uploadv3");
+                    assert!(fields.contains_key("thumbdata"));
+                    assert_eq!(integer(fields, "filetype")?, 4);
+                    let mut reply = CdnFields::new();
+                    put(&mut reply, "retcode", 0);
+                    for key in ["seq", "rangestart", "rangeend"] {
+                        reply.insert(key.into(), fields[key].clone());
+                    }
+                    reply.insert("fileid".into(), b"paired-object".to_vec());
+                    cancelled.set(true);
+                    Ok(reply)
+                },
+            )
+            .unwrap();
+        assert!(uploaded.original.is_none());
+        assert_eq!(uploaded.video.descriptor.file_id, "paired-object");
+        assert_eq!(uploaded.thumbnail.descriptor.file_id, "paired-object");
+        let mut altered = p;
+        altered.video.plaintext_bytes = MAX_NATIVE_UPLOAD_BYTES as u32 + 1;
+        assert!(client()
+            .upload_video_with_transport(
+                &altered,
+                |_, _| Ok(()),
+                |_, _| { panic!("Large normal video reached legacy transport") }
+            )
+            .is_err());
+    }
+    #[test]
+    fn boundary_matrix_keeps_ciphertext_and_media_kind_limits_separate() {
+        let boundary = MAX_CDN_TRANSFER_BYTES;
+        for (size, padded, legacy) in [
+            (boundary - 17, boundary - 16, Some("/uploadv3")),
+            (boundary - 16, boundary, None),
+            (boundary - 1, boundary, None),
+            (boundary, boundary + 16, None),
+            (boundary + 1, boundary + 16, None),
+            (MAX_LARGE_FILE_BYTES, MAX_LARGE_FILE_BYTES + 16, None),
+            (MAX_LARGE_FILE_BYTES + 1, MAX_LARGE_FILE_BYTES + 16, None),
+        ] {
+            assert_eq!((size / 16 + 1) * 16, padded);
+            let kind = if size > boundary {
+                MediaQuality::LargeFile
+            } else {
+                MediaQuality::File
+            };
+            assert_eq!(legacy_upload_path(kind, size, padded).ok(), legacy);
+            assert_eq!(
+                size <= upload_plaintext_limit(kind),
+                size <= MAX_LARGE_FILE_BYTES
+            );
+            assert_eq!(
+                size <= upload_plaintext_limit(MediaQuality::Original),
+                size <= MAX_NATIVE_UPLOAD_BYTES
+            );
+            assert_eq!(
+                size <= upload_plaintext_limit(MediaQuality::Video),
+                size <= wechat_media::MAX_VIDEO_SOURCE_BYTES
+            );
+        }
+        assert_eq!(MAX_LARGE_FILE_BYTES, 536_870_912);
+        assert_eq!(MAX_NATIVE_UPLOAD_BYTES, 26_214_383);
+        assert_eq!(MAX_CDN_TRANSFER_BYTES, 26_214_400);
+    }
+    #[test]
+    fn multiphase_paths_bind_account_sequence_type_and_phase() {
+        for filetype in [4, 5, 7] {
+            for phase in ["apply", "uploadblock", "fin", "complete"] {
+                assert!(large_file_path(
+                    &format!("/cdn/12345/3/{filetype}/{phase}"),
+                    12345,
+                    3
+                ));
+            }
+        }
+        for path in [
+            "/cdn/999/3/7/apply",
+            "/cdn/12345/2/7/apply",
+            "/cdn/12345/03/7/apply",
+            "/cdn/12345/0/7/apply",
+            "/cdn/12345/3/3/apply",
+            "/cdn/12345/3/7/unknown",
+            "/cdn/12345/3/7/apply?x=1",
+            "/cdn/12345/3/7/apply/extra",
+            "//cdn/12345/3/7/apply",
+            "/cdn/12345/3/7/../apply",
+        ] {
+            assert!(!large_file_path(path, 12345, 3), "Accepted {path}");
+        }
+        assert!(!large_file_path("/cdn/12345/0/7/apply", 12345, 0));
+    }
     #[test]
     fn cdn_codec_rejects_duplicate_and_truncated() {
         let fields = BTreeMap::from([

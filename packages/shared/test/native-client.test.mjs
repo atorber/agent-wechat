@@ -1,7 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NativeApiError, NativeWeChatClient, validateNativeBaseUrl, isNativeTombstone, NATIVE_MAX_SOURCE_BYTES } from '../src/native-client.ts';
+import { openAsBlob } from 'node:fs';
+import { mkdtemp, writeFile, truncate, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { NativeApiError, NativeWeChatClient, validateNativeBaseUrl, isNativeTombstone, NATIVE_MAX_SOURCE_BYTES, NATIVE_MAX_ORDINARY_SOURCE_BYTES, NATIVE_MAX_VIDEO_SOURCE_BYTES } from '../src/native-client.ts';
 const options = { baseUrl: 'http://127.0.0.1:6174', token: 'fixture-secret' };
+test('video send quality and its separate 50 MiB source bound are exposed without changing other source limits', async () => {
+  assert.equal(NATIVE_MAX_VIDEO_SOURCE_BYTES, 50 * 1024 * 1024); assert.equal(NATIVE_MAX_SOURCE_BYTES, 512 * 1024 * 1024);
+  assert.equal(NATIVE_MAX_ORDINARY_SOURCE_BYTES, 25 * 1024 * 1024 - 17);
+  const seen = [];
+  const client = new NativeWeChatClient({ ...options, fetch: async (url, init) => {
+    assert.equal(new URL(url).pathname, '/v1/accounts/a/sends'); assert.equal(init.method, 'POST');
+    const body = JSON.parse(init.body); assert.equal(init.headers.get('Idempotency-Key'), `video-key-${body.videoQuality}`); seen.push(body);
+    return Response.json({ id: 'video-job', state: 'queued' }, { status: 202 });
+  } });
+  for (const videoQuality of ['normal', 'original']) await client.sendMedia('a', { threadId: 'peer', kind: 'video', sourceId: 'owned', videoQuality }, `video-key-${videoQuality}`);
+  assert.deepEqual(seen.map(value => value.videoQuality), ['normal', 'original']);
+});
 test('native transport rejects plaintext remote URLs and embedded credentials', () => {
   for (const url of ['http://example.net', 'https://user:secret@example.net', 'https://example.net?token=x', 'file:///tmp/store']) assert.throws(() => validateNativeBaseUrl(url));
   assert.equal(validateNativeBaseUrl('https://example.net/prefix').pathname, '/prefix/');
@@ -180,8 +196,73 @@ test('whole-thread reads require a bounded optimistic version', async () => {
  const client=new NativeWeChatClient({...options,fetch:async(_url,init)=>{assert.deepEqual(JSON.parse(init.body),{expectedVersion:'7'});return Response.json({version:'8'});}});await client.markRead('a','t','7');
  for(const invalid of ['', 'x'.repeat(129), ['old-message-selection']]) assert.throws(()=>client.markRead('a','t',invalid));
 });
-test('media upload native limit is generated from the daemon contract and refuses before transport', async () => {
- let calls=0;const client=new NativeWeChatClient({...options,fetch:async()=>{calls++;throw Error('unexpected transport');}});assert.equal(NATIVE_MAX_SOURCE_BYTES,25*1024*1024-17);await assert.rejects(client.upload('a',new Uint8Array(NATIVE_MAX_SOURCE_BYTES+1),'fixture.bin'));assert.equal(calls,0);
+test('source staging accepts the exact file limit as a disk-backed Blob and refuses one extra byte before transport', async t => {
+  const directory=await mkdtemp(join(tmpdir(),'native-sdk-source-'));t.after(()=>rm(directory,{recursive:true,force:true}));
+  const path=join(directory,'source');await writeFile(path,new Uint8Array(1));await truncate(path,NATIVE_MAX_SOURCE_BYTES);
+  assert.equal(NATIVE_MAX_SOURCE_BYTES,512*1024*1024);assert.equal(NATIVE_MAX_ORDINARY_SOURCE_BYTES,25*1024*1024-17);
+  let uploads=0;
+  const client=new NativeWeChatClient({...options,fetch:async(url,init)=>{
+    uploads++;assert.equal(new URL(url).pathname,'/v1/accounts/a/uploads');assert.equal(init.method,'POST');
+    const file=init.body.get('file');assert.equal(file.size,NATIVE_MAX_SOURCE_BYTES);assert.equal(file.name,'synthetic.bin');
+    return Response.json({id:'staged-source',byteLength:file.size});
+  }});
+  const source=await client.upload('a',await openAsBlob(path),'synthetic.bin');
+  assert.equal(source.id,'staged-source');assert.equal(uploads,1);assert.ok(NATIVE_MAX_ORDINARY_SOURCE_BYTES<NATIVE_MAX_SOURCE_BYTES);
+  await truncate(path,NATIVE_MAX_SOURCE_BYTES+1);
+  await assert.rejects(client.upload('a',await openAsBlob(path),'synthetic.bin'),/bounded media upload/);assert.equal(uploads,1);
+});
+
+test('streamed media keeps range headers and cancels an over-limit or incomplete response without buffering it', async () => {
+  for(const mode of ['range','overflow','short']){
+    let cancelled=0;
+    const client=new NativeWeChatClient({...options,fetch:async(_url,init)=>{
+      if(mode==='range')assert.equal(new Headers(init.headers).get('Range'),'bytes=4-6');
+      const body=new ReadableStream({start(controller){controller.enqueue(new Uint8Array([1,2,3]));if(mode==='overflow')controller.enqueue(new Uint8Array([4]));else controller.close();},cancel(){cancelled++;}});
+      return new Response(body,{status:mode==='range'?206:200,headers:{'content-type':'application/pdf',...(mode==='range'?{'content-range':'bytes 4-6/536870912','content-length':'3'}:mode==='short'?{'content-length':'4'}:{})}});
+    }});
+    const response=await client.mediaContentStream('a','file',{maxBytes:mode==='short'?4:3,...(mode==='range'?{range:'bytes=4-6'}:{})});
+    let size=0;const consume=async()=>{for await(const chunk of response.stream)size+=chunk.byteLength;};
+    if(mode==='range'){await consume();assert.equal(size,3);assert.equal(response.contentRange,'bytes 4-6/536870912');assert.equal(response.status,206);}
+    else await assert.rejects(consume(),mode==='overflow'?/exceeds its bound/:/length mismatch/);
+    if(mode==='overflow')assert.equal(cancelled,1);
+  }
+});
+
+test('media transfers have a separate deadline and leave normal JSON requests unchanged', async () => {
+  const client=new NativeWeChatClient({...options,timeoutMs:1,mediaTimeoutMs:100,fetch:async(_url,init)=>{
+    await new Promise(resolve=>setTimeout(resolve,10));init.signal.throwIfAborted();
+    return new URL(_url).pathname.endsWith('/uploads')?Response.json({id:'source'}):new Response(new Uint8Array([1]),{headers:{'content-length':'1'}});
+  }});
+  assert.equal((await client.upload('a',new Blob([new Uint8Array([1])]),'small.bin')).id,'source');
+  assert.equal((await client.mediaContent('a','asset',{maxBytes:1})).bytes.length,1);
+  await assert.rejects(client.status(),error=>error.name==='TimeoutError');
+  for(const mediaTimeoutMs of [0,-1,3600001,NaN])assert.throws(()=>new NativeWeChatClient({...options,mediaTimeoutMs}),/media timeout/);
+});
+test('disk-backed or browser Blob uploads honor the requested MIME without converting to bytes', async () => {
+  const blob=new Blob([new Uint8Array([1])],{type:'text/plain'});
+  blob.arrayBuffer=async()=>assert.fail('Blob uploads must stay lazy');
+  const client=new NativeWeChatClient({...options,fetch:async(_url,init)=>{assert.equal(init.body.get('file').type,'application/pdf');return Response.json({id:'source'});}});
+  assert.equal((await client.upload('a',blob,'fixture.pdf','application/pdf')).id,'source');
+});
+test('cancelling a media stream releases a blocked reader without another request', async () => {
+  let requests=0,cancelled=0;
+  const client=new NativeWeChatClient({...options,fetch:async()=>{requests++;return new Response(new ReadableStream({start(controller){controller.enqueue(new Uint8Array([1]));},cancel(){cancelled++;}}));}});
+  const content=await client.mediaContentStream('a','asset',{maxBytes:4}),iterator=content.stream[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value[0],1);
+  const blocked=iterator.next();const rejection=assert.rejects(blocked,error=>error.name==='AbortError');await content.cancel();await rejection;
+  assert.equal(requests,1);assert.equal(cancelled,1);
+});
+test('missing positive-length bodies fail and media streams cannot be replayed or leak readers after early exit', async () => {
+  const missing=new NativeWeChatClient({...options,fetch:async()=>new Response(null,{headers:{'content-length':'1'}})});
+  await assert.rejects(missing.mediaContentStream('a','asset'),/length mismatch/);
+  for(const beforeRead of [true,false]){
+    let requests=0,cancelled=0,response;
+    const client=new NativeWeChatClient({...options,fetch:async()=>{requests++;response=new Response(new ReadableStream({start(controller){controller.enqueue(new Uint8Array([1]));},cancel(){cancelled++;}}));return response;}});
+    const content=await client.mediaContentStream('a','asset',{maxBytes:1});
+    if(beforeRead){await content.cancel();await content.cancel();await assert.rejects(async()=>{for await(const _chunk of content.stream){}},error=>error.name==='AbortError');}
+    else {for await(const _chunk of content.stream)break;assert.throws(()=>content.stream[Symbol.asyncIterator](),/already consumed/);}
+    assert.equal(response.body.locked,false);assert.equal(cancelled,1);assert.equal(requests,1);
+  }
 });
 
 test('local media writeback repair is bounded and does not submit a send or transfer', async () => {
@@ -220,4 +301,34 @@ test('quoted originals are parent-bound with embedded fallback and no caller-sel
   }
   const embedded=new NativeWeChatClient({...options,fetch:async()=>Response.json({...response,state:'embedded',message:null,embeddedText:'inside quote'})});
   assert.equal((await embedded.quotedMessage('a','parent')).embeddedText,'inside quote');
+});
+
+test('completed upload reuse is an explicit option on the original job retry', async () => {
+  const bodies = [];
+  const client = new NativeWeChatClient({ ...options, fetch: async (url, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(String(url), 'http://127.0.0.1:6174/v1/accounts/a/jobs/original-job/' + (body.reuseCompletedUpload ? 'retry-completed-upload' : 'retry'));
+    assert.equal(init.method, 'POST'); bodies.push(body);
+    return Response.json({ id: 'original-job', state: 'queued', attempts: 1 });
+  } });
+  await client.retryJob('a', 'original-job');
+  await client.retryJob('a', 'original-job', { reuseCompletedUpload: true });
+  assert.deepEqual(bodies, [{}, { reuseCompletedUpload: true }]);
+});
+
+test('an older daemon cannot turn completed-upload reuse into a normal retry', async () => {
+  let calls = 0;
+  const client = new NativeWeChatClient({ ...options, fetch: async (url, init) => {
+    calls++; assert.ok(String(url).endsWith('/jobs/original-job/retry-completed-upload'));
+    return Response.json({ error: { code: 'not_found', retryable: false } }, { status: 404 });
+  } });
+  await assert.rejects(client.retryJob('a', 'original-job', { reuseCompletedUpload: true }), error => error instanceof NativeApiError && error.status === 404);
+  assert.equal(calls, 1);
+});
+
+test('invalid retry options never fall back to an ordinary job retry', () => {
+  const client = new NativeWeChatClient({ ...options, fetch: async () => assert.fail('An invalid operator option must not start work') });
+  for (const invalid of [null, [], { reuseCompletedUpload: 1 }, { reuseCompletedUpload: 'true' }, { reuseCompletedUpload: null }, { skipReadback: true }]) {
+    assert.throws(() => client.retryJob('a', 'original-job', invalid), /Invalid media retry options/);
+  }
 });
