@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Keep manual native publication separate from npm's original push/OIDC context.
+// Keep native publication separate from npm's original push/OIDC context.
 import { appendFile, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +32,45 @@ export async function nativeReleaseReadiness({ root = resolve('packages/cli'), t
   return { version, ready, state: ready ? 'available' : 'uploading' };
 }
 
+async function publicationJobsSucceeded({ runId, requiredJobs, token = process.env.GH_TOKEN, fetchImpl = fetch }) {
+  if (!/^[1-9][0-9]*$/.test(String(runId ?? ''))) throw new Error('A native workflow run ID is required');
+  const response = await githubRequest(`actions/runs/${runId}/jobs?per_page=100`, { token, fetchImpl });
+  if (response.status !== 200) throw new Error(`Cannot check native publication (HTTP ${response.status})`);
+  const result = await response.json();
+  if (!Array.isArray(result.jobs) || result.total_count > 100) throw new Error('Cannot establish native publication');
+  return requiredJobs.every(name => result.jobs.some(job => job.name === name && job.status === 'completed' && job.conclusion === 'success'));
+}
+
+export function nativePublicationSucceeded(options) {
+  return publicationJobsSucceeded({ ...options, requiredJobs: ['prepare', 'image / manifest'] });
+}
+
+export async function runtimeImagePublished({ sourceCommit, token = process.env.GH_TOKEN, fetchImpl = fetch }) {
+  if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? '')) throw new Error('A full image source commit is required');
+  for (const [workflow, job] of [['native-release.yml', 'image / manifest'], ['native-image.yml', 'manifest']]) {
+    const query = new URLSearchParams({ head_sha: sourceCommit, branch: 'main', per_page: '100' });
+    const response = await githubRequest(`actions/workflows/${workflow}/runs?${query}`, { token, fetchImpl });
+    if (response.status !== 200) throw new Error(`Cannot check runtime image publication (HTTP ${response.status})`);
+    const result = await response.json();
+    if (!Array.isArray(result.workflow_runs) || result.total_count > 100) throw new Error('Cannot establish runtime image publication');
+    const runs = result.workflow_runs.filter(run => run.head_sha === sourceCommit && run.head_branch === 'main'
+      && run.path === `.github/workflows/${workflow}` && ['push', 'workflow_dispatch'].includes(run.event)
+      && run.repository?.full_name === releaseRepository && run.head_repository?.full_name === releaseRepository
+      && run.status === 'completed' && run.conclusion === 'success');
+    for (const run of runs) {
+      if (await publicationJobsSucceeded({ runId: run.id, requiredJobs: [job], token, fetchImpl })) return true;
+    }
+  }
+  return false;
+}
+
+export async function npmReleaseReadiness(options = {}) {
+  const native = await nativeReleaseReadiness(options);
+  if (!native.ready || native.state === 'published') return native;
+  const ready = await runtimeImagePublished({ ...options, sourceCommit: options.sourceCommit ?? process.env.GITHUB_SHA });
+  return { version: native.version, ready, state: ready ? 'available' : 'image-pending' };
+}
+
 export async function resumeNpmRelease({ sourceCommit, token = process.env.GH_TOKEN, fetchImpl = fetch } = {}) {
   if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? '')) throw new Error('A full native release source commit is required');
   const query = new URLSearchParams({ head_sha: sourceCommit, event: 'push', branch: 'main', per_page: '100' });
@@ -57,21 +96,25 @@ export async function resumeNpmRelease({ sourceCommit, token = process.env.GH_TO
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   if (process.argv[2] === 'ready') {
-    const result = await nativeReleaseReadiness();
+    const result = await npmReleaseReadiness();
     if (!process.env.GITHUB_OUTPUT) throw new Error('GITHUB_OUTPUT is required');
     await appendFile(process.env.GITHUB_OUTPUT, `ready=${result.ready}\n`);
     if (!result.ready) {
       const sourceCommit = process.env.GITHUB_SHA;
       if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? '')) throw new Error('A full npm release source commit is required');
-      const summary = `## Waiting for native release assets\n\n`
-        + `npm ${result.version} is waiting for the approved native release at commit \`${sourceCommit}\`.\n\n`
-        + `Run **Prepare native release assets** on main with version \`${result.version}\` and \`confirm_publish=true\` while main still points to this commit. `
-        + `After successful native publication, Release automatically retries this original push run and verifies all source and checksum bindings before publishing npm.\n`;
+      const summary = `## ${result.state === 'image-pending' ? 'Waiting for native runtime image' : 'Waiting for native release assets'}\n\n`
+        + `npm ${result.version} is waiting for native assets and the runtime image at commit \`${sourceCommit}\`.\n\n`
+        + `Merging the Changesets Version Packages PR starts **Prepare native release assets** automatically. For recovery, run it on main with version \`${result.version}\` and \`confirm_publish=true\` while main still points to this commit. `
+        + `After successful native asset and runtime image publication, Release automatically retries this original push run and verifies all source and checksum bindings before publishing npm.\n`;
       if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, summary);
       console.error(summary);
     }
     console.log(JSON.stringify(result));
   } else if (process.argv[2] === 'resume') {
+    if (!await nativePublicationSucceeded({ runId: process.env.NATIVE_RUN_ID })) {
+      console.log('Native asset or runtime image publication was skipped; no npm retry is needed.');
+      process.exit(0);
+    }
     const result = await resumeNpmRelease({ sourceCommit: process.env.NATIVE_SOURCE_COMMIT });
     const summary = `Resumed [the original npm release run](https://github.com/${releaseRepository}/actions/runs/${result.runId}) at commit \`${result.sourceCommit}\`.\n`;
     if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, summary);
