@@ -48,7 +48,7 @@ jobs:
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @agent-wechat/agent-wechat... build
@@ -85,7 +85,7 @@ jobs:
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
       - uses: docker/setup-buildx-action@v4.4.1
         id: buildx
@@ -168,7 +168,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
       - uses: actions/download-artifact@v8
         with:
           pattern: native-*validation*

@@ -73,7 +73,7 @@ jobs:
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
       - run: bash -n scripts/install-ci-npm.sh
       - run: bash scripts/install-ci-npm.sh
       - run: |
@@ -101,7 +101,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
 
       - name: Install dependencies
@@ -132,7 +132,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: pnpm
 
       - name: Install dependencies
