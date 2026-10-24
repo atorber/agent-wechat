@@ -84,14 +84,14 @@ async function recheckNativeInputs(client: NativeWeChatClient, state: NativeCons
       throw new NativeInputInvalidated();
     }
     if (message.quote) {
-      const quote = await client.quotedMessage(message.accountId, message.id);
-      if (quote.accountId !== message.accountId || quote.threadId !== message.threadId || quote.messageId !== message.id) throw Error("Native quote identity changed");
-      if (quote.state === "recalled" || quote.message && nativeRecallInfo(quote.message)) {
+      const quote = current.quote;
+      if (quote?.state === "recalled") {
         const affected = state.acceptRecall(state.cursor, { threadId: message.threadId, serverId: message.quote.serverId,
-          observedAt: quote.message && nativeRecallInfo(quote.message)?.observedAt || new Date().toISOString() });
+          observedAt: new Date().toISOString() });
         invalidateNativePreparedInputs(message.accountId, affected);
         throw new NativeInputInvalidated();
       }
+      if (!quote || JSON.stringify(quote) !== JSON.stringify(message.quote)) throw Error("Native embedded quote changed; delivery held for review");
     }
     if (!state.isCurrent(message)) throw new NativeInputInvalidated();
   }
@@ -190,7 +190,7 @@ async function dispatchNativeMessageInput(params: NativeDispatchParams, revision
   const callback = readPolicy !== "on_inbound"
     && (message.type === 1 || (message.type === 49 && message.appMessageType === 19 && !!message.body)
       || (message.type === 49 && [3, 4, 5].includes(message.appMessageType ?? 0) && !!message.link)
-      || (preparedMedia.quote?.type === 1 && ["resolved", "embedded"].includes(preparedMedia.quote.state))
+      || (preparedMedia.quote && [1, 49].includes(preparedMedia.quote.type ?? 0) && ["resolved", "embedded"].includes(preparedMedia.quote.state))
       || (preparedMedia.attachment?.status === "ready" && preparedMedia.suppliedAssets?.length))
     ? state.preparedCallback([message.id], readPolicy) : undefined;
   if (callback) trackNativePreparedInput(dispatchManifest, callback);

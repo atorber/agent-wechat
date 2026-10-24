@@ -147,7 +147,7 @@ test("registration separates default current-thread tools from optional account-
   assert.equal(registrations[0][0].contextVersion, 2); assert.deepEqual(registrations[0][1], { names: toolNames });
   assert.equal(registrations[1][0].contextVersion, 2); assert.deepEqual(registrations[1][1], { names: archiveNames, optional: true });
   const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
-  assert.deepEqual(manifest.contracts.tools, [...toolNames, ...archiveNames, "wechat_recall", "wechat_send_share", "wechat_group_info"]);
+  assert.deepEqual(manifest.contracts.tools, [...toolNames, ...archiveNames, "wechat_recall", "wechat_send_share", "wechat_group_info", "wechat_login"]);
   for (const name of archiveNames) assert.equal(manifest.toolMetadata[name].optional, true);
   for (const tool of fixture().tools) {
     const schema = tool.parameters as any; assert.equal(schema.additionalProperties, false);
@@ -362,28 +362,55 @@ test("existing download jobs are polled and terminal failures never resubmit, ev
   }
 });
 
-test("quote recall advertises original retrieval and enforces original sender admission", async () => {
-  const value=fixture();
-  const parent={id:"quote",accountId:"a",threadId:"room@chatroom",senderId:"u1",direction:"incoming",type:49,appMessageType:57,body:"Please explain",quote:{serverId:"42",type:1}};
-  value.setMessages([parent]);
-  value.client.quotedMessage=async()=>({accountId:"a",messageId:"quote",threadId:"room@chatroom",state:"resolved",message:{id:"original",accountId:"a",threadId:"room@chatroom",serverId:"42",senderId:"blocked",direction:"incoming",type:1,body:"blocked text"}});
-  const history:any=await value.run("wechat_history",{});
-  assert.equal(history.details.items[0].quote.serverId,"42"); assert.equal(history.details.items[0].attachment.retrievalTool,"wechat_media");
-  const media:any=await value.run("wechat_media",{messageId:"quote"});
-  assert.match(media.details.body,/not permitted/); assert.ok(!JSON.stringify(media).includes("blocked text"));
-  assert.ok(value.calls.every(call=>["messages","message"].includes(call[0])));
-  value.client.quotedMessage=async()=>({accountId:"a",messageId:"quote",threadId:"room@chatroom",state:"embedded",message:null,senderId:"blocked",embeddedText:"blocked embedded text"});
-  const embedded:any=await value.run("wechat_media",{messageId:"quote"});
-  assert.match(embedded.details.body,/not permitted/);assert.ok(!JSON.stringify(embedded).includes("blocked embedded text"));
+test("link cards remain readable in history and exact lookup without attachment retrieval", async () => {
+  const value = fixture();
+  const body = "[Link] Article title\nArticle description\nhttps://example.com/article?a=1&b=2";
+  const link = { title: "Article title", description: "Article description", url: "https://example.com/article?a=1&b=2", sourceName: null };
+  value.setMessages([{ id: "link", accountId: "a", threadId: "room@chatroom", senderId: "u1", direction: "incoming", type: 49, appMessageType: 5, body, link }]);
+  for (const [name, args] of [["wechat_history", {}], ["wechat_message", { messageId: "link" }]] as const) {
+    const result: any = await value.run(name, args);
+    const message = result.details.items?.[0] ?? result.details;
+    assert.equal(message.body, body); assert.deepEqual(message.link, link); assert.equal(message.attachment?.kind, "link_preview");
+  }
+  assert.ok(value.calls.every(call => ["messages", "message"].includes(call[0])));
 });
-test("archive quote recall keeps account/chat identity while allowing cross-author originals", async () => {
-  const value=fixture({},undefined,true);
-  value.setMessages([{id:"quote",accountId:"a",threadId:"private-peer",senderId:"blocked",direction:"incoming",type:49,appMessageType:57,body:"Comment",quote:{serverId:"42",type:1}}]);
-  value.client.quotedMessage=async()=>({accountId:"a",messageId:"quote",threadId:"private-peer",state:"resolved",message:{id:"original",accountId:"a",threadId:"private-peer",serverId:"42",senderId:"other",direction:"incoming",type:1,body:"Quoted stored text"}});
-  const result:any=await value.run("wechat_archive_media",{messageId:"quote"});
-  assert.match(result.details.body,/Quoted stored text/); assert.equal(result.details.status,"resolved");
-  value.client.quotedMessage=async()=>({accountId:"a",messageId:"quote",threadId:"foreign",state:"embedded",message:null,embeddedText:"foreign"});
-  await assert.rejects(value.run("wechat_archive_media",{messageId:"quote"}),/identity/);
+test("embedded quotes are visible in history only after quoted-author admission", async () => {
+  const value = fixture();
+  const body = "[Link] Article title\nhttps://example.com/article?a=1&b=2";
+  for (const senderId of ["u1", "blocked"]) {
+    value.setMessages([{ id: "quote", accountId: "a", threadId: "room@chatroom", senderId: "u1", direction: "incoming", type: 49,
+      appMessageType: 57, body: "Explain this", quote: { serverId: "42", type: 49, appMessageType: 5, state: "embedded", senderId, embeddedText: body } }]);
+    for (const [tool, args] of [["wechat_history", {}], ["wechat_message", { messageId: "quote" }], ["wechat_media", { messageId: "quote" }]] as const) {
+      const result: any = await value.run(tool, args);
+      const item = result.details.items?.[0] ?? result.details;
+      assert.match(item.body, /Explain this/);
+      if (senderId === "u1") assert.ok(item.body.includes(body));
+      else { assert.match(item.body, /not permitted/); assert.ok(!JSON.stringify(result).includes(body)); }
+    }
+  }
+  assert.ok(value.calls.every(call => ["messages", "message"].includes(call[0])));
+});
+test("archive tools display embedded quote text across authors without original resolution", async () => {
+  const value = fixture({}, undefined, true);
+  value.setMessages([{ id: "quote", accountId: "a", threadId: "private-peer", senderId: "blocked", direction: "incoming", type: 49,
+    appMessageType: 57, body: "Comment", quote: { serverId: "42", type: 1, state: "embedded", senderId: "other", embeddedText: "Quoted excerpt" } }]);
+  const result: any = await value.run("wechat_archive_media", { messageId: "quote" });
+  assert.match(result.details.body, /Quoted excerpt/); assert.equal(result.details.status, "embedded");
+});
+
+test("inline quoted recall during image retrieval prevents saving or exposing stale bytes", async t => {
+  const value = await mediaFixture(t);
+  const parent = { id: "media-message", accountId: "a", threadId: "room@chatroom", senderId: "u1", direction: "incoming", type: 49,
+    appMessageType: 57, body: "Current comment", quote: { serverId: "42", type: 3, state: "embedded", senderId: "u1", embeddedImage: true } };
+  value.setMessages([parent]);
+  value.client.mediaContent = async () => {
+    value.calls.push(["mediaContent"]);
+    value.setMessages([{ ...parent, quote: { serverId: "42", type: 3, state: "recalled" } }]);
+    return { bytes: value.bytes, contentType: "image/png" };
+  };
+  const result: any = await value.run("wechat_media", { messageId: "media-message" });
+  assert.equal(result.details.status, "recalled"); assert.equal(result.content.length, 1);
+  assert.equal(result.details.attachment, undefined); assert.equal(value.calls.some(call => call[0] === "saveMedia"), false);
 });
 
 test("recalled history and cached attachments expose a terminal placeholder without paths or bytes", async t => {

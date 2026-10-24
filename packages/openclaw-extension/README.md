@@ -23,6 +23,12 @@ Configure plugin defaults under `plugins.entries.agent-wechat.config` (or the sa
 
 The external service remains independently owned. Plugin stop closes its stream and never stops/logs out the daemon or cancels its sends. Remote endpoints require verified HTTPS or an encrypted tunnel terminating at loopback. Set `AGENT_WECHAT_TOKEN` in the Gateway process environment, or use a configured OpenClaw secret provider. The plugin resolves `native.token` through the pinned OpenClaw SDK; `native.tokenFile` is removed. Tokens contain 32–1024 printable ASCII bytes without spaces. An explicit unresolved reference fails startup without falling back to another token. The API token needs read/media/send/login for the selected account, plus read-state only when automatic whole-thread read marking is enabled; do not grant admin solely to run the plugin. Normal sender/DM/group/mention policy remains in `channels.agent-wechat`; defaults remain closed.
 
+## Login tool
+
+`wechat_login` is available to configured agents through OpenClaw's tool policy, including from other channels while WeChat is offline. Use `{"action":"status"}` to inspect the account, `{"action":"start"}` to start or resume login and display the returned QR image, then `{"action":"wait","timeoutMs":30000}` to check scan/approval completion. Repeated starts reuse the pending operation. For a new operation, `force: true` uses QR instead of saved trust. Waits are bounded and report the operation ID and state. Cancelling a tool call leaves the submitted login operation available for a later call.
+
+The tool also accepts `disconnect` (retain saved trust), `logout` (durable native logout) and `forget` with `confirm: true` (remove local authentication, retain history). It stays bound to the configured daemon/account. Apply OpenClaw tool allow/deny policies to control which agents can manage login. The tool is directly callable so the daemon's PNG reaches the model as image content.
+
 ## Native managed mode
 
 ```json
@@ -79,6 +85,8 @@ Every target gets a stable idempotency key and a durable operation. Only an exac
 Native text, image, file, video and voice delivery results return actual stored message IDs after account/thread/server-identity verification. `meta.messageIds` preserves each verified receipt for split voice notes, alongside the durable send/job ID. Accepted media jobs may publish their stored receipts slightly later; the adapter inspects the same job for up to ten seconds and requires every accepted voice chunk's receipt. If stored receipts remain unavailable, the result leaves `messageId` empty and reports `receiptState: "needs_review"` with `retryable: false`; acceptance is not a reason to resend. Failed, partial and uncertain jobs do not enter that receipt wait.
 
 Incoming `message.recalled` events are consumed independently of slow media and model work, including recalls of own or unmentioned messages. The consumer persists the event cursor together with a tombstone, removes recalled body/quote content and attachment references from its custody records, and invalidates pending model proofs. Tombstones survive restart and suppress a late original. Attachment retrieval, transcription, model dispatch and later automatic reply delivery recheck the selected messages so late work cannot reinsert recalled input. A quote's unrelated comment remains available after its recalled original is removed.
+
+Received quotes use the parsed embedded content delivered by WeChat's server protocol and included in the normal message response's `quote` field. Text and link details render immediately; image metadata can retrieve verified bytes under the reply's own message ID. Other quoted media keeps the current comment and an unavailable attachment status. Local recall suppression and quoted-author admission still apply, including in history tools. A stored original never replaces the embedded excerpt; quote display needs no separate quote endpoint.
 
 If a source-local message ID later names a different exact thread/server target, the consumer admits that new message with a separate host turn and reply key. Completion callbacks, media results and read receipts captured for the old target cannot overwrite the new custody record.
 
