@@ -102,3 +102,67 @@ npm trusted publishing lets GitHub Actions publish without a long-lived token. S
 Once configured, delete the `NPM_TOKEN` secret from GitHub repo settings. The workflow uses OIDC automatically (requires npm >= 11.5.1, installed in CI).
 
 **Note**: Trusted publishing can only be configured for packages that already exist on npm. For brand-new packages, the first publish must use a token.
+
+## Windows signing with Azure OIDC
+
+`.github/workflows/windows-signing.yml` is a reusable signing job for EXE, DLL,
+and MSI artifacts. A release workflow must call it after building the unsigned
+files. Adding this workflow does not enable signing in the native release matrix
+or create Azure resources.
+
+1. Create an [Azure Artifact Signing account](https://learn.microsoft.com/azure/artifact-signing/quickstart),
+   complete publisher identity validation, and create a **Public Trust** certificate
+   profile. Public Trust Test and Private Trust profiles do not provide public
+   Windows distribution signing.
+2. Create a single-tenant Microsoft Entra app registration and its service principal.
+   Assign **Artifact Signing Certificate Profile Signer** to that service principal,
+   scoped to the certificate profile. The signing identity does not need Contributor
+   or Owner. Do not create an app client secret.
+3. Add a federated credential to the app registration with these exact values:
+
+   | Field | Value |
+   | --- | --- |
+   | Issuer | `https://token.actions.githubusercontent.com` |
+   | Subject | `repo:thisnick/agent-wechat:environment:windows-signing` |
+   | Audience | `api://AzureADTokenExchange` |
+
+4. Create the GitHub environment **windows-signing**, allowing only the `main`
+   branch and `v*` release tags. Set these environment variables (the identifiers
+   are configuration, not private keys):
+
+   | Variable | Value |
+   | --- | --- |
+   | `AZURE_CLIENT_ID` | App registration's application/client ID |
+   | `AZURE_TENANT_ID` | Microsoft Entra directory ID |
+   | `AZURE_SUBSCRIPTION_ID` | Subscription containing the signing account |
+   | `AZURE_SIGNING_ENDPOINT` | Signing endpoint for the account's Azure region |
+   | `AZURE_SIGNING_ACCOUNT` | Artifact Signing account name |
+   | `AZURE_SIGNING_PROFILE` | Approved Public Trust certificate profile name |
+
+5. Upload only the application files intended for signing as an artifact in the
+   build job, then call the reusable workflow from the same run:
+
+   ```yaml
+   sign-windows:
+     needs: build-windows
+     permissions:
+       contents: read
+       id-token: write
+     uses: ./.github/workflows/windows-signing.yml
+     with:
+       unsigned-artifact: windows-unsigned
+       signed-artifact: windows-signed
+   ```
+
+The signing job uses a Windows x64 runner, including for ARM64 target binaries.
+It rejects pull request runs, imports no local signing key, and verifies each
+signature and timestamp before uploading the result. Azure retains the signing
+key; GitHub obtains a short-lived Azure token through OIDC.
+
+Sign application binaries before building their installer, then sign the final
+installer in a second call. Package and publish the signed outputs, and regenerate
+release checksums after signing. A signature changes the file's bytes, so existing
+unsigned checksum manifests cannot be reused.
+
+See Microsoft's [OIDC integration guide](https://github.com/Azure/artifact-signing-action/blob/main/docs/OIDC.md)
+and [profile-scoped role assignment](https://learn.microsoft.com/azure/artifact-signing/tutorial-assign-roles).
