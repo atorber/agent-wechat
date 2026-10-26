@@ -138,16 +138,29 @@ export async function groupJourney({ client, wait, account, control, state }) {
       (await client.group(account, room)).myDisplayName,
       "Team lead",
     );
+    for (const muted of [true, false]) {
+      await finish("direct notifications", await client.setThreadMuted(account, "sim_mei", muted, `direct-notifications-${muted}`));
+      assert.equal((await client.thread(account,"sim_mei")).muted,muted);
+      assert.equal((await client.threads(account)).items.find((thread) => thread.id === "sim_mei").muted,muted);
+      await finish("verify direct notifications", await client.refreshContact(account,"sim_mei"));
+      assert.equal((await client.thread(account,"sim_mei")).muted,muted);
+    }
     await finish(
       "mute group",
       await client.setThreadMuted(account, room, true, "group-mute"),
     );
     assert.equal((await client.group(account, room)).muted, true);
+    assert.equal((await client.thread(account, room)).muted, true);
+    assert.equal(
+      (await client.threads(account)).items.find((thread) => thread.id === room).muted,
+      true,
+    );
     await finish(
       "unmute group",
       await client.setThreadMuted(account, room, false, "group-unmute"),
     );
     assert.equal((await client.group(account, room)).muted, false);
+    assert.equal((await client.thread(account, room)).muted, false);
     await finish(
       "remove member",
       await client.removeGroupMembers(

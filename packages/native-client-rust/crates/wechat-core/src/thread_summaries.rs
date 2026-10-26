@@ -18,6 +18,13 @@ impl Core {
             .filter(|r| r["deleted"] != true)
             .filter_map(|r| r["id"].as_str().map(str::to_owned))
             .collect();
+        let muted = reader.thread_muted(&ids).unwrap_or_default();
+        let unresolved = self.store.runtime_keys(
+            account,
+            &ids.iter()
+                .map(|id| format!("contact-notifications-unresolved:{id}"))
+                .collect::<Vec<_>>(),
+        )?;
         let mut latest = reader.latest_messages(&ids, own).ok().and_then(|messages| {
             let (ids, messages): (Vec<_>, Vec<_>) = messages.into_iter().unzip();
             let senders: Vec<_> = messages
@@ -42,6 +49,12 @@ impl Core {
         for row in rows.iter_mut().filter(|r| r["deleted"] != true) {
             let Some(id) = row["id"].as_str().map(str::to_owned) else {
                 continue;
+            };
+            row["muted"] = if unresolved.contains(&format!("contact-notifications-unresolved:{id}"))
+            {
+                Value::Null
+            } else {
+                json!(muted.get(&id).copied().flatten())
             };
             let members = avatar_members.remove(&id).unwrap_or_default();
             row["avatarMembers"] = json!(members
