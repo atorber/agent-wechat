@@ -111,10 +111,20 @@ impl Core {
         }
         let reader = self.profile_reader(account)?;
         let own = self.profile_username(account)?;
-        self.catalog_rows(account, kind, None, &reader, own.as_deref(), None)?
+        let mut item = self
+            .catalog_rows(account, kind, None, &reader, own.as_deref(), None)?
             .into_iter()
             .find(|r| r["id"] == id)
-            .context("no rows")
+            .context("no rows")?;
+        if kind == "threads" {
+            self.thread_summaries(
+                account,
+                std::slice::from_mut(&mut item),
+                &reader,
+                own.as_deref(),
+            )?;
+        }
+        Ok(item)
     }
     /// The account actor must be held around the profile snapshot and boundary.
     pub fn catalog_page(
@@ -239,7 +249,16 @@ impl Core {
             )?
         };
         let metadata = json!({"sourceGeneration":reader.generation(),"coverage":reader.coverage(),"order":rows.iter().map(|r|r["id"].clone()).collect::<Vec<_>>()});
-        self.paginate_values(account, &query, q, rows, metadata)
+        let mut page = self.paginate_values(account, &query, q, rows, metadata)?;
+        if kind == "threads" {
+            self.thread_summaries(
+                account,
+                page["items"].as_array_mut().context("invalid page")?,
+                &reader,
+                own.as_deref(),
+            )?;
+        }
+        Ok(page)
     }
     fn paginate_values(
         &self,
@@ -445,7 +464,13 @@ impl Core {
             let (items, next): (Vec<Value>, Option<String>) = match kind {
                 "threads" => {
                     let page = reader.threads(&q)?;
-                    (page.items.into_iter().map(|t|{let id=t.username;let kind=if id.ends_with("@chatroom"){"group"}else if id=="filehelper"||id.starts_with("weixin"){"system"}else{"direct"};Ok(json!({"id":id,"peerId":id,"accountId":account,"kind":kind,"displayName":t.label,"unreadCount":t.unread_count,"readStateVersion":self.read_state_version(account,&id,reader.generation())?,"history":{"coverage":"partial","localCount":null},"version":reader.generation()}))}).collect::<Result<Vec<_>>>()?,page.next_cursor)
+                    let ids: Vec<_> = page
+                        .items
+                        .iter()
+                        .map(|thread| thread.username.clone())
+                        .collect();
+                    let versions = self.store.read_versions(account, &ids)?;
+                    (page.items.into_iter().map(|t|{let id=t.username;let kind=if id.ends_with("@chatroom"){"group"}else if id=="filehelper"||id.starts_with("weixin"){"system"}else{"direct"};Ok(json!({"id":id,"peerId":id,"accountId":account,"kind":kind,"displayName":t.label,"unreadCount":t.unread_count,"readStateVersion":Self::read_state_hash(&id,reader.generation(),versions.get(&id).map(String::as_str).unwrap_or("0"))?,"history":{"coverage":"partial","localCount":null},"version":reader.generation()}))}).collect::<Result<Vec<_>>>()?,page.next_cursor)
                 }
                 "contacts" => {
                     let page = reader.contacts(&q)?;

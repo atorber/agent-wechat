@@ -1,5 +1,5 @@
 /** Native v1 HTTP transport. This does not start a daemon or use the legacy API. */
-import type { OfficialProfileRequest, OfficialProfileSelection, LoginRequest, QrRefresh, NativeTombstone, NativeMessage, QuoteSendReference, NativeThread, NativeContact, NativeGroup, NativeGroupMember, NativePage, NativeOperation, NativeSendIntent, ShareSendRequest, NativeEvent, NativeIdentity, NativeStatus, MediaAsset, MediaJob, NativeMediaJobRetryRequest, MediaTransferRequest, MediaSendRequest, OwnedMediaSource } from "./native.generated.js";
+import type { AccountSettings, NativeAccountRemoval, OfficialProfileRequest, OfficialProfileSelection, LoginRequest, QrRefresh, NativeTombstone, NativeMessage, QuoteSendReference, NativeThread, NativeContact, NativeGroup, NativeGroupMember, NativePage, NativeOperation, NativeSendIntent, ShareSendRequest, NativeEvent, NativeIdentity, NativeStatus, MediaAsset, MediaJob, NativeMediaJobRetryRequest, MediaTransferRequest, MediaSendRequest, OwnedMediaSource } from "./native.generated.js";
 export type * from "./native.generated.js";
 export { NATIVE_MAX_SOURCE_BYTES, NATIVE_MAX_ORDINARY_SOURCE_BYTES, NATIVE_MAX_VIDEO_SOURCE_BYTES } from "./native.generated.ts";
 import { NATIVE_MAX_SOURCE_BYTES } from "./native.generated.ts";
@@ -58,7 +58,7 @@ export class NativeWeChatClient {
     const nodeEnvironment = (globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } }).process?.env;
     if (this.baseUrl.protocol === "https:" && nodeEnvironment?.NODE_TLS_REJECT_UNAUTHORIZED === "0") throw new Error("Native API refuses HTTPS with TLS verification disabled");
     if (typeof options.token !== "string" || !options.token || /[\r\n]/.test(options.token)) throw new Error("Native API bearer token is required");
-    this.token = options.token; this.fetchImpl = options.fetch ?? fetch; this.timeoutMs = options.timeoutMs ?? 30000;
+    this.token = options.token; this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis); this.timeoutMs = options.timeoutMs ?? 30000;
     this.mediaTimeoutMs = options.mediaTimeoutMs ?? 60 * 60000;
     if (!Number.isInteger(this.mediaTimeoutMs) || this.mediaTimeoutMs < 1 || this.mediaTimeoutMs > 60 * 60000) throw new Error("Invalid native media timeout");
     this.streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? 45000;
@@ -110,7 +110,13 @@ export class NativeWeChatClient {
   accounts(): Promise<{ items: Record<string, unknown>[] }> { return this.request("v1/accounts"); }
   account(accountId: string): Promise<Record<string, unknown>> { return this.request(`v1/accounts/${id(accountId)}`); }
   createAccount(input: string | { id?: string; alias?: string }): Promise<Record<string, unknown>> { const body = typeof input === "string" ? { id: input } : input; if (!body.id && !body.alias) throw new Error("Account ID or alias is required"); return this.request("v1/accounts", { method: "POST", body: JSON.stringify(body) }); }
+  removeAccount(accountId: string, confirmAccountId: string): Promise<NativeAccountRemoval> { if (accountId !== confirmAccountId) throw new Error("Account confirmation does not match"); return this.request(`v1/accounts/${id(accountId)}`, { method: "DELETE", body: JSON.stringify({ confirmAccountId }) }); }
   updateAccount(accountId: string, options: { alias?: string; autoConnect?: boolean }): Promise<Record<string, unknown>> { return this.request(`v1/accounts/${id(accountId)}`, { method: "PATCH", body: JSON.stringify(options) }); }
+  accountSettings(accountId: string, signal?: AbortSignal): Promise<AccountSettings> { return this.request(`v1/accounts/${id(accountId)}/settings`, { signal }); }
+  updateAccountSettings(accountId: string, settings: AccountSettings, signal?: AbortSignal): Promise<AccountSettings> {
+    if (!Number.isSafeInteger(settings.autoDownloadMaxBytes) || settings.autoDownloadMaxBytes < 0 || settings.autoDownloadMaxBytes > NATIVE_MAX_SOURCE_BYTES) throw new Error("Invalid automatic download limit");
+    return this.request(`v1/accounts/${id(accountId)}/settings`, { method: "PATCH", body: JSON.stringify(settings), signal });
+  }
   capabilities(accountId: string): Promise<Record<string, unknown>> { return this.request(`v1/accounts/${id(accountId)}/capabilities`); }
   connect(accountId: string): Promise<NativeOperation> { return this.request(`v1/accounts/${id(accountId)}/connect`, { method: "POST", body: "{}" }); }
   sync(accountId: string): Promise<NativeOperation> { return this.request(`v1/accounts/${id(accountId)}/sync`, { method: "POST", body: "{}" }); }
@@ -303,7 +309,7 @@ export class NativeWeChatClient {
   ack(accountId: string, consumerId: string, cursor: string): Promise<unknown> {
     return this.request(`v1/accounts/${id(accountId)}/consumers/${id(consumerId)}/ack`, { method: "POST", body: JSON.stringify({ cursor: decimal(cursor) }) });
   }
-  async *watch(accountId: string, after = "0", signal?: AbortSignal): AsyncGenerator<NativeEvent> {
+  async *watch(accountId: string, after = "0", signal?: AbortSignal, options: { onActivity?: () => void } = {}): AsyncGenerator<NativeEvent> {
     const connection = new AbortController();
     const streamSignal = signal ? AbortSignal.any([signal, connection.signal]) : connection.signal;
     const bounded = async <T>(work: () => Promise<T>, milliseconds: number, reason: string): Promise<T> => {
@@ -329,6 +335,7 @@ export class NativeWeChatClient {
         // awaited read, not time spent yielding an event to a slow consumer.
         const activeReader = reader;
         const { value, done } = await bounded(() => activeReader.read(), this.streamIdleTimeoutMs, "Native SSE idle timeout"); if (done) break;
+        options.onActivity?.();
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length > 1024 * 1024) throw new Error("Native SSE frame exceeds its bound");
         let newline: number;

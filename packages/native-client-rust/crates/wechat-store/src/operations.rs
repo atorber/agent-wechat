@@ -204,6 +204,7 @@ impl Store {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+        Self::require_registered(&db, id)?;
         db.execute("INSERT INTO account_settings(account_id,keys_file) VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET keys_file=excluded.keys_file",params![id,path.to_str().context("keys path must be UTF-8")?])?;
         Ok(())
     }
@@ -214,10 +215,12 @@ impl Store {
     ) -> Result<T> {
         self.account(id)?;
         // Serialize sidecar operations through the store lock as well as SQLite.
-        let _guard = self
+        let guard = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+        // Recheck after taking the registry lock: a removal may have raced admission.
+        Self::require_registered(&guard, id)?;
         let path = self.account_dir(id)?.join("agent/control.sqlite");
         let m = fs::symlink_metadata(&path)?;
         if !m.is_file() || !wechat_platform::private_path(&path)? {
@@ -236,7 +239,7 @@ impl Store {
         }
         result
     }
-    fn prepare_account(db: &mut Connection) -> Result<()> {
+    pub(crate) fn prepare_account(db: &mut Connection) -> Result<()> {
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if !(1..=7).contains(&version) {
@@ -305,6 +308,22 @@ impl Store {
         self.control(id, |db| {
             db.execute("DELETE FROM runtime WHERE key=?1", [key])?;
             Ok(())
+        })
+    }
+    pub fn runtime_prefix(
+        &self,
+        account: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        anyhow::ensure!(
+            !prefix.is_empty() && prefix.len() <= 100 && (1..=100).contains(&limit),
+            "invalid_runtime_query"
+        );
+        self.control(account, |db| {
+            let mut query = db.prepare("SELECT key,value FROM runtime WHERE substr(key,1,length(?1))=?1 ORDER BY key LIMIT ?2")?;
+            let rows = query.query_map(params![prefix, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
     pub fn append_event(&self, id: &str, kind: &str, data: &Value) -> Result<Event> {
@@ -435,6 +454,18 @@ impl Store {
                 params![id, key, hash, destination, encrypted, client_id, now],
             )?;
             let intent = read_send(&tx, account, &id)?;
+            tx.execute(
+                "INSERT INTO events(kind,data_json,created_at)VALUES('send.updated',?1,?2)",
+                params![
+                    serde_json::to_string(&intent)?,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            let seq = tx.last_insert_rowid();
+            tx.execute(
+                "DELETE FROM events WHERE sequence<=?1",
+                [seq.saturating_sub(10_000)],
+            )?;
             tx.commit()?;
             Ok((intent, true))
         })
@@ -474,7 +505,18 @@ impl Store {
         })
     }
     pub fn recover_uncertain_sends(&self, account: &str) -> Result<usize> {
-        self.control(account,|db|Ok(db.execute("UPDATE outbox SET state='needs_review',error_code='restart_after_submission' WHERE state='submitting'",[])?))
+        self.control(account,|db| {
+            let tx = db.transaction()?;
+            let ids = {
+                let mut query = tx.prepare("SELECT id FROM outbox WHERE state='submitting' ORDER BY created_at,id")?;
+                let rows = query.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            tx.execute("UPDATE outbox SET state='needs_review',error_code='restart_after_submission' WHERE state='submitting'",[])?;
+            for id in &ids {crate::outbox::event(&tx,&read_send(&tx,account,id)?)?;}
+            tx.commit()?;
+            Ok(ids.len())
+        })
     }
     /// The received checkpoint means the original commands are recoverably
     /// staged, not that every official-file projection has completed.
@@ -580,6 +622,40 @@ impl Store {
             .runtime(id, &key)?
             .and_then(|v| String::from_utf8(v).ok())
             .unwrap_or_else(|| "0".into()))
+    }
+    pub fn read_versions(
+        &self,
+        id: &str,
+        threads: &[String],
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        anyhow::ensure!(threads.len() <= 200, "invalid_read_version_query");
+        if threads.is_empty() {
+            return Ok(Default::default());
+        }
+        let keys: Vec<_> = threads
+            .iter()
+            .map(|thread| format!("read-version:{thread}"))
+            .collect();
+        self.control(id, |db| {
+            let placeholders = vec!["?"; keys.len()].join(",");
+            let mut statement = db.prepare(&format!(
+                "SELECT key,value FROM runtime WHERE key IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(&keys), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut versions = std::collections::BTreeMap::new();
+            for row in rows {
+                let (key, bytes) = row?;
+                if let Some(thread) = key.strip_prefix("read-version:") {
+                    versions.insert(
+                        thread.into(),
+                        String::from_utf8(bytes).unwrap_or_else(|_| "0".into()),
+                    );
+                }
+            }
+            Ok(versions)
+        })
     }
     pub fn begin_read(
         &self,
@@ -699,6 +775,44 @@ mod tests {
         assert_eq!(store.recover_uncertain_sends("test").unwrap(), 1);
         assert_eq!(store.send("test", &first.id).unwrap().state, "needs_review");
         assert_eq!(store.recover_uncertain_sends("test").unwrap(), 0);
+    }
+    #[test]
+    fn text_send_admission_and_restart_recovery_roll_back_when_event_commit_fails() {
+        let (_temp, store) = setup();
+        let reject = |db: &mut Connection| -> Result<()> {
+            db.execute_batch("CREATE TRIGGER reject_send_event BEFORE INSERT ON events WHEN NEW.kind='send.updated' BEGIN SELECT RAISE(ABORT,'event unavailable'); END;")?;
+            Ok(())
+        };
+        let restore = |db: &mut Connection| -> Result<()> {
+            db.execute_batch("DROP TRIGGER reject_send_event;")?;
+            Ok(())
+        };
+        store.control("test", reject).unwrap();
+        assert!(store
+            .create_send("test", "event-key", "peer", "hash", b"synthetic", "10")
+            .is_err());
+        assert!(store.send_by_key("test", "event-key").is_err());
+        store.control("test", restore).unwrap();
+        let (send, created) = store
+            .create_send("test", "event-key", "peer", "hash", b"synthetic", "10")
+            .unwrap();
+        assert!(created);
+        store.put_runtime("test", "desired", b"connected").unwrap();
+        assert!(store.claim_send("test", &send.id).unwrap());
+        store.control("test", reject).unwrap();
+        assert!(store.recover_uncertain_sends("test").is_err());
+        assert_eq!(store.send("test", &send.id).unwrap().state, "submitting");
+        store.control("test", restore).unwrap();
+        assert_eq!(store.recover_uncertain_sends("test").unwrap(), 1);
+        let events = store.events("test", 0, 200).unwrap();
+        let states = events
+            .iter()
+            .filter(|event| event.kind == "send.updated")
+            .map(|event| event.data["state"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(states, vec!["queued", "submitting", "needs_review"]);
+        assert_eq!(store.recover_uncertain_sends("test").unwrap(), 0);
+        assert_eq!(store.events("test", 0, 200).unwrap().len(), events.len());
     }
     #[test]
     fn restart_interrupts_only_unfinished_network_operations_atomically() {
@@ -847,5 +961,58 @@ mod tests {
             .is_err());
         assert!(store.revoke_token(&grant.id).unwrap());
         assert!(store.access_tokens().unwrap()[0].revoked);
+    }
+}
+
+#[cfg(test)]
+mod runtime_prefix_tests {
+    use super::*;
+    #[test]
+    fn read_version_batch_matches_individual_reads_and_keeps_accounts_separate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(&temporary.path().join("data")).unwrap();
+        store.create_account("one").unwrap();
+        store.create_account("two").unwrap();
+        store.put_runtime("one", "read-version:peer", b"3").unwrap();
+        store
+            .put_runtime("one", "read-version:invalid", &[255])
+            .unwrap();
+        store.put_runtime("two", "read-version:peer", b"9").unwrap();
+        let threads = vec!["peer".into(), "invalid".into(), "missing".into()];
+        let versions = store.read_versions("one", &threads).unwrap();
+        for thread in &threads {
+            assert_eq!(
+                versions.get(thread).map(String::as_str).unwrap_or("0"),
+                store.read_version("one", thread).unwrap()
+            );
+        }
+        assert_eq!(versions["peer"], "3");
+        assert_eq!(store.read_versions("two", &threads).unwrap()["peer"], "9");
+        assert!(store
+            .read_versions("one", &vec!["peer".into(); 201])
+            .is_err());
+    }
+    #[test]
+    fn runtime_prefix_is_bounded_literal_and_account_scoped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(&temporary.path().join("data")).unwrap();
+        store.create_account("one").unwrap();
+        store.create_account("two").unwrap();
+        for key in ["queue:1", "queue:2", "other", "literal%key"] {
+            store.put_runtime("one", key, key.as_bytes()).unwrap();
+        }
+        store
+            .put_runtime("two", "queue:1", b"another-account")
+            .unwrap();
+        assert_eq!(
+            store.runtime_prefix("one", "queue:", 1).unwrap(),
+            vec![("queue:1".into(), b"queue:1".to_vec())]
+        );
+        assert_eq!(
+            store.runtime_prefix("one", "literal%", 100).unwrap().len(),
+            1
+        );
+        assert!(store.runtime_prefix("one", "", 1).is_err());
+        assert!(store.runtime_prefix("one", "queue:", 101).is_err());
     }
 }

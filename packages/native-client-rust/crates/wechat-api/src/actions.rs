@@ -2,6 +2,10 @@ use super::*;
 pub(super) fn routes() -> Router<App> {
     Router::new()
         .route(
+            "/v1/accounts/{a}/settings",
+            get(account_settings).patch(update_settings),
+        )
+        .route(
             "/v1/accounts/{a}/messages/{id}/recall",
             post(recall_message),
         )
@@ -73,6 +77,30 @@ async fn recall_message(
         )?,
     ))
 }
+async fn account_settings(
+    State(app): State<App>,
+    Extension(c): Extension<Claims>,
+    Path(a): Path<String>,
+) -> ApiResult<Json<wechat_store::AccountSettings>> {
+    c.require(Some(&a), "read")?;
+    Ok(Json(app.core.store.account_settings(&a)?))
+}
+async fn update_settings(
+    State(app): State<App>,
+    Extension(c): Extension<Claims>,
+    Path(a): Path<String>,
+    Json(input): Json<wechat_store::AccountSettings>,
+) -> ApiResult<Json<wechat_store::AccountSettings>> {
+    c.require(Some(&a), "media")?;
+    let _guard = app.core.lock_account(&a).await?;
+    app.core.store.set_account_settings(&a, &input)?;
+    app.core.store.append_event(
+        &a,
+        "account.settings_updated",
+        &json!({"accountId":a,"settings":input}),
+    )?;
+    Ok(Json(app.core.store.account_settings(&a)?))
+}
 pub(super) async fn update_account(
     State(app): State<App>,
     Extension(c): Extension<Claims>,
@@ -103,6 +131,11 @@ async fn capabilities(
 ) -> ApiResult<Json<Value>> {
     c.require(Some(&a), "read")?;
     app.core.store.account(&a)?;
+    if app.core.upstream_kind() == wechat_core::upstream::UpstreamKind::Simulator {
+        return Ok(Json(
+            json!({"nativeRuntime":true,"upstream":"simulator","officialBinaryRequired":false,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"mediaUploadMaxBytes":wechat_core::MediaKind::Image.max_source_bytes(),"mediaSendMaxBytes":{"file":wechat_core::MediaKind::Image.max_source_bytes(),"image":wechat_core::MediaKind::Image.max_source_bytes(),"voice":wechat_core::MediaKind::Image.max_source_bytes(),"video":wechat_core::MediaKind::Image.max_source_bytes()},"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["group"],"incomingGroupUpdates":"partial","mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some()}),
+        ));
+    }
     Ok(Json(
         json!({"nativeRuntime":true,"officialBinaryRequired":false,"quotedTextSend":true,"quotedTextSendScopes":["read","send"],"quotedTextSendLiveValidated":false,"mediaUploadMaxBytes":wechat_core::MAX_SOURCE_BYTES,"mediaSendMaxBytes":media_send_max_bytes(),"mediaKinds":["image","file","video","voice"],"downloadQualities":["best","thumbnail","standard","original","normal","encoded"],"logout":true,"savedDeviceLogin":true,"profileKeysConfigured":app.core.store.keys_file(&a)?.is_some(),"groupMutations":["create","rename","leave","add_members","remove_members","my_name","clear_announcement"],"groupMutationScope":"admin","groupCreateMinSelectedMembers":2,"groupMutationMaxSelectedMembers":40,"threadNotificationTargets":["group"],"incomingGroupUpdates":"partial"}),
     ))

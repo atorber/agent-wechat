@@ -198,6 +198,7 @@ impl Core {
         self: &Arc<Self>,
         request: OfficialProfileRequest,
     ) -> Result<OfficialProfileSelection> {
+        crate::upstream::require_native(self.upstream.kind())?;
         let _guard = self.official_profiles.lock().await;
         let core = self.clone();
         blocking(move || core.prepare_official_profile_inner(request)).await
@@ -271,6 +272,8 @@ impl Core {
             self.leases
                 .lock()
                 .map_err(|_| anyhow::anyhow!("profile ownership unavailable"))?
+                .entry(account.id.clone())
+                .or_default()
                 .push(lease);
             self.bootstrap_leases
                 .lock()

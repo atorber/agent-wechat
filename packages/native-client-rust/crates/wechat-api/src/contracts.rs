@@ -90,8 +90,33 @@ pub struct NativeThread {
     #[ts(type = "number | null")]
     pub unread_count: Option<i64>,
     pub read_state_version: String,
+    // Absent when local message shards are unavailable; null for empty history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub last_message: Option<NativeThreadMessage>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub avatar_members: Option<Vec<NativeThreadAvatarMember>>,
     #[ts(type = "unknown")]
     pub history: Value,
+}
+#[derive(Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadMessage {
+    pub id: String,
+    pub sender_id: Option<String>,
+    pub sender_name: Option<String>,
+    pub direction: Option<String>,
+    #[serde(rename = "type")]
+    pub message_type: i32,
+    pub text: String,
+    pub created_at: Option<String>,
+}
+#[derive(Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadAvatarMember {
+    pub id: String,
+    pub display_name: String,
 }
 #[derive(Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -318,6 +343,19 @@ pub struct NativeMediaJobRetryRequest {
     pub reuse_completed_upload: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeAccountRemovalRequest {
+    pub confirm_account_id: String,
+}
+#[derive(Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAccountRemoval {
+    pub account_id: String,
+    pub removed: bool,
+    pub files_retained: bool,
+}
+
 pub fn typescript() -> String {
     let declarations = [
         NativeMentions::decl(),
@@ -326,6 +364,8 @@ pub fn typescript() -> String {
         NativeRecallInfo::decl(),
         NativeMessage::decl(),
         NativeThread::decl(),
+        NativeThreadMessage::decl(),
+        NativeThreadAvatarMember::decl(),
         NativeContact::decl(),
         NativeGroup::decl(),
         NativeGroupMember::decl(),
@@ -343,6 +383,9 @@ pub fn typescript() -> String {
         NativeEvent::decl(),
         NativeIdentity::decl(),
         NativeStatus::decl(),
+        wechat_store::AccountSettings::decl(),
+        NativeAccountRemovalRequest::decl(),
+        NativeAccountRemoval::decl(),
         wechat_core::QuoteSendReference::decl(),
         NativeTextSendRequest::decl(),
         wechat_core::ShareSendRequest::decl(),

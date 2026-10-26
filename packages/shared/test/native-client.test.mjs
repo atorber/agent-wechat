@@ -412,3 +412,46 @@ test('invalid retry options never fall back to an ordinary job retry', () => {
     assert.throws(() => client.retryJob('a', 'original-job', invalid), /Invalid media retry options/);
   }
 });
+test('default browser fetch keeps the global receiver', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = function () { assert.equal(this, globalThis); return Promise.resolve(Response.json({ items: [] })); };
+  try { await new NativeWeChatClient(options).accounts(); } finally { globalThis.fetch = original; }
+});
+test('SSE activity starts on actual frames, including keepalive comments', async () => {
+  const encoder = new TextEncoder(); let activity = 0;
+  const client = new NativeWeChatClient({ ...options, fetch: async () => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(encoder.encode(': keepalive\n\n'));
+    controller.enqueue(encoder.encode('data: {"cursor":"1","kind":"message.committed","data":{"messageId":"m"},"createdAt":"1"}\n\n')); controller.close();
+  } }), { headers: { 'Content-Type': 'text/event-stream' } }) });
+  assert.equal(activity,0); const events=[];
+  for await (const event of client.watch('a','0',undefined,{ onActivity: () => activity++ })) events.push(event);
+  assert.equal(activity,2); assert.equal(events.length,1);
+});
+
+
+test('profile removal sends a confirmed DELETE and refuses a mismatched identity before transport', async () => {
+  const requests = [];
+  const client = new NativeWeChatClient({ ...options, fetch: async (url, init) => {
+    requests.push({ url: String(url), init });
+    return Response.json({ accountId: 'profile-1', removed: true, filesRetained: true });
+  }});
+  assert.throws(() => client.removeAccount('profile-1', 'profile-2'), /confirmation/);
+  assert.equal(requests.length, 0);
+  assert.equal((await client.removeAccount('profile-1', 'profile-1')).filesRetained, true);
+  assert.match(requests[0].url, /\/v1\/accounts\/profile-1$/);
+  assert.equal(requests[0].init.method, 'DELETE');
+  assert.deepEqual(JSON.parse(requests[0].init.body), { confirmAccountId: 'profile-1' });
+});
+
+test('account settings read and update the account-scoped API with byte limits', async () => {
+  const calls = [];
+  const client = new NativeWeChatClient({ ...options, fetch: async (url, init) => {
+    calls.push([new URL(url).pathname, init.method ?? 'GET', init.body ? JSON.parse(init.body) : null]);
+    return Response.json({ autoDownloadMaxBytes: init.body ? JSON.parse(init.body).autoDownloadMaxBytes : 52428800 });
+  }});
+  assert.equal((await client.accountSettings('personal')).autoDownloadMaxBytes, 52428800);
+  assert.equal((await client.updateAccountSettings('personal', { autoDownloadMaxBytes: 0 })).autoDownloadMaxBytes, 0);
+  assert.deepEqual(calls, [ ['/v1/accounts/personal/settings', 'GET', null], ['/v1/accounts/personal/settings', 'PATCH', { autoDownloadMaxBytes: 0 }] ]);
+  for (const autoDownloadMaxBytes of [-1, 1.5, NaN, 536870913]) assert.throws(() => client.updateAccountSettings('personal', { autoDownloadMaxBytes }), /limit/);
+  assert.equal(calls.length, 2);
+});

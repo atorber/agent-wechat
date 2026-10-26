@@ -119,7 +119,14 @@ impl IntoResponse for ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
         let message = error.to_string();
+        if message == "unsupported_simulator_operation" {
+            return Self(
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_simulator_operation",
+            );
+        }
         for code in [
+            "invalid_auto_download_limit",
             "invalid_group_identity",
             "invalid_group_text",
             "invalid_group_members",
@@ -334,6 +341,11 @@ impl From<anyhow::Error> for ApiError {
                 "account_not_found",
             ),
             ("no rows", StatusCode::NOT_FOUND, "not_found"),
+            (
+                "account_sign_out_required",
+                StatusCode::CONFLICT,
+                "account_sign_out_required",
+            ),
             ("auth_required", StatusCode::CONFLICT, "auth_required"),
             (
                 "profile_keys_missing",
@@ -465,8 +477,22 @@ async fn shutdown_daemon(
 }
 async fn status(State(app): State<App>, Extension(c): Extension<Claims>) -> ApiResult<Json<Value>> {
     c.require(None, "read")?;
+    let mut identity = version();
+    if app.core.upstream_kind() == wechat_core::upstream::UpstreamKind::Simulator {
+        identity.backend = "simulator";
+        identity.native_login = false;
+        identity.capabilities = vec![
+            "serve",
+            "simulator-login",
+            "simulator-sync",
+            "simulator-push",
+            "text-send",
+            "events",
+            "scoped-tokens",
+        ];
+    }
     checked::<contracts::NativeStatus>(
-        json!({"serverId":app.core.store.server_id,"dataDir":app.core.store.root,"pid":std::process::id(),"ownershipGeneration":app.core.ownership_generation,"version":version(),"state":"ready"}),
+        json!({"serverId":app.core.store.server_id,"dataDir":app.core.store.root,"pid":std::process::id(),"ownershipGeneration":app.core.ownership_generation,"version":identity,"state":"ready"}),
     )
 }
 async fn accounts(
@@ -511,6 +537,24 @@ async fn create_account(
         StatusCode::CREATED,
         Json(serde_json::to_value(account).map_err(anyhow::Error::from)?),
     ))
+}
+async fn remove_account(
+    State(app): State<App>,
+    Extension(c): Extension<Claims>,
+    Path(a): Path<String>,
+    Json(input): Json<contracts::NativeAccountRemovalRequest>,
+) -> ApiResult<Json<Value>> {
+    c.require(Some(&a), "admin")?;
+    if input.confirm_account_id != a {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "account_confirmation_mismatch",
+        ));
+    }
+    app.core.remove_account(&a).await?;
+    checked::<contracts::NativeAccountRemoval>(
+        json!({"accountId": a, "removed": true, "filesRetained": true}),
+    )
 }
 async fn prepare_official_profile(
     State(app): State<App>,
@@ -1108,7 +1152,9 @@ pub fn router(core: Arc<Core>, token: &str) -> Router {
         .route("/v1/profiles/official", post(prepare_official_profile))
         .route(
             "/v1/accounts/{a}",
-            get(account).patch(actions::update_account),
+            get(account)
+                .patch(actions::update_account)
+                .delete(remove_account),
         )
         .route("/v1/accounts/{a}/schema", get(schema))
         .route(
@@ -1346,6 +1392,107 @@ mod tests {
         let core = Core::new(store, None).unwrap();
         let app = router(core.clone(), OWNER);
         (t, core, app)
+    }
+    #[tokio::test]
+    async fn profile_removal_requires_confirmation_scope_signout_and_idle_workers() {
+        let (_temp, core, app) = setup();
+        let read = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let manage = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (token, scope) in [(read, "read"), (manage, "admin")] {
+            core.store
+                .issue_token(
+                    scope,
+                    &format!("{:x}", Sha256::digest(token.as_bytes())),
+                    &["one".into()],
+                    &[scope.into()],
+                    None,
+                )
+                .unwrap();
+        }
+        let body = Some(json!({"confirmAccountId":"one"}));
+        for (token, target, expected) in [
+            (None, "one", StatusCode::UNAUTHORIZED),
+            (Some(read), "one", StatusCode::FORBIDDEN),
+            (Some(manage), "two", StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(
+                call(
+                    app.clone(),
+                    "DELETE",
+                    &format!("/v1/accounts/{target}"),
+                    token,
+                    body.clone()
+                )
+                .await
+                .0,
+                expected
+            );
+        }
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                "/v1/accounts/one",
+                Some(OWNER),
+                Some(json!({"confirmAccountId":"two"}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        core.store
+            .put_runtime("one", "account-state", b"retained state")
+            .unwrap();
+        let (status, error) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/accounts/one",
+            Some(OWNER),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "account_sign_out_required");
+        core.store.put_runtime("one", "logged-out", b"1").unwrap();
+        let guard = core.lock_account("one").await.unwrap();
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                "/v1/accounts/one",
+                Some(OWNER),
+                body.clone()
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        drop(guard);
+        let path = core.store.account("one").unwrap().profile_path;
+        assert!(wechat_store::profile_lease(&path).is_err());
+        let (status, result) = call(
+            app.clone(),
+            "DELETE",
+            "/v1/accounts/one",
+            Some(manage),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            result,
+            json!({"accountId":"one","removed":true,"filesRetained":true})
+        );
+        assert!(path.is_dir());
+        assert!(wechat_store::profile_lease(&path).is_ok());
+        assert!(core.store.account("one").is_err());
+        assert!(core.store.account("two").is_ok());
+        assert_eq!(
+            call(app, "GET", "/v1/accounts/one", Some(OWNER), None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
     }
     #[tokio::test]
     async fn recall_requires_account_send_scope_and_an_exact_string_server_id() {
@@ -2067,6 +2214,93 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+    #[tokio::test]
+    async fn download_settings_require_account_scope_and_validate_without_touching_a_profile() {
+        let (_temp, core, app) = setup();
+        let read = "synthetic-read-policy-token-123456";
+        let media = "synthetic-media-policy-token-123456";
+        for (token, scope) in [(read, "read"), (media, "media")] {
+            core.store
+                .issue_token(
+                    scope,
+                    &format!("{:x}", Sha256::digest(token)),
+                    &["one".into()],
+                    &[scope.into()],
+                    None,
+                )
+                .unwrap();
+        }
+        let path = "/v1/accounts/one/settings";
+        let (status, settings) = call(app.clone(), "GET", path, Some(read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["autoDownloadMaxBytes"], 52_428_800);
+        assert_eq!(
+            call(
+                app.clone(),
+                "GET",
+                "/v1/accounts/two/settings",
+                Some(read),
+                None
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "PATCH",
+                path,
+                Some(read),
+                Some(json!({"autoDownloadMaxBytes":0}))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, settings) = call(
+            app.clone(),
+            "PATCH",
+            path,
+            Some(media),
+            Some(json!({"autoDownloadMaxBytes":0})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["autoDownloadMaxBytes"], 0);
+        assert_eq!(
+            core.store
+                .account_settings("two")
+                .unwrap()
+                .auto_download_max_bytes,
+            52_428_800
+        );
+        for value in [json!(-1), json!(536_870_913), json!(1.5), json!("50")] {
+            let status = call(
+                app.clone(),
+                "PATCH",
+                path,
+                Some(media),
+                Some(json!({"autoDownloadMaxBytes":value})),
+            )
+            .await
+            .0;
+            assert!(status.is_client_error());
+        }
+        assert_eq!(
+            core.store
+                .account_settings("one")
+                .unwrap()
+                .auto_download_max_bytes,
+            0
+        );
+        assert!(core
+            .store
+            .events("one", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "account.settings_updated"));
     }
     #[tokio::test]
     async fn authorization_is_required_and_status_identifies_owned_process() {

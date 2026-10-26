@@ -27,6 +27,7 @@ const moved = {
   'operations/restarting': 'how-it-works/sends',
   'reference/api': 'use/api',
   'use/quoted-replies': 'use/cli',
+  'use/downloads': 'use/settings',
   'reference/environment-vars': 'reference/configuration',
 };
 
@@ -56,6 +57,7 @@ export default defineConfig({
           { label: 'What you need', slug: 'setup/requirements' },
           { label: 'Install', slug: 'setup/install' },
           { label: 'Connect your account', slug: 'setup/connect' },
+          { label: 'Desktop app', slug: 'setup/desktop' },
           { label: 'Keep it running', slug: 'setup/run' },
           { label: 'Migrate from the old container', slug: 'setup/migrate' },
         ] },
@@ -63,6 +65,7 @@ export default defineConfig({
           { label: 'CLI recipes', slug: 'use/cli' },
           { label: 'Manage groups', slug: 'use/groups' },
           { label: 'Send attachments', slug: 'use/media' },
+          { label: 'Settings', slug: 'use/settings' },
           { label: 'Video quality', slug: 'use/video' },
           { label: 'OpenClaw', items: [
             { label: 'Quick setup', slug: 'openclaw/setup' },

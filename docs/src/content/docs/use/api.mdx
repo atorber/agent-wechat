@@ -14,6 +14,25 @@ export WX=http://127.0.0.1:6174/v1 TOKEN=...   # and ACCOUNT=<id from /v1/accoun
 curl -H "Authorization: Bearer $TOKEN" $WX/accounts
 ```
 
+## Profiles
+
+Use the existing daemon connection key for profile management. There is no separate
+frontend role to configure.
+
+| Action | Request |
+| --- | --- |
+| List profiles | `GET /accounts` |
+| Add a profile | `POST /accounts` with `{ "alias": "Personal" }` |
+| Sign in | `POST /accounts/{id}/login-attempts` with an `Idempotency-Key` |
+| Sign out | `POST /accounts/{id}/auth/logout` with an `Idempotency-Key` |
+| Remove a signed-out profile | `DELETE /accounts/{id}` with `{ "confirmAccountId": "<same id>" }` |
+
+Removal returns `{ "accountId": "…", "removed": true, "filesRetained": true }`.
+It unregisters the profile and keeps its local files and recovery records. Sign out
+and wait for active operations to finish first; otherwise the response is `409`.
+Removed IDs and profile paths stay reserved. The existing token scopes apply:
+creation, renaming and removal use `admin`; sign-in and sign-out use `login`.
+
 ## Read
 
 ```bash
@@ -23,6 +42,15 @@ curl -H "Authorization: Bearer $TOKEN" "$WX/accounts/$ACCOUNT/messages?query=inv
 ```
 
 Lists return `{ "items": [...], "nextCursor": "..." }`. Pass `cursor=` with the same query to get the next page.
+
+`GET /threads` and `GET /threads/{id}` include sidebar summaries from saved history:
+
+| Field | Contents |
+| --- | --- |
+| `lastMessage` | Latest local message ID, sender ID/name, direction, type, time and a plain-text `text` preview of up to 160 characters. `null` means empty local history; omitted means the preview is unavailable. |
+| `avatarMembers` | Up to four cached group members, each with `id` and `displayName`; empty for direct chats or an unavailable roster. Fetch cached pictures through `GET /avatars/{username}`. |
+
+These reads do not refresh WeChat or download media. Media messages use labels such as “Photo” and “Sticker”; recalled content stays suppressed. Refresh the thread list after message or group events to update the summaries.
 
 ## Send
 

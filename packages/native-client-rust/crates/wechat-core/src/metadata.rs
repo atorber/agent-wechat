@@ -333,7 +333,7 @@ impl Core {
             wechat_profile::apply_contact_patch(
                 &location,
                 &keys,
-                &contact_patch(record)?,
+                &self.upstream.contact_patch(record)?,
                 &options,
             )?;
             if record.username.ends_with("@chatroom") {
@@ -521,10 +521,9 @@ impl Core {
         ids: &[String],
     ) -> Result<MetadataReply<ContactLookup>> {
         let mut state = self.account_state(account)?;
-        let native = client()?;
         let capture =
             |state: &mut wechat_protocol::AccountState| -> Result<MetadataReply<ContactLookup>> {
-                let raw = native.lookup_contacts_raw(state, ids)?;
+                let raw = self.upstream.lookup_contacts_raw(state, ids)?;
                 // Persist the verified body before any schema/identity decoding. A
                 // decoder failure can be investigated offline without repeating RPC.
                 self.retain_contact_wire(account, ids, &raw)?;
@@ -535,7 +534,9 @@ impl Core {
         match capture(&mut state) {
             Ok(reply) => Ok(reply),
             Err(error) if auth_rejected(&error) => {
-                state = native.renew_session(&state, "agent-wechat metadata")?;
+                state = self
+                    .upstream
+                    .renew_session(&state, "agent-wechat metadata")?;
                 capture(&mut state)
             }
             Err(error) => Err(error),
@@ -612,7 +613,7 @@ impl Core {
                 let profile_revision = self.group_revision(account, &group_id)?;
                 let epoch = self.store.runtime(account, "logout-epoch")?;
                 let raw = self.group_read(account, epoch.as_deref(), |state| {
-                    client()?.group_detail_raw(state, &group_id)
+                    self.upstream.group_detail_raw(state, &group_id)
                 })?;
                 let id = self.stage_metadata_body(
                     account,
@@ -631,7 +632,9 @@ impl Core {
                 self.metadata_contact_lookup(account, std::slice::from_ref(&group_id))?;
                 let mut state = self.account_state(account)?;
                 let profile_revision = self.group_revision(account, &group_id)?;
-                let reply = client()?.lookup_room_receipt(&mut state, &group_id, version)?;
+                let reply = self
+                    .upstream
+                    .lookup_room_receipt(&mut state, &group_id, version)?;
                 self.save_state(account, &state)?;
                 let complete = reply.value.full_member_ids.is_some();
                 let id = self.stage_metadata_body(
@@ -667,7 +670,9 @@ impl Core {
                 )?;
                 self.apply_metadata_receipt(account, &id, false)?;
                 self.metadata_check(account, operation, deadline)?;
-                let bytes = wechat_protocol::media::download_advertised_avatar(&source)?;
+                let mut state = self.account_state(account)?;
+                let bytes = self.upstream.download_avatar(&mut state, &source)?;
+                self.save_state(account, &state)?;
                 let id = self.stage_metadata_body(
                     account,
                     ReceiptBody::Avatar {
@@ -746,8 +751,10 @@ impl Core {
                 pending
             } else {
                 let mut state = self.account_state(account)?;
-                let reply =
-                    client()?.init_contacts_receipt(&mut state, sequences.0, sequences.1)?;
+                let reply = self
+                    .upstream
+                    .native(NativeOptions::default())?
+                    .init_contacts_receipt(&mut state, sequences.0, sequences.1)?;
                 self.save_state(account, &state)?;
                 let id =
                     self.stage_metadata_body(account, ReceiptBody::ContactCatalog(reply.clone()))?;
@@ -842,7 +849,10 @@ impl Core {
             }
             self.metadata_check(account, operation, deadline)?;
             let mut state = self.account_state(account)?;
-            let page = client()?.group_inventory(&mut state, &cursor)?;
+            let page = self
+                .upstream
+                .native(NativeOptions::default())?
+                .group_inventory(&mut state, &cursor)?;
             self.save_state(account, &state)?;
             let more = page.more;
             let wait = page.wait_seconds;

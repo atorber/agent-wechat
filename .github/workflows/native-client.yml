@@ -7,6 +7,10 @@ on:
       - 'rust-toolchain.toml'
       - 'packages/shared/src/native*'
       - 'scripts/native-generate-types.sh'
+      - 'scripts/native-simulator-smoke.mjs'
+      - 'scripts/client-ui*-smoke.mjs'
+      - 'packages/client-ui/**'
+      - 'pnpm-lock.yaml'
       - 'scripts/native-ci-cache-key*.py'
       - '.github/workflows/native-client.yml'
   push:
@@ -16,6 +20,10 @@ on:
       - 'rust-toolchain.toml'
       - 'packages/shared/src/native*'
       - 'scripts/native-generate-types.sh'
+      - 'scripts/native-simulator-smoke.mjs'
+      - 'scripts/client-ui*-smoke.mjs'
+      - 'packages/client-ui/**'
+      - 'pnpm-lock.yaml'
       - 'scripts/native-ci-cache-key*.py'
       - '.github/workflows/native-client.yml'
 
@@ -119,6 +127,29 @@ jobs:
       - if: matrix.suite == 'test'
         run: cargo build --workspace --profile test --locked
       - if: matrix.suite == 'test'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - name: Exercise the real hub through the local upstream simulator
+        if: matrix.suite == 'test'
+        run: node ../../scripts/native-simulator-smoke.mjs
+      - if: matrix.suite == 'test'
         run: bash ../../scripts/native-generate-types.sh --check
       - if: matrix.suite == 'test'
         run: python3 scripts/smoke.py target/debug/wx
+      - if: matrix.suite == 'test'
+        uses: pnpm/action-setup@v4
+      - name: Install browser-client test dependencies
+        if: matrix.suite == 'test'
+        working-directory: .
+        run: pnpm install --frozen-lockfile --filter @agent-wechat/client-ui...
+      - name: Check browser-client state models
+        if: matrix.suite == 'test'
+        working-directory: .
+        run: |
+          pnpm --filter @agent-wechat/shared build
+          pnpm --filter @agent-wechat/client-ui test
+      - name: Exercise the connected session and UI launcher with synthetic accounts
+        if: matrix.suite == 'test'
+        working-directory: .
+        run: pnpm client:smoke
