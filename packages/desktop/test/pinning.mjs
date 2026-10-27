@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { reloadPage } from "./webdriver-navigation.mjs";
+import { composerAcceptance } from "./composer.mjs";
 
 export async function pinningAcceptance({
   script,
@@ -60,6 +61,9 @@ export async function pinningAcceptance({
     puts = [],
     histories = [],
     reads = [];
+  const sentTexts = [];
+  const textIntents = new Map();
+  let queueNextText = false, textCancellations = 0;
   let mode = "confirm",
     cursor = 0,
     connection;
@@ -110,6 +114,7 @@ export async function pinningAcceptance({
       );
     if (path.endsWith("/capabilities"))
       return json({
+        quotedTextSend: true,
         threadPinningTargets: ["direct", "group"],
         threadNotificationTargets: ["direct", "group"],
         threadPinningScope: "admin",
@@ -126,6 +131,31 @@ export async function pinningAcceptance({
       return;
     }
     if (path.endsWith("/events")) return json(page([]));
+    if (path === `/v1/accounts/${account}/sends` && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const input = JSON.parse(body);
+      sentTexts.push(input);
+      if (queueNextText) {
+        const intent = {
+          id: `text-${sentTexts.length}`, accountId: account,
+          destination: input.threadId, state: "queued", clientId: "123",
+          serverId: null, errorCode: null, createdAt: "10",
+        };
+        textIntents.set(intent.id, intent);
+        return json(intent);
+      }
+      return json({ error: { code: "invalid_request", message: "Synthetic send rejected" } }, 400);
+    }
+    const textSend = path.match(/\/sends\/(text-\d+)(\/cancel)?$/);
+    if (textSend) {
+      const intent = textIntents.get(textSend[1]);
+      if (textSend[2] && req.method === "POST") {
+        textCancellations++;
+        intent.state = "cancelled";
+      }
+      return json(intent);
+    }
     if (path.endsWith(`/avatars/${ownUsername}`)) {
       ownAvatarReads++;
       res.setHeader("Content-Type", "image/png");
@@ -150,6 +180,7 @@ export async function pinningAcceptance({
             id === "open"
               ? Array.from({ length: 60 }, (_, i) => ({
                   id: `open-${i + 1}`,
+                  serverId: String(1000 + i),
                   accountId: account,
                   threadId: id,
                   senderId: "open",
@@ -438,6 +469,13 @@ export async function pinningAcceptance({
       await until(
         "return document.querySelector('[role=tooltip]')?.textContent",
         (text) => text?.includes("9 unread") && text.includes("Saved message"),
+      );
+      assert.equal(
+        await script(
+          `return ${row("unopened")}.querySelector('.chat-row').querySelectorAll('[title]').length`,
+        ),
+        0,
+        "the row uses its hover card without a duplicate browser tooltip",
       );
       if (capture) await capture("hover");
       assert.deepEqual(histories, beforeHistories);
@@ -739,6 +777,13 @@ export async function pinningAcceptance({
     await menu();
     assert.equal(await script(`return ${pinItem()}.disabled`), true);
     await key("\uE00C");
+    await click(row("open") + ".querySelector('.chat-row')");
+    await until("return Boolean(document.querySelector('article[data-message-id=\"open-60\"]'))", Boolean);
+    await composerAcceptance({
+      script, until, sentTexts,
+      queueNextSend: () => { queueNextText = true; },
+      cancelledSends: () => textCancellations,
+    });
     console.log(
       "Pinning interface: unread badges, hover actions/info, direct pin/mute, shared details, keyboard/context/touch access, optimistic pins, server order, unknown state, pending projection, rejection, reload recovery, phone updates, stable focus/drafts/history/unreads/scroll passed",
     );
