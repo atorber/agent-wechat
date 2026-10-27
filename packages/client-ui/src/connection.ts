@@ -12,6 +12,7 @@ import { AvatarCache } from "./avatar-cache.ts";
 import { MediaInbox } from "./media-inbox.ts";
 import { MessageRecall } from "./message-recall.ts";
 import { GroupMutations, validGroupReceipt } from "./group-creation.ts";
+import { ThreadPinning, ThreadMuting } from "./thread-pinning.ts";
 import { validQuoteReference } from "./reply.ts";
 export type Connection = {
   desktopId?: string;
@@ -29,6 +30,8 @@ export type Connection = {
   logout: (account: string) => Promise<NativeOperation>;
   clearLogout: (account: string) => void;
   groupCreation: (account: string, target?: string) => GroupMutations;
+  threadPinning: (account: string, target: string) => ThreadPinning;
+  threadMuting: (account: string, target: string) => ThreadMuting;
 };
 export async function connect(
   endpoint: string,
@@ -47,7 +50,7 @@ export async function connect(
       return transport(input, init);
     },
   });
-  const status = initialStatus ?? await client.status();
+  const status = initialStatus ?? (await client.status());
   if (simulator && status.version.backend !== "simulator")
     throw new Error("Expected a simulator");
   let preferences: Storage | undefined;
@@ -181,6 +184,8 @@ export async function connect(
     (account, messageId) => incomingMedia.invalidateMessage(account, messageId),
   );
   const groups = new Map<string, GroupMutations>();
+  const pins = new Map<string, ThreadPinning>();
+  const mutes = new Map<string, ThreadMuting>();
   const stopSignOut = session.onSignedOut((account) => {
     incomingMedia.clear(account);
     avatars.clear(account);
@@ -190,6 +195,16 @@ export async function connect(
       if ((JSON.parse(key) as string[])[0] === account) {
         recall.close();
         recalls.delete(key);
+      }
+    for (const [key, pin] of pins)
+      if ((JSON.parse(key) as string[])[0] === account) {
+        pin.close();
+        pins.delete(key);
+      }
+    for (const [key, mute] of mutes)
+      if ((JSON.parse(key) as string[])[0] === account) {
+        mute.close();
+        mutes.delete(key);
       }
     for (const [key, group] of groups)
       if ((JSON.parse(key) as string[])[0] === account) {
@@ -211,6 +226,35 @@ export async function connect(
       /* Memory fallback remains available. */
     }
   };
+  function groupCreation(account: string, target = "create"): GroupMutations {
+    const context = JSON.stringify([account, target]);
+    let creation = groups.get(context);
+    if (!creation) {
+      const key = `agentwechat-group-v2:${status.serverId}:${context}`;
+      creation = new GroupMutations(client, account, {
+        read() {
+          try {
+            const saved: unknown = JSON.parse(
+              storage(account).getItem(key) ?? "null",
+            );
+            return validGroupReceipt(saved, target) ? saved : null;
+          } catch {
+            return null;
+          }
+        },
+        write(value) {
+          try {
+            if (value) storage(account).setItem(key, JSON.stringify(value));
+            else storage(account).removeItem(key);
+          } catch {
+            /* Optional metadata-only recovery. */
+          }
+        },
+      });
+      groups.set(context, creation);
+    }
+    return creation;
+  }
   return {
     session,
     cache: persistent,
@@ -235,6 +279,8 @@ export async function connect(
       stopMediaInvalidation();
       incomingMedia.close();
       for (const recall of recalls.values()) recall.close();
+      for (const pin of pins.values()) pin.close();
+      for (const mute of mutes.values()) mute.close();
       for (const group of groups.values()) group.close();
     },
     avatars,
@@ -273,34 +319,34 @@ export async function connect(
       }
       return recall;
     },
-    groupCreation(account, target = "create") {
-      const context = JSON.stringify([account, target]);
-      let creation = groups.get(context);
-      if (!creation) {
-        const key = `agentwechat-group-v2:${status.serverId}:${context}`;
-        creation = new GroupMutations(client, account, {
-          read() {
-            try {
-              const saved: unknown = JSON.parse(
-                storage(account).getItem(key) ?? "null",
-              );
-              return validGroupReceipt(saved, target) ? saved : null;
-            } catch {
-              return null;
-            }
-          },
-          write(value) {
-            try {
-              if (value) storage(account).setItem(key, JSON.stringify(value));
-              else storage(account).removeItem(key);
-            } catch {
-              /* Optional metadata-only recovery. */
-            }
-          },
-        });
-        groups.set(context, creation);
+    groupCreation,
+    threadPinning(account, target) {
+      const key = JSON.stringify([account, target]);
+      let pin = pins.get(key);
+      if (!pin) {
+        pin = new ThreadPinning(
+          session,
+          groupCreation(account, target),
+          account,
+          target,
+        );
+        pins.set(key, pin);
       }
-      return creation;
+      return pin;
+    },
+    threadMuting(account, target) {
+      const key = JSON.stringify([account, target]);
+      let mute = mutes.get(key);
+      if (!mute) {
+        mute = new ThreadMuting(
+          session,
+          groupCreation(account, target),
+          account,
+          target,
+        );
+        mutes.set(key, mute);
+      }
+      return mute;
     },
     clearLogout(account) {
       saveLogout(account, null);

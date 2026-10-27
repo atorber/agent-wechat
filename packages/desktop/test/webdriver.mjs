@@ -5,6 +5,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import https from "node:https";
 import { notificationsAcceptance } from "./notifications.mjs";
+import { pinningAcceptance } from "./pinning.mjs";
 import { interfaceAcceptance } from "./interface.mjs";
 const application = process.env.DESKTOP_BINARY;
 if (!application) throw new Error("DESKTOP_BINARY is required");
@@ -144,6 +145,12 @@ try {
   await until("return document.body.innerText", (value) =>
     value.includes("App updates")
   );
+  const soundToggle = `document.querySelector('input[aria-label="Notification sound"]')`;
+  for (const enabled of [false, true]) {
+    await script(`${soundToggle}.click(); return true`);
+    await until(`return ${soundToggle}.disabled`, value => !value);
+    assert.equal((await invokeNative("desktop_settings")).notificationSoundEnabled, enabled);
+  }
   const updates = await invokeNative("updates_status");
   assert.equal(updates.automatic, true);
   assert.equal(updates.prereleases, updates.currentVersion.includes("-"));
@@ -267,6 +274,10 @@ try {
   await invokeNative("updates_preferences", {
     preferences: { automatic: true, prereleases: true },
   });
+  if (process.platform === "linux") {
+    assert.equal((await invokeNative("desktop_settings")).notificationSoundEnabled, false);
+    await invokeNative("notifications_sound_enabled", { enabled: true });
+  }
   console.log(
     "Native update settings and release channel persist across restart"
   );
@@ -282,6 +293,15 @@ try {
             process.env.DESKTOP_INTERFACE_SCREENSHOT,
             Buffer.from(await call(`/session/${session}/screenshot`), "base64"),
           )
+      : undefined,
+  });
+  await pinningAcceptance({
+    script, invoke: invokeNative, until,
+    resize: (width, height) => call(`/session/${session}/window/rect`, { width, height }),
+    key: (value) => call(`/session/${session}/actions`, { actions: [{ type: "key", id: "keyboard", actions: [{ type: "keyDown", value }, { type: "keyUp", value }] }] }),
+    hover: (x, y) => call(`/session/${session}/actions`, { actions: [{ type: "pointer", id: "mouse", parameters: { pointerType: "mouse" }, actions: [{ type: "pointerMove", origin: "viewport", x, y }] }] }),
+    capture: process.env.DESKTOP_PINNING_SCREENSHOT
+      ? async (name) => writeFile(name ? process.env.DESKTOP_PINNING_SCREENSHOT.replace(/\.png$/, `-${name}.png`) : process.env.DESKTOP_PINNING_SCREENSHOT, Buffer.from(await call(`/session/${session}/screenshot`), "base64"))
       : undefined,
   });
   try {
