@@ -15,6 +15,7 @@ on:
       - 'packages/shared/src/native*'
       - 'scripts/native-generate-types.sh'
       - 'scripts/native-simulator-smoke.mjs'
+      - 'scripts/native-ci-smoke-trace*.mjs'
       - 'scripts/client-ui*-smoke.mjs'
       - 'packages/client-ui/**'
       - '.node-version'

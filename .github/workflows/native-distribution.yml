@@ -262,7 +262,7 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     uses: ./.github/workflows/native-portable.yml
     with:
-      windows_simulator: ${{ github.event_name != 'pull_request' }}
+      windows_simulator: true
       main_checks_only: ${{ github.event_name == 'push' }}
 
   desktop:

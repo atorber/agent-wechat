@@ -1,13 +1,14 @@
 // Real hub processes and the existing SDK; all account/profile/upstream state is synthetic.
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { NativeWeChatClient } from "../packages/shared/src/native-client.ts";
 import { assertSameUnavailableMedia } from "./native-ci-media-assertions.mjs";
+import { SmokeTrace } from "./native-ci-smoke-trace.mjs";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const binary = process.env.WX_DEV_BINARY ?? join(repository, "packages/native-client-rust/target/debug", process.platform === "win32" ? "wx-dev.exe" : "wx-dev");
@@ -17,6 +18,7 @@ const temporary = await mkdtemp(join(tmpdir(), "agent-wechat-simulator-"));
 const data = join(temporary, "synthetic hub state");
 const processes = new Set();
 const subscriptions = [];
+const trace = new SmokeTrace();
 let remote;
 let hub;
 let a;
@@ -24,6 +26,7 @@ let b;
 let controlToken;
 
 async function waitFor(label, condition, timeout = 20000) {
+  trace.observe("waiting", { label, timeout });
   const deadline = Date.now() + timeout;
   let lastError;
   while (Date.now() < deadline) {
@@ -36,6 +39,7 @@ async function waitFor(label, condition, timeout = 20000) {
 async function start(command, args = [], directory = data) {
   const child = spawn(binary, [command, ...(directory ? ["--data-dir", directory] : []), ...args], { stdio: ["ignore", "pipe", "pipe"] });
   processes.add(child);
+  trace.process(command, child);
   child.once("exit", () => processes.delete(child));
   let diagnostics = "";
   child.stderr.on("data", chunk => { diagnostics = (diagnostics + chunk).slice(-4000); });
@@ -70,6 +74,7 @@ async function remoteState() {
 }
 async function attach() {
   const token = (await readFile(hub.ready.tokenFile, "utf8")).trim();
+  trace.secret(token);
   a = new NativeWeChatClient({ baseUrl: hub.ready.endpoint, token });
   b = new NativeWeChatClient({ baseUrl: hub.ready.endpoint, token });
   const status = await a.status();
@@ -90,20 +95,36 @@ async function cli(...args) {
 async function login(account, scanned = false) {
   await a.createAccount(account);
   const operation = await a.login(account, { strategy: "qr", qrRefresh: { mode: "manual", maxRefreshes: 0 } }, `login-${account}`);
-  await waitFor(`${account} QR ready`, async () => (await a.operation(account, operation.id)).state === "awaiting_scan");
+  const status = async () => {
+    const current = await a.operation(account, operation.id);
+    trace.observe(`login:${account}`, {
+      id: current.id, state: current.state,
+      result: Object.fromEntries(["code", "reason", "retryable", "connection", "pollFailures", "method", "qrGeneration"]
+        .filter((key) => current.result?.[key] !== undefined).map((key) => [key, current.result[key]])),
+    });
+    return current;
+  };
+  await waitFor(`${account} QR ready`, async () => (await status()).state === "awaiting_scan");
   const png = await a.qr(account, operation.id);
   assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
   if (scanned) {
     await control({ op: "login", account, status: "scanned" });
-    await waitFor(`${account} awaiting approval`, async () => (await a.operation(account, operation.id)).state === "awaiting_approval");
+    await waitFor(`${account} awaiting approval`, async () => (await status()).state === "awaiting_approval");
   }
   await control({ op: "login", account, status: "approved" });
   await waitFor(`${account} signed in`, async () => {
-    const current = await a.operation(account, operation.id);
+    const current = await status();
     if (["failed", "expired", "rejected"].includes(current.state)) throw new Error(JSON.stringify(current));
     return current.state === "succeeded";
   });
-  await waitFor(`${account} push connected`, async () => (await a.account(account)).incomingTransport === "simulator_push");
+  await waitFor(`${account} push connected`, async () => {
+    const current = await a.account(account);
+    trace.observe(`account:${account}`, {
+      authenticated: current.authenticated, connection: current.connection,
+      incomingTransport: current.incomingTransport,
+    });
+    return current.incomingTransport === "simulator_push";
+  });
   await waitFor(`${account} baseline`, async () => (await a.messages(account, "sim_mei")).items.length === 1);
   assert.ok((await a.contacts(account)).items.some(contact => contact.id === "sim_mei"));
 }
@@ -185,6 +206,7 @@ async function pinJourney(streams) {
 try {
   remote = await start("upstream");
   controlToken = (await readFile(remote.ready.controlTokenFile, "utf8")).trim();
+  trace.secret(controlToken);
   assert.equal((await fetch(`http://${remote.ready.upstream}/state`)).status, 401);
   hub = await start("hub", ["--upstream", remote.ready.upstream]);
   await runCli(["config", "server", "add", "synthetic", "--url", hub.ready.endpoint, "--token-file", hub.ready.tokenFile]);
@@ -355,6 +377,19 @@ try {
   await assert.rejects(stat(launcher.ready.dataDir), error => error.code === "ENOENT");
   await assert.rejects(fetch(launcherRemote));
   console.log(JSON.stringify({ ok: true, checks: ["real QR login and profile projection", "two SDK event consumers", "actual wx CLI status and message fetch", "direct/group CLI and API pin/unpin with independent remote refresh", "pin/mute independence and keyed replay", "queued/accepted/uncertain sends", "local_send without default echo", "fault-injected echo deduplication", "synthetic phone self-send and File Transfer", "incoming/live and catchup origins", "inbound push", "SSE resume", "restart and catch-up", "account isolation", "revocation/logout", "virtual clock expiry", "advertised media stays unavailable", "unhandled status controls do not block live messages", "unknown sync retention", "launcher startup/shutdown and cleanup"] }));
+} catch (error) {
+  const report = trace.report(error);
+  console.error(report);
+  if (process.env.WX_SMOKE_DIAGNOSTICS) {
+    try {
+      const path = resolve(process.env.WX_SMOKE_DIAGNOSTICS);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, report + "\n");
+    } catch {
+      console.error("Could not save synthetic smoke diagnostics; see the report above.");
+    }
+  }
+  throw new Error("Synthetic native smoke failed; see the redacted diagnostics above.");
 } finally {
   for (const subscription of subscriptions) subscription.controller.abort();
   await Promise.allSettled(subscriptions.map(subscription => subscription.done));

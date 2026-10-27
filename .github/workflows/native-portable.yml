@@ -91,6 +91,8 @@ jobs:
     env:
       # Include the actual Windows flags in cache identity, not just build steps.
       RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+      # Catch Windows simulator regressions before merge; defer ARM64 to main.
+      WINDOWS_SIMULATOR: ${{ inputs.simulator_checks && inputs.windows_simulator && (github.event_name != 'pull_request' || matrix.target == 'x86_64-pc-windows-msvc') }}
     defaults:
       run:
         shell: bash
@@ -122,7 +124,7 @@ jobs:
           # No fallback keys: all native inputs and the build driver must match.
           key: native-executable-v2-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.WindowsSDKVersion }}-${{ env.RUSTFLAGS }}-${{ hashFiles('packages/native-client-rust/**', '!packages/native-client-rust/**/target/**', 'rust-toolchain.toml', '.cargo/config*', '.gitattributes', 'scripts/native-ci-build.py', 'scripts/native-ci-msvc.ps1', '.github/workflows/native-portable.yml') }}
       - uses: Swatinem/rust-cache@v2
-        if: runner.os != 'Windows' || steps.native-executable.outputs.cache-hit != 'true' || (inputs.simulator_checks && inputs.windows_simulator)
+        if: runner.os != 'Windows' || steps.native-executable.outputs.cache-hit != 'true' || env.WINDOWS_SIMULATOR == 'true'
         with:
           workspaces: packages/native-client-rust -> target
           # A cached CLI needs dependencies only when simulator checks also run.
@@ -130,7 +132,7 @@ jobs:
           # Pin cache identity to our compiler, target, flags and MSVC version.
           add-rust-environment-hash-key: false
           # Simulator/test dependencies are needed even when wx.exe is cached.
-          key: portable-v2-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.WindowsSDKVersion }}-${{ env.RUSTFLAGS }}-opt${{ env.CARGO_PROFILE_DEV_OPT_LEVEL }}-debug${{ env.CARGO_PROFILE_DEV_DEBUG }}-${{ env.CARGO_PROFILE_TEST_DEBUG }}-sim${{ (runner.os != 'Windows' || inputs.windows_simulator) }}-${{ steps.cache-key.outputs.rust }}
+          key: portable-v2-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.WindowsSDKVersion }}-${{ env.RUSTFLAGS }}-opt${{ env.CARGO_PROFILE_DEV_OPT_LEVEL }}-debug${{ env.CARGO_PROFILE_DEV_DEBUG }}-${{ env.CARGO_PROFILE_TEST_DEBUG }}-sim${{ (runner.os != 'Windows' || env.WINDOWS_SIMULATOR == 'true') }}-${{ steps.cache-key.outputs.rust }}
           cache-on-failure: true
       - name: Start Unix release compiler
         if: runner.os != 'Windows'
@@ -194,7 +196,7 @@ jobs:
           cargo test --locked --manifest-path packages/native-client-rust/Cargo.toml -p wechat-profile --test initialize --test projection --target ${{ matrix.target }}
           cargo build --profile test --locked --manifest-path packages/native-client-rust/Cargo.toml -p wechat-simulator --bin wx-dev --target ${{ matrix.target }}
       - name: Build the Windows local upstream development runtime
-        if: inputs.simulator_checks && inputs.windows_simulator && runner.os == 'Windows'
+        if: env.WINDOWS_SIMULATOR == 'true' && runner.os == 'Windows'
         shell: pwsh
         run: |
           cargo test --locked --manifest-path packages/native-client-rust/Cargo.toml -p wechat-protocol -p wechat-profile --lib --target ${{ matrix.target }}
@@ -203,11 +205,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --profile test --locked --manifest-path packages/native-client-rust/Cargo.toml -p wechat-simulator --bin wx-dev --target ${{ matrix.target }}
       - name: Verify the simulator and real hub on this native platform
-        if: inputs.simulator_checks && (runner.os != 'Windows' || inputs.windows_simulator)
+        if: inputs.simulator_checks && (runner.os != 'Windows' || env.WINDOWS_SIMULATOR == 'true')
         env:
           WX_DEV_BINARY: packages/native-client-rust/target/${{ matrix.target }}/debug/${{ runner.os == 'Windows' && 'wx-dev.exe' || 'wx-dev' }}
           WX_BINARY: packages/native-client-rust/target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'wx.exe' || 'wx' }}
+          WX_SMOKE_DIAGNOSTICS: artifacts/smoke-diagnostics-${{ matrix.target }}.json
         run: node scripts/native-simulator-smoke.mjs
+      - name: Retain synthetic simulator failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulator-diagnostics-${{ matrix.target }}
+          path: artifacts/smoke-diagnostics-${{ matrix.target }}.json
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.artifact_prefix || 'native-validation' }}-${{ matrix.target }}
