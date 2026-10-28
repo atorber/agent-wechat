@@ -1,5 +1,7 @@
 # agent-wechat
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A standalone native WeChat daemon, CLI and OpenClaw channel.
 
 The native `wx` executable speaks the protocol directly and uses official-format local profiles. It needs no official WeChat executable or desktop at runtime. See the supported profile scope and remaining limits in [implemented capabilities and validation](packages/native-client-rust/README.md).
