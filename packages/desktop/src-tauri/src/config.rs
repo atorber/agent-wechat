@@ -17,6 +17,12 @@ pub struct Connection {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NotificationAccount {
+    pub server_id: String,
+    pub account_id: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub schema_version: u32,
     pub installation_id: String,
@@ -27,6 +33,8 @@ pub struct Config {
     pub network_enabled: bool,
     #[serde(default = "enabled")]
     pub notifications_enabled: bool,
+    #[serde(default)]
+    pub notification_disabled_accounts: Vec<NotificationAccount>,
     #[serde(default = "enabled")]
     pub notification_sound_enabled: bool,
     #[serde(default = "enabled")]
@@ -48,6 +56,7 @@ impl Default for Config {
             network_port: 6175,
             network_enabled: false,
             notifications_enabled: true,
+            notification_disabled_accounts: Vec::new(),
             notification_sound_enabled: true,
             automatic_updates: true,
             update_prereleases: None,
@@ -55,6 +64,32 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn account_notifications_enabled(&self, server: &str, account: &str) -> bool {
+        !self
+            .notification_disabled_accounts
+            .iter()
+            .any(|item| item.server_id == server && item.account_id == account)
+    }
+    pub fn notifications_for(&self, server: &str, account: &str) -> bool {
+        self.notifications_enabled && self.account_notifications_enabled(server, account)
+    }
+    pub fn set_account_notifications(
+        &mut self,
+        server: &str,
+        account: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        self.notification_disabled_accounts
+            .retain(|item| item.server_id != server || item.account_id != account);
+        if !enabled {
+            self.notification_disabled_accounts
+                .push(NotificationAccount {
+                    server_id: server.into(),
+                    account_id: account.into(),
+                });
+        }
+        self.validate()
+    }
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -78,6 +113,25 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        let mut accounts = std::collections::HashSet::new();
+        if self.notification_disabled_accounts.len() > 1024 {
+            bail!("Too many account notification preferences");
+        }
+        for item in &self.notification_disabled_accounts {
+            if item.server_id.is_empty()
+                || item.server_id.len() > 256
+                || item.server_id.chars().any(char::is_control)
+                || item.account_id.is_empty()
+                || item.account_id.len() > 128
+                || !item
+                    .account_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+                || !accounts.insert((&item.server_id, &item.account_id))
+            {
+                bail!("Invalid account notification preference");
+            }
+        }
         uuid::Uuid::parse_str(&self.installation_id).context("Invalid installation identity")?;
         if self.local_port < 1024
             || self.network_port < 1024
@@ -217,5 +271,35 @@ mod tests {
         config.notification_sound_enabled = false;
         config.save(&path).unwrap();
         assert!(!Config::load(&path).unwrap().notification_sound_enabled);
+    }
+    #[test]
+    fn account_notification_overrides_are_local_scoped_and_survive_reload() {
+        let mut legacy = serde_json::to_value(Config::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("notificationDisabledAccounts");
+        let mut config: Config = serde_json::from_value(legacy).unwrap();
+        assert!(config.notifications_for("hub-a", "account-a"));
+        config
+            .set_account_notifications("hub-a", "account-a", false)
+            .unwrap();
+        assert!(!config.notifications_for("hub-a", "account-a"));
+        assert!(config.notifications_for("hub-a", "account-b"));
+        assert!(config.notifications_for("hub-b", "account-a"));
+        let directory = wechat_platform::private_tempdir("desktop-notifications-").unwrap();
+        let path = directory.path().join("desktop.json");
+        config.save(&path).unwrap();
+        let mut config = Config::load(&path).unwrap();
+        assert!(!config.notifications_for("hub-a", "account-a"));
+        config.notifications_enabled = false;
+        config
+            .set_account_notifications("hub-a", "account-a", true)
+            .unwrap();
+        assert!(config.account_notifications_enabled("hub-a", "account-a"));
+        assert!(!config.notifications_for("hub-a", "account-a"));
+        config.notifications_enabled = true;
+        assert!(config.notifications_for("hub-a", "account-a"));
+        assert!(config.notification_disabled_accounts.is_empty());
     }
 }

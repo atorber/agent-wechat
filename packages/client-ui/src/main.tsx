@@ -26,6 +26,8 @@ import {
   connect,
   control,
   simulatorClock,
+  previewHubs,
+  type PreviewHub,
   type Connection,
 } from "./connection.ts";
 import {
@@ -203,6 +205,12 @@ function ConnectionForm({
   const [error, setError] = useState(initialError),
     [busy, setBusy] = useState(false),
     [show, setShow] = useState(false);
+  const [hubs, setHubs] = useState<PreviewHub[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void previewHubs().then(value => { if (!cancelled) setHubs(value); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy) return;
@@ -238,6 +246,16 @@ function ConnectionForm({
         <h1>Connect to an agent-wechat hub</h1>
         <p>Enter the address and access key for your agent-wechat hub.</p>
       </div>
+      {hubs.length > 1 && <div className="preview-hubs" aria-label="Preview hubs">
+        {hubs.map(hub => <button key={hub.id} type="button" className="secondary" disabled={busy}
+          onClick={() => {
+            setBusy(true); setError("");
+            void bootstrap(undefined, hub.id).then(value => {
+              if (!value) throw Error("Reopen the private preview link to choose a hub.");
+              onConnect(value);
+            }).catch(e => setError(readableError(e))).finally(() => setBusy(false));
+          }}>{hub.name}</button>)}
+      </div>}
       <form onSubmit={submit}>
         <div className="remote-fields">
           <label htmlFor="hub-address">agent-wechat hub address</label>

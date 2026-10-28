@@ -127,6 +127,24 @@ The launcher accepts `CLIENT_UI_PORT` and HTTPS `CLIENT_UI_ORIGIN`. Keep the pri
 fragment link private. Closing the launcher leaves the external daemon running.
 `node scripts/client-ui-connect-smoke.mjs` checks the proxy with a local HTTP fixture.
 
+For several hubs, use `--connections-file /absolute/private/connections.json`
+instead of `--server` and `--token-file`. Keep this JSON file owner-only:
+
+```json
+[
+  { "id": "local", "name": "Local hub", "server": "http://127.0.0.1:6174", "tokenFile": "/private/local-key" },
+  { "id": "test", "name": "Test hub", "server": "http://127.0.0.1:6176", "tokenFile": "/private/test-key" }
+]
+```
+
+An optional `endpoint` gives the hub's public origin for display and browser
+storage; requests still use its configured internal `server`. The connection
+screen offers each named hub, and remembers the last successful choice. A hub
+being offline does not prevent opening another. Each hub has a separate proxy
+route and daemon key; the private preview key grants access to all configured
+hubs. Browser requests stay on the preview origin. No CORS changes are needed on
+the hubs. Keep this local connection file and all keys outside the repository.
+
 **Manage accounts** opens the chooser, where each profile has a settings button.
 Signed-out profiles can sign in or be removed. Removal requires typing the profile's
 current name and sends its canonical ID as confirmation. The backend rejects active

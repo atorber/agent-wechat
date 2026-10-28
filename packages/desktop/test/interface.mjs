@@ -342,6 +342,24 @@ export async function interfaceAcceptance({
     await script(
       "document.querySelector('button[aria-label=\"Settings\"]').click(); return true",
     );
+    const accountToggle = "document.querySelector('.account-settings .setting input[type=checkbox]')";
+    await until(`return ${accountToggle} && !${accountToggle}.disabled`, Boolean);
+    assert.equal(await script(`return ${accountToggle}.checked`), true);
+    const accountScope = { connectionId: connection.id, serverId: "interface-fixture", accountId: "fixture" };
+    for (const enabled of [false, true]) {
+      await script(`${accountToggle}.click(); return true`);
+      await until(`return ${accountToggle}.disabled`, value => !value);
+      assert.equal((await invoke("notifications_account_settings", accountScope)).enabled, enabled);
+    }
+    const masterToggle = "document.querySelector('.desktop-preferences input[aria-label=\"Message notifications\"]')";
+    await script(`${masterToggle}.click(); return true`);
+    await until("return document.querySelector('.account-settings').innerText.includes('Desktop notifications are turned off.')", Boolean);
+    assert.equal(await script(`return ${accountToggle}.checked`), true, "the master switch must preserve account preferences");
+    await until(`return ${masterToggle}.disabled`, value => !value);
+    await script(`${masterToggle}.click(); return true`);
+    await until("return document.querySelector('.account-settings').innerText.includes('Desktop notifications are turned off.')", value => !value);
+    assert.equal(await script("return [...document.querySelectorAll('.desktop-preferences button')].some(button => button.textContent.trim() === 'Preview')"), false);
+    assert.equal(await script("return getComputedStyle(document.querySelector('.desktop-update-settings')).borderBottomWidth"), "0px");
     await click("Switch hub");
     await until("return document.body.innerText", (text) =>
       text.includes("Welcome to AgentWechat"),

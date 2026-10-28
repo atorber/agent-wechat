@@ -212,6 +212,16 @@ export async function notificationsAcceptance(invoke) {
       "unready contact sync must remain silent",
     );
     contactReady = true;
+    const scope = { connectionId: connection.id, serverId, accountId: account };
+    assert.deepEqual(await invoke("notifications_account_settings", scope), { enabled: true, desktopEnabled: true });
+    assert.deepEqual(await invoke("notifications_account_settings", { ...scope, enabled: false }), { enabled: false, desktopEnabled: true });
+    assert.equal((await invoke("notifications_account_settings", { ...scope, accountId: "other-account" })).enabled, true);
+    await assert.rejects(invoke("notifications_account_settings", { ...scope, serverId: "other-hub", enabled: true }), /connection changed/);
+    send("account-disabled");
+    await wait(() => fetched.has("account-disabled"));
+    await pause(250);
+    assert.equal((await entries()).length, 0, "account override must suppress unmuted chat notifications");
+    assert.equal((await invoke("notifications_account_settings", { ...scope, enabled: true })).enabled, true);
     window("close");
     await wait(() => !window().visible);
     const reopened = spawn(process.env.DESKTOP_BINARY, [], { stdio: "ignore" });
@@ -335,17 +345,13 @@ export async function notificationsAcceptance(invoke) {
     const silent = await wait(async () => (await entries())[4]);
     assert.equal(silent.suppressSound, true);
     assert.equal(silent.soundFile, null);
-    await invoke("notifications_preview_sound");
-    const preview = await wait(async () => (await entries())[5]);
-    assert.equal(preview.body, "Notification sound preview");
-    assert.equal(preview.soundFile, first.soundFile);
     await invoke("notifications_sound_enabled", { enabled: true });
     await pause(3100);
     send("sound-on");
-    const withSound = await wait(async () => (await entries())[6]);
+    const withSound = await wait(async () => (await entries())[5]);
     assert.equal(withSound.soundFile, first.soundFile);
     send("burst");
-    const burst = await wait(async () => (await entries())[7]);
+    const burst = await wait(async () => (await entries())[6]);
     assert.equal(burst.suppressSound, true);
     assert.equal(burst.soundFile, null);
     const groupSend = (id, senderId, message = {}) => send(id, {
@@ -353,48 +359,48 @@ export async function notificationsAcceptance(invoke) {
       event: { threadId: group },
     });
     groupSend("group-text", "alice");
-    const groupText = await wait(async () => (await entries())[8]);
+    const groupText = await wait(async () => (await entries())[7]);
     assert.equal(groupText.title, "Alice");
     assert.equal(groupText.body, "Fixture group\nFixture message");
     assert.equal(memberRequests.length, 0, "the thread's sender name needs no extra lookup");
     groupSend("group-photo", "alice", { type: 3, body: "" });
-    const groupPhoto = await wait(async () => (await entries())[9]);
+    const groupPhoto = await wait(async () => (await entries())[8]);
     assert.equal(groupPhoto.title, "Alice");
     assert.equal(groupPhoto.body, "Fixture group\nPhoto");
     groupSend("group-quote", "bob", {
       type: 49, appMessageType: 57, body: "Yes, that works",
       quote: { type: 1, embeddedText: "Original quoted message" },
     });
-    const groupQuote = await wait(async () => (await entries())[10]);
+    const groupQuote = await wait(async () => (await entries())[9]);
     assert.equal(groupQuote.title, "Bob <B>");
     assert.equal(groupQuote.body, "Fixture group\nYes, that works");
     assert.deepEqual(memberRequests, ["bob"], "only a cached exact-member lookup is needed");
     groupSend("group-unknown", null);
-    const groupUnknown = await wait(async () => (await entries())[11]);
+    const groupUnknown = await wait(async () => (await entries())[10]);
     assert.equal(groupUnknown.title, "Member");
     assert.equal(groupUnknown.body, "Fixture group\nFixture message");
     assert.deepEqual(memberRequests, ["bob"], "a missing sender ID cannot trigger a lookup");
     groupSend("group-unavailable", "missing");
-    const groupUnavailable = await wait(async () => (await entries())[12]);
+    const groupUnavailable = await wait(async () => (await entries())[11]);
     assert.equal(groupUnavailable.title, "Member");
     assert.equal(groupUnavailable.body, "Fixture group\nFixture message");
     groupSend("group-mismatch", "mismatch");
-    const groupMismatch = await wait(async () => (await entries())[13]);
+    const groupMismatch = await wait(async () => (await entries())[12]);
     assert.equal(groupMismatch.title, "Member");
     assert.equal(groupMismatch.body, "Fixture group\nFixture message");
     groupSend("group-slow", "slow");
-    const groupSlow = await wait(async () => (await entries())[14]);
+    const groupSlow = await wait(async () => (await entries())[13]);
     assert.equal(groupSlow.title, "Member");
     assert.equal(groupSlow.body, "Fixture group\nFixture message", "a stalled name lookup must not block delivery");
     muted = true;
     groupSend("group-muted", "muted-member");
     await wait(() => fetched.has("group-muted"));
     await pause(250);
-    assert.equal((await entries()).length, 15);
+    assert.equal((await entries()).length, 14);
     assert.ok(!memberRequests.includes("muted-member"), "muted groups do not resolve senders");
     await invoke("notifications_sound_enabled", { enabled: false });
     console.log(
-      "Native notifications: group sender previews and cached-member fallback, hidden delivery, click restore, mute/history/outgoing suppression, deduplication, Soft pair sound, silent banners, preview and burst limiting passed",
+      "Native notifications: group sender previews and cached-member fallback, hidden delivery, click restore, mute/history/outgoing suppression, deduplication, Soft pair sound, silent banners, per-account controls and burst limiting passed",
     );
   } finally {
     await invoke("desktop_select", { id: "local" }).catch(() => {});

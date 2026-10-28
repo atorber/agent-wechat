@@ -15,6 +15,7 @@ import { GroupMutations, validGroupReceipt } from "./group-creation.ts";
 import { ThreadPinning, ThreadMuting } from "./thread-pinning.ts";
 import { validQuoteReference } from "./reply.ts";
 import { validMentionReceipt } from "./mentions.ts";
+import { previewFetch } from "./preview-transport.ts";
 export type Connection = {
   desktopId?: string;
   session: HubSession;
@@ -455,13 +456,16 @@ export async function connect(
 }
 export async function bootstrap(
   suppliedKey?: string,
+  selectedHub?: string,
 ): Promise<Connection | null> {
   const launchKey = new URLSearchParams(location.hash.slice(1)).get("dev");
   const key = suppliedKey ?? launchKey;
   if (launchKey)
     history.replaceState(null, "", location.pathname + location.search);
   if (!import.meta.env.DEV) return null;
-  const response = await fetch("/__dev/session", {
+  let hub = selectedHub;
+  try { hub ??= localStorage.getItem("agentwechat-preview-hub") ?? undefined; } catch {}
+  const response = await fetch(`/__dev/session${hub ? `?hub=${encodeURIComponent(hub)}` : ""}`, {
     headers: key ? { Authorization: `Bearer ${key}` } : {},
     cache: "no-store",
   });
@@ -471,7 +475,21 @@ export async function bootstrap(
   )
     return null;
   const data = await response.json();
-  return connect(data.endpoint, data.token, data.simulator === true);
+  let transport: typeof fetch | undefined;
+  if (data.proxyPath !== undefined) {
+    transport = previewFetch(data.endpoint, location.origin, data.proxyPath);
+  }
+  const connection = await connect(data.endpoint, data.token, data.simulator === true, transport);
+  if (typeof data.hub === "string") try { localStorage.setItem("agentwechat-preview-hub", data.hub); } catch {}
+  return connection;
+}
+export type PreviewHub = { id: string; name: string; endpoint: string };
+export async function previewHubs(): Promise<PreviewHub[]> {
+  if (!import.meta.env.DEV) return [];
+  const response = await fetch("/__dev/connections", { cache: "no-store" });
+  if (!response.ok || !response.headers.get("content-type")?.includes("application/json")) return [];
+  const value = await response.json();
+  return Array.isArray(value) ? value.filter(item => item && typeof item.id === "string" && /^[a-z0-9-]{1,48}$/.test(item.id) && typeof item.name === "string" && typeof item.endpoint === "string") : [];
 }
 export async function control(body: Record<string, unknown>): Promise<void> {
   const response = await fetch("/__dev/control", {

@@ -525,6 +525,8 @@ body {
 .remote-fields {
   margin-top: 25px;
 }
+.preview-hubs { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.preview-hubs > button { flex: 1; min-width: 120px; }
 .remote-fields > label {
   font-size: 12px;
   font-weight: 550;
