@@ -1,6 +1,7 @@
 {
   "name": "@agent-wechat/cli",
   "version": "1.2.0",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "wx": "./scripts/native-launcher.mjs",
@@ -9,7 +10,8 @@
   "files": [
     "scripts",
     "native-release.json",
-    "THIRD_PARTY_NOTICES.txt"
+    "THIRD_PARTY_NOTICES.txt",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node build.js",

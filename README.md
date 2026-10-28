@@ -217,3 +217,10 @@ The [demo assets and gallery source](scripts/demo-gallery/README.md) include the
 finished video, screenshots, synthetic visual fixtures, and image-generation
 scripts. [Video edit sources](scripts/demo-video/README.md) preserve the motion
 titles, timing, and original instrumental; private raw recordings stay outside Git.
+
+## License
+
+Agent WeChat's original project code is licensed under the [MIT License](LICENSE).
+Third-party components retain their existing licenses and notices; see the
+[bundled notices](packages/cli/THIRD_PARTY_NOTICES.txt), component-specific notices,
+and the [Inter font license](scripts/demo-video/fonts/OFL.txt).
