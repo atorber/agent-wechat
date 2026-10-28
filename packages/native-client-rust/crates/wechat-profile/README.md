@@ -1,5 +1,7 @@
 # Offline official-profile library
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 `wechat-profile` reads an explicitly selected stopped Linux account profile. It
 runs without an official executable, agent-server, network connection or native
 login. It does not discover passwords or acquire memory from a process.
