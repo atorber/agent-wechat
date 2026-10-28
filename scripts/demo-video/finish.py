@@ -11,7 +11,7 @@ image_start_frame=round(image['start']*30)
 cut_end_frame=image_start_frame+round(image['duration']*30)
 cut_start_frame=cut_end_frame-45
 cut_start=cut_start_frame/30;cut_end=cut_end_frame/30
-duration=2752/30
+duration=(sum(round(s['duration']*30) for s in old)-45)/30
 graph=(f'[0:v]split=2[vx][vy];'
        f'[vx]trim=end_frame={cut_start_frame},setpts=PTS-STARTPTS[vp];'
        f'[vy]trim=start_frame={cut_end_frame},setpts=PTS-STARTPTS[vq];'

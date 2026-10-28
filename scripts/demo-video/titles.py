@@ -18,8 +18,8 @@ CARDS=[
  dict(id='02-agent-combined',duration=3.2,lines=[('Your AI agent receives',.06,'AI agent'),('and replies in your',.55,None),('WeChat thread.',1.05,None)]),
  dict(id='04-voice',duration=2.2,lines=[('Send a voice note.',.06,'voice note')]),
  dict(id='05-voice-reply',duration=3.2,lines=[('It can hear that',.06,'hear'),('and send one too.',.8,'send')]),
- dict(id='06-media',duration=2.4,lines=[('Access and save your media.',.06,'your media')]),
- dict(id='07-terminal',duration=2.2,lines=[('Even from the terminal.',.06,'terminal')]),
+ dict(id='06-media',duration=3.2,lines=[('Access and save your media',.06,None),('in the Agent WeChat desktop app.',.8,'Agent WeChat desktop app')]),
+ dict(id='07-terminal',duration=2.2,lines=[('Or from the terminal.',.06,'terminal')]),
 ]
 
 @lru_cache(None)

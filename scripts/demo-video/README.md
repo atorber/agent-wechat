@@ -5,7 +5,7 @@ OpenClaw → phone voice note → recorded Windows client → terminal → saved
 It preserves the recorded demo's copy and interfaces, including the historical
 Windows client; it is not a compatibility statement for current releases.
 
-The final cut is **1920 × 1080, 30 fps, 2,752 frames (91.733 seconds)**.
+The final cut is **1920 × 1080, 30 fps, 2,776 frames (92.533 seconds)**.
 Private recordings, voice notes, generated chat media, credentials and rendered
 videos are not stored in Git. Keep the original recordings separately to rebuild
 the full video. The title preview and instrumental can be generated without them.
@@ -75,7 +75,7 @@ notifications and credentials before exporting it.
 - Closing card is left aligned with only two text sizes: 120 and 42 pixels.
 
 The approved copy and underline targets live in `titles.py`. The final timing is
-saved in `approved-timeline.json`. `render.py` creates a 93.233-second intermediate
+saved in `approved-timeline.json`. `render.py` creates a 94.033-second intermediate
 cut; `finish.py` removes its final 45 frames of the image-in-chat shot and mixes
 music, preserving all subsequent audio/video alignment.
 
