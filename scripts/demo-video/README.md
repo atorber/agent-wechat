@@ -6,9 +6,12 @@ It preserves the recorded demo's copy and interfaces, including the historical
 Windows client; it is not a compatibility statement for current releases.
 
 The final cut is **1920 × 1080, 30 fps, 2,776 frames (92.533 seconds)**.
-Private recordings, voice notes, generated chat media, credentials and rendered
-videos are not stored in Git. Keep the original recordings separately to rebuild
+The approved final export is included at
+[`docs/public/demo/agent-wechat-demo.mp4`](../../docs/public/demo/agent-wechat-demo.mp4).
+Private raw recordings, standalone voice notes, credentials, and intermediate
+renders are not stored in Git. Keep the original recordings separately to rebuild
 the full video. The title preview and instrumental can be generated without them.
+README and gallery images have their own [rebuild guide](../demo-gallery/README.md).
 
 ## Run
 
@@ -100,3 +103,24 @@ Check the send animation, voice alignment, image arrival, terminal command and
 terminal-to-image dissolve visually. The committed timeline contains filenames
 rather than local account paths. The bundled, unmodified Inter font is licensed
 under the SIL Open Font License; see `fonts/OFL.txt`.
+
+## GitHub inline copy
+
+The README uses the [video attachment on issue #324](https://github.com/thisnick/agent-wechat/issues/324#issuecomment-6480211337).
+Its 9,545,885-byte MP4 fits GitHub's
+[10 MB free-plan video limit](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files). The H.264 video
+stream is unchanged; only the AAC audio is re-encoded from 256 to 128 kbps. The
+full-quality export remains under `docs/public/demo`.
+
+Recreate the smaller attachment from the repository root:
+
+```sh
+mkdir -p work/demo-gallery
+ffmpeg -i docs/public/demo/agent-wechat-demo.mp4 \
+  -map 0:v:0 -map 0:a:0 -c:v copy -c:a aac -b:a 128k \
+  -movflags +faststart work/demo-gallery/agent-wechat-demo-github.mp4
+```
+
+Upload that file through a GitHub issue/comment attachment picker and put the
+returned `https://github.com/user-attachments/assets/...` URL on its own line in
+the README. Use that stable attachment URL, not an expiring media-delivery URL.
