@@ -1,0 +1,101 @@
+---
+title: 群成员 @ 提醒
+description: 在桌面端应用、CLI、OpenClaw 或 API 中 @ 提醒群聊成员。
+---
+
+使用微信用户 ID (wxid) 来 @ 提醒群成员。Daemon 会自动填充群成员的显示名称，并构建微信服务端用于识别目标成员所需的结构化元数据。在普通文本中直接手打 `@昵称` 并不会触发系统的 @ 提醒机制。
+
+## 桌面端应用
+
+在群聊输入框中键入 `@` 字符，或点击附件按钮旁的 **@ 提醒**。选择相应群成员即可在光标处插入 @ 标签。可按退格键 (Backspace) 或标签上的 × 按钮将其移除。应用会将选中的成员 ID 保存在草稿中。
+
+## OpenClaw
+
+使用现有的 `message` 工具配合 `agent-wechat` 通道即可。例如：
+
+```json
+{
+  "action": "send",
+  "channel": "agent-wechat",
+  "target": "GROUP_ID",
+  "message": "请帮忙查阅一下",
+  "channelData": {
+    "agent-wechat": { "mentions": { "userIds": ["MEMBER_ID"] } }
+  }
+}
+```
+
+使用 `"mentions": { "all": true }` 可提醒全员 (@所有人)。加载微信通道后，工具 schema 中会自动暴露这些选项。
+
+## CLI 命令行
+
+1. 使用 `wx groups members list GROUP_ID` 查询群成员 ID。
+2. 发送普通文本消息：
+
+   ```bash
+   wx messages send GROUP_ID --text "请帮忙查阅一下" \
+     --mention MEMBER_ID --idempotency-key mention-001
+   ```
+
+   命令将返回发送任务 ID、`state` 状态以及本地 `receiptPath`。在微信中接收到的消息呈现为 `@群名片 消息正文`。可多次传入 `--mention` 以提醒多人；其名字将按传入顺序排列。
+3. 如需 @所有人，传入 `--mention-all` 代替具体的成员 ID：
+
+   ```bash
+   wx messages send GROUP_ID --text "会议马上开始" --mention-all
+   ```
+
+   微信服务端将校验当前账号在该群是否具备 @所有人 的管理权限。
+
+## API 与 SDK
+
+向 `POST /v1/accounts/ACCOUNT_ID/sends` 提交请求，并在请求头中带上 `Idempotency-Key`：
+
+```json
+{
+  "threadId": "GROUP_ID",
+  "text": "请帮忙查阅一下",
+  "mentions": { "userIds": ["MEMBER_ID"] }
+}
+```
+
+使用 `"mentions": { "all": true }` 进行全员提醒。这两种参数形式不可混用。响应返回标准发送收据；可通过 `GET /sends/SEND_ID` 查询进度。
+
+```ts
+await client.sendText(accountId, groupId, "请帮忙查阅一下", "mention-001", {
+  mentions: { userIds: [memberId] },
+});
+```
+
+如需将 @ 标签嵌入句子中的特定位置，可在提交文本时传入 `positions` 数组及其 UTF-16 偏移量区间。每个位置区间以 `@` 起始，并包含末尾的 U+2005 专用空白符；`end` 为开区间，`index` 索引对应 `userIds` 数组中的元素：
+
+```ts
+await client.sendText(accountId, groupId, "你好 @Alice\u2005，请查收此文件", "mention-002", {
+  mentions: { userIds: [memberId], positions: [{ start: 3, end: 11, index: 0 }] },
+});
+```
+
+Daemon 会自动用本地保存的群成员名称替换对应的标签占位。使用成员信息中的 `mentionName` 可获得精准的预览。多个区间可指定相同的成员；但 `userIds` 中选中的每一位成员必须至少在一个区间中出现。对于 `all: true`，请使用索引 `0`。支持此格式的 Hub 节点会在账号 capability 中声明 `inlineTextMentions: true`。
+
+成员名称依次优先取用群昵称、个人微信昵称，兜底为账号 ID。个人的私有好友备注不会被带入群提醒。Daemon 会将解析好的名称和元数据持久化存入原始发送记录中，因此即使之后群昵称发生变动，重放原幂等键依然发送最初的消息。
+
+## 接收 @ 提醒
+
+在消息的 GET/list 返回结果中包含以下字段：
+
+```json
+{
+  "mentions": {
+    "state": "known",
+    "userIds": ["MEMBER_ID"],
+    "self": true,
+    "all": false,
+    "source": "msgsource.atuserlist"
+  }
+}
+```
+
+`self` 为 `true` 表示你在被提醒名单中；`all` 为 `true` 表示这是一条 @所有人 消息。全员提醒标记独立于 `userIds`。若元数据缺失或异常，返回 `state: "unknown"` 且相关标记为 null。监听 `message.committed` 事件后获取消息详情即可读取这些字段。OpenClaw 的群 @ 触发门禁同时支持命中自身或者命中全员提醒。
+
+:::note[使用提示]
+群成员提醒目前仅支持在 Daemon 本地已存储的群聊中发送普通文本。未知成员 ID、重复 ID、单聊会话、引用回复以及富媒体消息载荷均不支持提醒。未指定插入位置时，Daemon 默认将 @ 标签追加在消息开头。包含成员名称在内的完整文本内容不得超出 64 KiB 的文本上限。遇到网络超时请保留原有的发送幂等键；详见[消息发送与恢复机制](/zh-cn/how-it-works/sends/)。
+:::

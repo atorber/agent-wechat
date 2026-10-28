@@ -1,0 +1,70 @@
+---
+title: 管理群聊
+description: 查看群成员、创建与编辑群聊，以及调整群通知设置。
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+使用 `wx groups` 命令管理普通微信群聊，使用 `wx chats mute/unmute` 修改群免打扰设置。修改操作需要拥有 `admin` 范围的 Daemon 令牌。微信服务端仍会严格校验你的账号在对应群聊中的实际权限。
+
+## 查看与刷新
+
+1. 查找群聊并读取本地已保存的群成员：
+
+   ```bash
+   wx groups list
+   wx groups get '123456@chatroom'
+   wx groups members list '123456@chatroom' --limit 50
+   wx groups members get '123456@chatroom' wxid_alice
+   ```
+
+   精准查询群成员将返回 `{"state":"present","member":{...}}` 或 `{"state":"unconfirmed","member":null}`。本地未找到该记录并不代表该成员已退群。
+
+2. 在需要时从微信服务器拉取最新数据：
+
+   ```bash
+   wx groups refresh '123456@chatroom'
+   wx groups members refresh '123456@chatroom'
+   ```
+
+   群信息刷新将拉取群名称、通知状态和群公告。群成员刷新将拉取群成员名单。操作结果中会明确指示服务器是否下发了完整的成员清单。
+
+## 修改与管理
+
+1. 谨慎选择目标群聊与联系人。建群需至少选择除你之外的两名联系人；每位被邀请成员在服务端的返回结果可能各自不同。
+
+   ```bash
+   wx groups create wxid_alice wxid_bob --name '读书俱乐部' --idempotency-key group-create-001
+   wx groups rename '123456@chatroom' '读书俱乐部' --idempotency-key group-name-001
+   wx groups members add '123456@chatroom' wxid_alice --idempotency-key group-add-001
+   wx groups members remove '123456@chatroom' wxid_alice --idempotency-key group-remove-001
+   wx groups my-name '123456@chatroom' 'Sam' --idempotency-key group-my-name-001
+   wx chats mute '123456@chatroom' --idempotency-key group-mute-001
+   wx chats unmute '123456@chatroom' --idempotency-key group-unmute-001
+   wx groups clear-announcement '123456@chatroom' --idempotency-key group-clear-001
+   wx groups leave '123456@chatroom' --idempotency-key group-leave-001
+   ```
+
+2. 检查操作记录中的 `remoteOutcome`、`members`、`unconfirmedMembers` 以及 `profileProjection`。`succeeded` 代表建群或修改请求已被服务端接受；对于部分成功的邀请操作请检查各个成员的具体状态。退出群聊会保留本地已保存的聊天历史。每条命令均会输出操作 ID 及本地收据路径。
+
+   ```bash
+   wx operations get OPERATION_ID
+   ```
+
+   若遇到网络丢失响应，请务必复用相同的幂等键与一致参数重试。`needs_review` 表示微信端可能已经接收了请求，切勿随意更换新键重试，应主动查询已有操作记录。
+
+## API 与 SDK
+
+[群组相关 API 路由](/zh-cn/use/api/#路由列表) 要求在请求头中传入 `Idempotency-Key`，并返回带有操作任务的 HTTP 202 响应。可通过 `GET /group-mutations/by-idempotency-key?key=...` 进行查询。TypeScript SDK 提供了 `createGroup`、`renameGroup`、`leaveGroup`、`addGroupMembers`、`removeGroupMembers`、`setMyGroupName`、`clearGroupAnnouncement`、`setThreadMuted`、`groupMember` 以及 `groupMutationByKey`。
+
+```ts
+const op = await client.renameGroup(accountId, groupId, '读书俱乐部', 'group-name-001');
+const status = await client.operation(accountId, op.id);
+```
+
+<Aside title="使用提示">
+- 群聊数据保存在本地。接收到受支持的变更事件并持久化后将触发 `group.updated`；版本号变动通知可能会触发群名单和公告的主动刷新。联系人同步流也会携带群免打扰状态。目前支持的变更字段写入后可能会报告 `profileProjection: "partial"`，因为本地提示消息、全文搜索索引和部分私有配置未完整重建。
+- 未知的同步指令字段保持挂起状态。
+- 免打扰支持普通联系人单聊与群聊。自定义群备注、发布群公告、生成邀请二维码链接、转让群主及变更群管理员等操作暂不支持。
+- OpenClaw 仅暴露了只读权限的[群信息工具](/zh-cn/openclaw/tools/)，未开放群修改工具。
+</Aside>
