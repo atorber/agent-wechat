@@ -527,7 +527,7 @@ async fn alert(
     };
     let desktop = app.state::<Desktop>();
     let inner = desktop.inner.lock().await;
-    if !inner.config.notifications_enabled
+    if !inner.config.notifications_for(&target.server_id, account)
         || inner
             .active
             .as_ref()
@@ -639,6 +639,43 @@ pub async fn notifications_take_target(
         }))
 }
 #[tauri::command]
+pub async fn notifications_account_settings(
+    state: State<'_, Desktop>,
+    connection_id: String,
+    server_id: String,
+    account_id: String,
+    enabled: Option<bool>,
+) -> Result<Value, String> {
+    let mut inner = state.inner.lock().await;
+    if inner.active.as_ref().is_none_or(|active| {
+        active.connection.id != connection_id
+            || active.connection.server_id.as_deref() != Some(server_id.as_str())
+    }) {
+        return Err("Hub connection changed; reopen account settings".into());
+    }
+    if account_id.is_empty()
+        || account_id.len() > 128
+        || !account_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+    {
+        return Err("Invalid account identity".into());
+    }
+    if let Some(enabled) = enabled {
+        let mut config = inner.config.clone();
+        config
+            .set_account_notifications(&server_id, &account_id, enabled)
+            .map_err(|error| error.to_string())?;
+        config
+            .save(&state.config_file)
+            .map_err(|_| "Cannot save account notification settings")?;
+        inner.config = config;
+    }
+    Ok(
+        serde_json::json!({ "enabled": inner.config.account_notifications_enabled(&server_id, &account_id), "desktopEnabled": inner.config.notifications_enabled }),
+    )
+}
+#[tauri::command]
 pub async fn notifications_enabled(state: State<'_, Desktop>, enabled: bool) -> Result<(), String> {
     let mut inner = state.inner.lock().await;
     let mut config = inner.config.clone();
@@ -662,19 +699,6 @@ pub async fn notifications_sound_enabled(
         .map_err(|_| "Cannot save notification sound settings")?;
     inner.config = config;
     Ok(())
-}
-#[tauri::command]
-pub async fn notifications_preview_sound(app: tauri::AppHandle) -> Result<(), String> {
-    crate::notification_sound::show(
-        &app,
-        "AgentWechat",
-        None,
-        "Notification sound preview",
-        None,
-        true,
-    )
-    .await
-    .map_err(|_| "Cannot preview notification sound".into())
 }
 fn sound_due(last: &mut Option<Instant>, enabled: bool, now: Instant) -> bool {
     if !enabled

@@ -279,6 +279,7 @@ export function DesktopPreferences({
             const enabled = event.target.checked;
             void action(async () => {
               await desktopInvoke("notifications_enabled", { enabled });
+              window.dispatchEvent(new Event("desktop-notifications-changed"));
               await refresh();
             });
           }}
@@ -286,32 +287,19 @@ export function DesktopPreferences({
       </div>
       <div className="setting">
         <span>Notification sound</span>
-        <div className="notification-sound-controls">
-          <button
-            className="quiet-button"
-            disabled={busy || !settings}
-            onClick={() =>
-              void action(async () => {
-                await desktopInvoke("notifications_preview_sound");
-              })
-            }
-          >
-            Preview
-          </button>
-          <input
-            type="checkbox"
-            aria-label="Notification sound"
-            checked={settings?.notificationSoundEnabled ?? true}
-            disabled={busy || !settings}
-            onChange={(event) => {
-              const enabled = event.target.checked;
-              void action(async () => {
-                await desktopInvoke("notifications_sound_enabled", { enabled });
-                await refresh();
-              });
-            }}
-          />
-        </div>
+        <input
+          type="checkbox"
+          aria-label="Notification sound"
+          checked={settings?.notificationSoundEnabled ?? true}
+          disabled={busy || !settings}
+          onChange={(event) => {
+            const enabled = event.target.checked;
+            void action(async () => {
+              await desktopInvoke("notifications_sound_enabled", { enabled });
+              await refresh();
+            });
+          }}
+        />
       </div>
       <div className="setting">
         <span>Open at login</span>

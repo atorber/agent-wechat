@@ -1919,7 +1919,6 @@ input:focus-visible {
 .desktop-access-key input { width: 100%; font-family: monospace; }
 .desktop-connection-details code, .desktop-preferences small { overflow-wrap: anywhere; }
 
-.desktop-update-settings { border-bottom: 1px solid var(--line); padding-bottom: 20px; }
 .desktop-update-settings .setting { gap: 16px; }
 .desktop-update-settings progress { width: 100%; }
 .desktop-update-notice { position: fixed; z-index: 2000; right: 24px; bottom: 24px; max-width: min(440px, calc(100vw - 48px)); padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 8px 24px #0003; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
@@ -2172,8 +2171,6 @@ input:focus-visible {
   }
 }
 
-.notification-sound-controls { display: flex; align-items: center; gap: 16px; }
-.notification-sound-controls .quiet-button { padding: 7px 12px; font-size: 12px; }
 
 /* Inline group mentions share the message field and the bottom action row. */
 .composer { position: relative; overflow: visible; }

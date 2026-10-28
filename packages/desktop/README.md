@@ -10,7 +10,7 @@ Once configured, the local hub starts whenever the app opens, including when the
 
 **Quit AgentWechat** requests shutdown of the exact child hub using its PID, hub ID and ownership generation. It never adopts another process, and remote hubs are not stopped. Profiles and encryption keys stay in the app's data folder outside the installation directory.
 
-Message notifications run in the native app for signed-in profiles on the selected hub, including while the window is hidden. Change **Settings → Message notifications** to turn them off. The app alerts for new incoming messages in chats known to be unmuted, after contact sync is ready. It suppresses the conversation being read in the focused window, history, outgoing messages and duplicate events. Starting the app begins at the current event boundary; it does not replay old alerts. Only message IDs and event cursors are kept in protected notification receipts.
+Message notifications run in the native app for signed-in profiles on the selected hub, including while the window is hidden. Change **Settings → Message notifications** to turn them off, or use an account's settings to disable only that account on this device. The desktop-wide switch takes precedence. The app alerts for new incoming messages in chats known to be unmuted, after contact sync is ready. It suppresses the conversation being read in the focused window, history, outgoing messages and duplicate events. Starting the app begins at the current event boundary; it does not replay old alerts. Only message IDs and event cursors are kept in protected notification receipts.
 
 Notifications for quoted replies show the reply text. If that text is unavailable, the preview says “Reply.”
 
