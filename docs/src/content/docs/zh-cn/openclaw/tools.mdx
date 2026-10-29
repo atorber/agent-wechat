@@ -18,6 +18,10 @@ import { Aside } from '@astrojs/starlight/components';
 
 例如当用户提问“Sam 刚才发的地址是什么？”时，智能体可以调用 `wechat_search` 传入 `{"query": "地址"}`，并对匹配到的照片调用 `wechat_media` 提取图像内容。
 
+## 指定消息发送目标
+
+在使用 OpenClaw 内置的 `message` 工具时，请将 `wx contacts find 姓名` 或 `wx chats find 群名` 返回的联系人或会话 ID 作为 `target`。支持 `wechat:ID` 与 `agent-wechat:ID` 两种格式前缀。若 Daemon 本地已有该确切联系人或单聊会话记录，也支持不带 `wxid_` 前缀的联系人 ID。微信昵称和可修改的微信号不能作为发送目标 ID。
+
 ## 引用某条消息
 
 使用 OpenClaw 内置的 `message` 工具，并将 `replyTo` 设为历史消息或搜索返回的存储消息 `id`：

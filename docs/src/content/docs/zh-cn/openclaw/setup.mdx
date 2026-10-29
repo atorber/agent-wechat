@@ -51,7 +51,7 @@ import chat from '../../../../assets/wechat-chat.svg';
    }
    ```
 
-   微信用户 ID 格式通常为 `wxid_…`。可通过 `wx contacts find 姓名` 查找好友 ID，通过 `wx chats find 群名` 查找群聊 ID（以 `@chatroom` 结尾）。你自己的 ID 可以通过发送过的消息中的 `senderId` 获取（例如执行 `wx messages list filehelper --limit 1`）。
+   可通过 `wx contacts find 姓名` 查找好友 ID，通过 `wx chats find 群名` 查找群聊 ID（以 `@chatroom` 结尾）。联系人 ID 通常以 `wxid_` 开头，但也有部分例外。请使用命令返回的真实 ID，而不是昵称或可修改的微信号。你自己的 ID 可以通过发送过的消息中的 `senderId` 获取（例如执行 `wx messages list filehelper --limit 1`）。
 
 4. **注入令牌环境变量。** 在 Gateway 运行环境中设置 `AGENT_WECHAT_TOKEN`，然后重启 OpenClaw Gateway。
 
