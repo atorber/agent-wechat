@@ -27,7 +27,7 @@ import { Aside } from '@astrojs/starlight/components';
    wx groups members refresh '123456@chatroom'
    ```
 
-   群信息刷新将拉取群名称、通知状态和群公告。群成员刷新将拉取群成员名单，并在操作结果中明确指示服务器是否下发了完整的成员清单。
+   群信息刷新将拉取群名称、通知状态和群公告。群成员刷新将拉取群成员名单、群主与管理员列表，并在操作结果中明确指示成员名单是否完整。
 
 ## 修改与管理
 
@@ -72,6 +72,8 @@ const status = await client.operation(accountId, op.id);
 
 在群聊输入框中键入 `@` 字符，或点击附件按钮旁的 **@ 提醒**。选择相应群成员即可在光标处插入 @ 标签；按退格键 (Backspace) 或标签上的 × 按钮即可将其移除。选中的接收成员将保存在草稿中。
 
+**“所有人” (Everyone)** 仅对群主和群管理员可用。如果你的群权限发生变更，应用会保留草稿，并允许你移除“所有人”或刷新群信息。省略该权限字段的旧版服务端将保留原有行为。
+
 ### CLI 命令行
 
 使用 `wx groups members list GROUP_ID` 查询群成员 ID：
@@ -82,7 +84,7 @@ wx messages send GROUP_ID --text "请帮忙查阅一下" \
 wx messages send GROUP_ID --text "会议马上开始" --mention-all
 ```
 
-可多次传入 `--mention` 按顺序提醒多位成员。如需 @所有人，传入 `--mention-all` 代替具体的成员 ID（视微信服务端权限而定）。命令输出包含发送任务 ID、`state` 状态及 `receiptPath` 收据路径。
+可多次传入 `--mention` 按顺序提醒多位成员。只有群主和群管理员可以使用 `--mention-all`。命令输出包含发送任务 ID、`state` 状态及 `receiptPath` 收据路径。
 
 ### OpenClaw
 
@@ -115,6 +117,8 @@ wx messages send GROUP_ID --text "会议马上开始" --mention-all
 ```
 
 使用 `userIds` 或 `all: true`（二选一）。使用 `GET /sends/SEND_ID` 查询发送收据与进度。
+
+`GET /groups/GROUP_ID` 包含 `ownerId`、`administratorIds`（除非微信协议单独下发，否则不重复包含群主）以及 `canMentionAll`。`null` 权限表示根据本地已存数据尚无法确认权限资格；请先刷新群成员后再重试。普通群成员提交新的 `all: true` 发送将返回 `403 mention_all_forbidden`；权限未知时返回 `409 mention_all_permission_unavailable`。排队中的发送在实际提交前会重新核验权限。复用已有发送幂等键仍会返回该发送记录。
 
 ```ts
 await client.sendText(accountId, groupId, "请帮忙查阅一下", "mention-001", {
