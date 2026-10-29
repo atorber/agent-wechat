@@ -38,9 +38,14 @@ export default defineConfig({
   site,
   base,
   redirects: Object.fromEntries(
-    Object.entries(moved).map(([from, to]) => {
+    Object.entries(moved).flatMap(([from, to]) => {
       const [path, fragment] = to.split('#');
-      return [`/${from}`, `${base}/${path}${path ? '/' : ''}${fragment ? `#${fragment}` : ''}`];
+      const target = `${base}/${path}${path ? '/' : ''}${fragment ? `#${fragment}` : ''}`;
+      const zhTarget = `${base}/zh-cn/${path}${path ? '/' : ''}${fragment ? `#${fragment}` : ''}`;
+      return [
+        [`/${from}`, target],
+        [`/zh-cn/${from}`, zhTarget],
+      ];
     }),
   ),
   markdown: {
@@ -81,7 +86,6 @@ export default defineConfig({
         { label: 'Use it', translations: { 'zh-CN': '使用指南' }, items: [
           { label: 'CLI recipes', translations: { 'zh-CN': 'CLI 常用命令' }, slug: 'use/cli' },
           { label: 'Manage groups', translations: { 'zh-CN': '管理群聊' }, slug: 'use/groups' },
-          { label: 'Mention group members', translations: { 'zh-CN': '群成员 @ 提醒' }, slug: 'use/mentions' },
           { label: 'Send attachments', translations: { 'zh-CN': '发送附件' }, slug: 'use/media' },
           { label: 'Settings', translations: { 'zh-CN': '设置' }, slug: 'use/settings' },
           { label: 'Video and image quality', translations: { 'zh-CN': '视频与图片画质' }, slug: 'use/quality' },

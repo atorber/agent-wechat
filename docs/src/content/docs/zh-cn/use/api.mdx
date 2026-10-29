@@ -151,7 +151,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 每次发送均必须携带 `Idempotency-Key`。使用相同键重复提交将返回初次发送的记录，绝不重复外发。可通过 `GET /sends/{id}` 查看进度，或通过 `GET /sends/by-idempotency-key?key=...` 按键查找。
 
-群文本消息支持传入 `mentions: { userIds: ["MEMBER_ID"] }` 或 `mentions: { all: true }`。详情参考[群成员 @ 提醒](/zh-cn/use/mentions/)。
+群文本消息支持传入 `mentions: { userIds: ["MEMBER_ID"] }` 或 `mentions: { all: true }`。详情参考[群成员 @ 提醒](/zh-cn/use/groups/#mention-group-members)。
 
 如需引用某条已保存的消息，在请求中同时传入该消息在当前会话下的 `id` 与 `serverId`：
 

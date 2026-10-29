@@ -5,6 +5,8 @@ description: 文件、图片、视频与语音的大小限制，大文件发送�
 
 import { Aside } from '@astrojs/starlight/components';
 
+在桌面端或 Web 客户端中，可点击附件按钮、直接粘贴文件或图片，或将文件拖放到消息输入框中。发送前可进行预览确认。JPEG、PNG、GIF 和 WebP 文件将作为图片发送；MP4 文件将作为视频发送；其他格式均作为普通文件附件发送。
+
 可通过 CLI、HTTP API 或 OpenClaw 发送各类附件。普通文件上限为 **512 MiB (536,870,912 字节)**。具体限制视选择的消息类型而定：
 
 | 附件类型 | 最大原始体积 |

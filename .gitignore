@@ -53,3 +53,4 @@ artifacts/desktop/
 
 # Local launch-image build environments and generated sample media
 /work/demo-gallery/
+.knowledge/*
