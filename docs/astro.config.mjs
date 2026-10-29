@@ -9,6 +9,7 @@ const site = 'https://thisnick.github.io';
 
 // Pages from the previous layout, kept working for existing links.
 const moved = {
+  'use/mentions': 'use/groups#mention-group-members',
   'use/video': 'use/quality',
   'use/contacts': 'use/api#contacts',
   'getting-started/overview': '',

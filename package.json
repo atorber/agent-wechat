@@ -1,6 +1,7 @@
 {
   "name": "agent-wechat",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "Standalone native WeChat daemon, CLI and OpenClaw channel",
   "private": true,
   "type": "module",

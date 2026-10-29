@@ -1,6 +1,7 @@
 import { ConversationRow } from "./conversation-row.tsx";
 import { ThreadPinSwitch, useThreadPinPreview } from "./thread-pinning.tsx";
 import { ThreadNotifications } from "./thread-notifications.tsx";
+import { emojiText } from "./emoji-text.ts";
 import { DesktopUpdates } from "./desktop-updates.tsx";
 import { desktop, desktopConnect, desktopInvoke, desktopNotifications, installDesktopLinks, type DesktopSession } from "./desktop.ts";
 import { DesktopWelcome, DesktopPreferences } from "./desktop-ui.tsx";
@@ -39,7 +40,8 @@ import {
 } from "./session.ts";
 import { Avatar, Button, Icon, Logo, Welcome } from "./ui.tsx";
 import { HistorySearch } from "./history-search.ts";
-import { AttachmentPicker, MediaCard, PendingAttachments } from "./media.tsx";
+import { MediaCard, PendingAttachments } from "./media.tsx";
+import { AttachmentPicker } from "./attachment-picker.tsx";
 import { ConversationAvatar, HubAvatar } from "./avatars.tsx";
 import {
   messageSummary,
@@ -69,6 +71,8 @@ import "./style.css";
 import "./onboarding.css";
 import "./client.css";
 import { SharedLink } from "./shared-link.tsx";
+import { LocationMessage } from "./location-message.tsx";
+import { SystemNotice } from "./system-notice.tsx";
 import { MentionEditor } from "./mention-editor.tsx";
 import { validMentionTokens, type MentionToken } from "./mentions.ts";
 const EMPTY_MENTIONS: MentionToken[] = [];
@@ -848,6 +852,7 @@ function Chats({
   >(undefined);
 
   const messageInput = useRef<HTMLTextAreaElement>(null);
+  const composerInput = useRef<HTMLDivElement>(null);
   const mentionInput = useRef<HTMLDivElement>(null);
   function focusMessage() { (mentionInput.current ?? messageInput.current)?.focus({ preventScroll: true }); }
   const composing = useRef(false);
@@ -1498,7 +1503,7 @@ function Chats({
                     )}
                   </ConversationScroll>
                   <div className="composer-wrap">
-                    <div className="composer">
+                    <div className="composer" ref={composerInput}>
                       {!reply && pendingQuote.current && (
                         <div className="composer-reply">
                           <span className="reply-source">
@@ -1574,7 +1579,8 @@ function Chats({
                       {composerNotice && <p className="mention-error" role="alert">{composerNotice}</p>}
                       <div className="composer-bottom">
                         <div className="composer-tools" role="group" aria-label="Message actions">
-                          {state.account && <AttachmentPicker key={state.account} connection={connection} account={state.account} threadId={state.selected} recipient={selectedName}
+                          {state.account && <AttachmentPicker key={JSON.stringify([state.account, state.selected])} connection={connection} account={state.account} threadId={state.selected} recipient={selectedName}
+                            composerRef={composerInput} mediaKinds={Array.isArray(state.capabilities.mediaKinds) ? state.capabilities.mediaKinds : []}
                             enabled={active && !reply && !pendingQuote.current && !draftMentions.length && Array.isArray(state.capabilities.mediaKinds) && state.capabilities.mediaKinds.length > 0} />}
                           <Button icon="mention" label="Mention someone"
                             title={!state.selected?.endsWith("@chatroom") ? "Mentions are available in group chats" : !inlineCapable ? "Update the hub to use inline mentions" : reply || pendingQuote.current ? "Remove the reply to mention someone" : "Mention someone"}
@@ -1876,10 +1882,10 @@ function Pending({
               <strong>
                 {send.quotePreview?.senderName || "Quoted message"}
               </strong>
-              <span>{send.quotePreview?.text || "Reply"}</span>
+              <span>{emojiText(send.quotePreview?.text || "Reply")}</span>
             </div>
           )}
-          <p>{send.text}</p>
+          <p>{emojiText(send.text)}</p>
         </div>
         <div
           className={`delivery ${
@@ -1948,7 +1954,7 @@ function ReplyPreview({
             ? message.recall
               ? "Message recalled"
               : "Message unavailable"
-            : messageSummary(message, sender).text}
+            : emojiText(messageSummary(message, sender).text)}
         </span>
       </button>
       <Button icon="close" label="Cancel reply" onClick={cancel} />
@@ -1975,6 +1981,10 @@ function Message({
   const own = m.direction === "outgoing";
   const presentation = messagePresentation(m);
   const textLink = textMessageLink(m);
+  if (presentation === "system") {
+    return <SystemNotice messageId={m.id} text={m.body?.trim() || "System message"}
+      timestamp={time(m.createdAt)} dateTime={date(m.createdAt).toISOString()} />;
+  }
   if (
     presentation === "recalled" &&
     (!m.senderId || !["incoming", "outgoing"].includes(m.direction ?? ""))
@@ -2024,7 +2034,7 @@ function Message({
                     <a href={textLink.href} target="_blank" rel="noopener noreferrer">
                       {m.body}
                     </a>
-                  ) : m.body || (m.type >= 10000 ? "System message" : "")}
+                  ) : emojiText(m.body || (m.type >= 10000 ? "System message" : ""))}
                 </p>
               </div>
             ) : presentation === "reply" || presentation === "forwarded" ? (
@@ -2042,14 +2052,16 @@ function Message({
                   </div>
                 )}
                 <p>
-                  {m.body ||
+                  {emojiText(m.body ||
                     (presentation === "reply"
                       ? "Reply text is unavailable."
-                      : "Forwarded content is unavailable.")}
+                      : "Forwarded content is unavailable."))}
                 </p>
               </div>
             ) : presentation === "link" && m.link ? (
               <SharedLink message={m} connection={connection} />
+            ) : presentation === "location" && m.location ? (
+              <LocationMessage location={m.location} />
             ) : presentation === "media" ? (
               <MediaCard message={m} connection={connection} />
             ) : (

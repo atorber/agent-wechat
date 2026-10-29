@@ -2,6 +2,7 @@
 name = "agent-wechat-desktop"
 version = "1.2.0"
 edition = "2021"
+license = "MIT"
 publish = false
 
 [workspace]

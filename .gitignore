@@ -45,3 +45,11 @@ packages/desktop/src-tauri/binaries/
 packages/desktop/src-tauri/resources/
 packages/desktop/src-tauri/gen/
 artifacts/desktop/
+
+# Private demo captures, renders, and uploaded attachments
+/work/demo-video/
+/work/demo-design/
+/.codex-attachments/
+
+# Local launch-image build environments and generated sample media
+/work/demo-gallery/

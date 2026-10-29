@@ -16,8 +16,34 @@ import { Aside } from '@astrojs/starlight/components';
 | Quote reply | Comment in `body`, plus the quote embedded in the reply | Comment and a labeled quote |
 | Forwarded chat | Readable list of who said what | Same text |
 | Link card (article, music, video) | Title, description, URL, source, optional thumbnail | Card text and thumbnail |
+| Static location | `location` coordinates, supplied name/address and readable `body` | Location text |
+| Location-sharing notice (49/17) | Supplied title text | Passive notice; does not join sharing |
+| Plain system notice | Supplied text without a message author | Not a new agent turn |
 | Recalled message | `[Message recalled]` | Removed from pending work |
 | Anything else | Marked unsupported | Not sent to the agent |
+
+## Text emoji
+
+The desktop and web apps display recognized WeChat face aliases, such as
+`[微笑]` and `[Lol]`, as Unicode emoji. Some faces use approximate equivalents;
+their appearance depends on your device. Desktop notifications use the same
+mapping. Unknown aliases and existing Unicode emoji stay unchanged, and URLs
+keep their spelling. Sending, copying, search and API responses retain the
+original message text.
+
+## Locations
+
+Static pins expose `location.latitude`,
+`longitude`, optional `name`, `address`, `scale`, `mapType` and `poiId`, plus a
+readable `body`. The coordinate system is reported as `unknown`; coordinates
+are not converted and no map service is contacted automatically. The desktop app shows a
+location card with two Google Maps actions: **Search place** uses its name/address
+and shared coordinates as search context, while **View pin** opens the shared
+coordinates directly. Search results are not restricted to a strict boundary.
+Coordinates can also be copied; no coordinate conversion is applied. OpenClaw applies the usual sender and group-mention rules.
+
+Location-sharing notices display the sender's supplied title. They do not start
+or join live tracking. Map thumbnails are not downloaded.
 
 ## Voice notes
 

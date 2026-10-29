@@ -35,7 +35,7 @@ test("Channels cards, upload notices, and announcements have bounded presentatio
     link: { title: "Channels post", url: "https://example.invalid/channels" },
   };
   assert.equal(messagePresentation(channel), "link");
-  for (const appMessageType of [74, 87]) {
+  for (const appMessageType of [17, 74, 87]) {
     const message = { type: 49, appMessageType, body: "Notice text" };
     assert.equal(messagePresentation(message), "text");
     assert.equal(messagePresentation({ ...message, recall: {} }), "recalled");
@@ -45,6 +45,22 @@ test("Channels cards, upload notices, and announcements have bounded presentatio
     );
   }
   assert.equal(messagePresentation({ ...channel, recall: {} }), "recalled");
+});
+
+test("static locations use a card without map downloads and recalls suppress coordinates", () => {
+  const message = { type: 48, location: { latitude: 12.5, longitude: -45.25 }, body: "[Location]\nExample park\nLatitude: 12.5\nLongitude: -45.25" };
+  assert.equal(messagePresentation(message), "location");
+  assert.equal(textMessageLink(message), null);
+  assert.equal(messagePresentation({ ...message, location: null }), "unsupported");
+  assert.equal(messagePresentation({ ...message, body: null }), "unsupported");
+  assert.equal(messagePresentation({ ...message, recall: {} }), "recalled");
+});
+
+test("plain system notices do not use chat bubbles or clickable message text", () => {
+  const notice = { type: 10000, senderId: "transport-peer", direction: "incoming", body: "Location sharing has ended." };
+  assert.equal(messagePresentation(notice), "system");
+  assert.equal(textMessageLink({ ...notice, body: "https://example.invalid" }), null);
+  assert.equal(messagePresentation({ ...notice, recall: {} }), "recalled");
 });
 
 test("quoted replies and forwarded history never enter the media download flow", () => {
@@ -90,8 +106,9 @@ test("supported media keep their renderer, unsupported cards do not request down
       messagePresentation({ type: 49, appMessageType }),
       "unsupported"
     );
-  for (const type of [1, 10000, 10002])
-    assert.equal(messagePresentation({ type }), "text");
+  assert.equal(messagePresentation({ type: 1 }), "text");
+  for (const type of [10000, 10002])
+    assert.equal(messagePresentation({ type }), "system");
 });
 
 test("recall markers override every body and content renderer", () => {
