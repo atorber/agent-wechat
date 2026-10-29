@@ -69,6 +69,8 @@ import "./style.css";
 import "./onboarding.css";
 import "./client.css";
 import { SharedLink } from "./shared-link.tsx";
+import { LocationMessage } from "./location-message.tsx";
+import { SystemNotice } from "./system-notice.tsx";
 import { MentionEditor } from "./mention-editor.tsx";
 import { validMentionTokens, type MentionToken } from "./mentions.ts";
 const EMPTY_MENTIONS: MentionToken[] = [];
@@ -1975,6 +1977,10 @@ function Message({
   const own = m.direction === "outgoing";
   const presentation = messagePresentation(m);
   const textLink = textMessageLink(m);
+  if (presentation === "system") {
+    return <SystemNotice messageId={m.id} text={m.body?.trim() || "System message"}
+      timestamp={time(m.createdAt)} dateTime={date(m.createdAt).toISOString()} />;
+  }
   if (
     presentation === "recalled" &&
     (!m.senderId || !["incoming", "outgoing"].includes(m.direction ?? ""))
@@ -2050,6 +2056,8 @@ function Message({
               </div>
             ) : presentation === "link" && m.link ? (
               <SharedLink message={m} connection={connection} />
+            ) : presentation === "location" && m.location ? (
+              <LocationMessage location={m.location} />
             ) : presentation === "media" ? (
               <MediaCard message={m} connection={connection} />
             ) : (
