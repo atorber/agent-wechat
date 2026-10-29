@@ -32,6 +32,8 @@ const moved = {
   'use/quoted-replies': 'use/cli',
   'use/downloads': 'use/settings',
   'reference/environment-vars': 'reference/configuration',
+  'reference/rust-protocol': 'reference/rust-libraries#send-one-text-message',
+  'reference/rust-profile': 'reference/rust-libraries#profile-writes',
 };
 
 export default defineConfig({
