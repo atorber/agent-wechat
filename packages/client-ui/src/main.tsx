@@ -1419,7 +1419,7 @@ function Chats({
                     history={{
                       hasMore: !!state.nextMessages,
                       loading: state.loading,
-                      load: () => void session.older(),
+                      load: () => session.older(),
                     }}
                     leading={
                       state.messages[0] ? (
