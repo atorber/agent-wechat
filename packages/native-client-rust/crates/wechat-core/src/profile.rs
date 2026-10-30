@@ -101,6 +101,9 @@ impl Core {
         Ok((location, keys))
     }
     pub fn profile_reader(&self, account: &str) -> Result<ProfileReader> {
+        #[cfg(test)]
+        self.profile_snapshot_opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (location, keys) = self.profile_location_keys(account)?;
         Ok(ProfileReader::open(
             location,
@@ -313,6 +316,18 @@ pub(crate) fn normalized_message(
     let created = chrono::DateTime::from_timestamp(msg.create_time, 0).map(|d| d.to_rfc3339());
     let app = crate::quotes::message_app(&msg);
     let location = crate::locations::message_location(&msg);
+    if msg.message_type == 42 {
+        let content = msg.content.text.as_deref().unwrap_or("");
+        let content = if thread.as_deref().is_some_and(|s| s.ends_with("@chatroom")) {
+            msg.sender
+                .as_ref()
+                .and_then(|sender| content.strip_prefix(&format!("{sender}:\n")))
+                .unwrap_or(content)
+        } else {
+            content
+        };
+        text = crate::quotes::contact_card_text(content);
+    }
     if let Some(location) = &location {
         text = Some(location.body());
     }

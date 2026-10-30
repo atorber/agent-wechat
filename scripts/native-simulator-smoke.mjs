@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import { zstdDecompressSync } from "node:zlib";
 import { NativeWeChatClient } from "../packages/shared/src/native-client.ts";
 import { assertSameUnavailableMedia } from "./native-ci-media-assertions.mjs";
 
@@ -77,12 +79,20 @@ async function attach() {
   assert.equal(status.version.nativeLogin, false);
   return status;
 }
-async function runCli(args) {
-  const { stdout } = await execute(cliBinary, ["--json", "--config", join(temporary, "client", "client.toml"), ...args], {
-    timeout: 10000,
-    env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("AGENT_WECHAT_"))),
-  });
-  return JSON.parse(stdout);
+async function runCli(args, allowNeedsReview = false) {
+  try {
+    const { stdout } = await execute(cliBinary, ["--json", "--config", join(temporary, "client", "client.toml"), ...args], {
+      timeout: 10000,
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("AGENT_WECHAT_"))),
+    });
+    return JSON.parse(stdout);
+  } catch (error) {
+    if (!allowNeedsReview || error.code !== 8) throw error;
+    const result = JSON.parse(error.stdout);
+    assert.equal(result.state, "needs_review");
+    assert.equal(result.errorCode, "submission_outcome_unknown");
+    return result;
+  }
 }
 async function cli(...args) {
   return runCli(["--server", hub.ready.endpoint, "--token-file", hub.ready.tokenFile, "--account", "personal", ...args]);
@@ -206,6 +216,118 @@ async function pinJourney(streams) {
   await assert.rejects(a.sendByKey("personal", "all-after-leave"), error => error.status === 404);
 }
 
+
+// This journey owns a separate synthetic account so send counts and lost-ACK
+// faults cannot affect the existing personal/work account acceptance checks.
+async function quoteMentionJourney() {
+  const account = "quote_mentions";
+  await login(account);
+  const creation = await a.createGroup(account, { members: ["sim_mei", "sim_daniel"], name: "Synthetic quoted mentions" }, "quote-mentions-create");
+  const created = await waitFor("quoted mention group", async () => {
+    const operation = await a.operation(account, creation.id);
+    if (["failed", "needs_review", "cancelled"].includes(operation.state)) throw new Error(JSON.stringify(operation));
+    return operation.state === "succeeded" && operation;
+  });
+  const room = created.result.groupId;
+  assert.equal((await a.group(account, room)).canMentionAll, true);
+  const settle = async (intent, state = "accepted") => waitFor(`quoted mention send ${state}`, async () => {
+    const current = await a.send(account, intent.id);
+    if (["failed", "cancelled"].includes(current.state)) throw new Error(JSON.stringify(current));
+    // Acceptance precedes the local projection receipt used by message reads.
+    return current.state === state && (state !== "accepted" || current.localMessageId) && current;
+  });
+  const source = await settle(await a.sendText(account, room, "Original synthetic quote target", "quote-mentions-source"));
+  const original = await a.message(account, source.localMessageId);
+  const quote = { messageId: original.id, serverId: original.serverId };
+  const cliSend = (text, key, mentions, reference = quote, threadId = room, allowNeedsReview = false) => runCli(["--server", hub.ready.endpoint, "--token-file", hub.ready.tokenFile, "--account", account,
+    "messages", "send", threadId, "--text", text, "--quote-message-id", reference.messageId, "--quote-server-id", reference.serverId,
+    ...(mentions ? mentions.all ? ["--mention-all"] : mentions.userIds.flatMap(id => ["--mention", id]) : []), "--idempotency-key", key, "--detach"], allowNeedsReview);
+  const accepted = [];
+  for (const [index, path, text, mentions] of [
+    [0, "sdk", "SDK quoted members", { userIds: ["sim_mei", "sim_daniel"] }],
+    [1, "sdk", "Hi @old name\u2005SDK quoted inline member", { userIds: ["sim_mei"], positions: [{ start: 3, end: 13, index: 0 }] }],
+    [2, "sdk", "SDK quoted everyone", { all: true }],
+    [3, "cli", "CLI quoted member", { userIds: ["sim_mei"] }],
+    [4, "cli", "CLI quoted everyone", { all: true }],
+  ]) {
+    const key = `quote-mentions-${index}`;
+    const intent = await settle(path === "sdk" ? await a.sendText(account, room, text, key, { quote, mentions }) : await cliSend(text, key, mentions));
+    const message = await b.message(account, intent.localMessageId);
+    assert.equal(message.type, 49);
+    assert.equal(message.appMessageType, 57);
+    assert.equal(message.quote.serverId, quote.serverId);
+    assert.equal(message.quote.embeddedText, original.body);
+    assert.equal(message.mentions.state, "known");
+    if (mentions.all) assert.equal(message.mentions.all, true);
+    else assert.deepEqual(message.mentions.userIds, mentions.userIds);
+    assert.ok(message.body.includes(path === "sdk" && mentions.positions ? "SDK quoted inline member" : text));
+    assert.ok(!message.body.includes("<appmsg>"));
+    assert.equal((await b.sendText(account, room, text, key, { quote, mentions })).id, intent.id);
+    if (path === "cli") assert.equal((await cliSend(text, key, mentions)).id, intent.id);
+    accepted.push({ key, id: intent.id, localMessageId: intent.localMessageId, threadId: room, quote, quoteType: 1, mentions });
+  }
+  // The media control emits a direct incoming message without a group-member
+  // envelope. Quote its stored descriptor without requesting sticker bytes.
+  const stickerPeer = "sim_mei";
+  await control({ op: "receive_media", account, peer: stickerPeer, kind: "sticker" });
+  const sticker = await waitFor("stored synthetic sticker quote target", async () =>
+    (await a.messages(account, stickerPeer)).items.find(message => message.type === 47));
+  const stickerQuote = { messageId: sticker.id, serverId: sticker.serverId };
+  for (const path of ["sdk", "cli"]) {
+    const text = `${path} quoted sticker reference`, key = `quote-sticker-${path}`;
+    const intent = await settle(path === "sdk" ? await a.sendText(account, stickerPeer, text, key, { quote: stickerQuote })
+      : await cliSend(text, key, undefined, stickerQuote, stickerPeer));
+    const message = await b.message(account, intent.localMessageId);
+    assert.equal(message.threadId, stickerPeer);
+    assert.equal(message.type, 49);
+    assert.equal(message.appMessageType, 57);
+    assert.equal(message.quote.type, 47);
+    assert.equal(message.quote.serverId, stickerQuote.serverId);
+    assert.equal(message.body, text);
+    assert.equal((await b.sendByKey(account, key)).id, intent.id);
+    assert.equal((await b.sendText(account, stickerPeer, text, key, { quote: stickerQuote })).id, intent.id);
+    if (path === "cli") assert.equal((await cliSend(text, key, undefined, stickerQuote, stickerPeer)).id, intent.id);
+    accepted.push({ key, id: intent.id, localMessageId: intent.localMessageId, threadId: stickerPeer, quote: stickerQuote, quoteType: 47 });
+  }
+  const uncertain = [];
+  for (const path of ["sdk", "cli"]) {
+    const text = `Lost acknowledgment for ${path} quoted mentions`, key = `quote-mentions-lost-${path}`, mentions = { userIds: ["sim_mei"] };
+    await control({ op: "send_fault", account, fault: "lost_acknowledgment" });
+    const intent = await settle(path === "sdk" ? await a.sendText(account, room, text, key, { quote, mentions }) : await cliSend(text, key, mentions, quote, room, true), "needs_review");
+    assert.equal((await b.sendByKey(account, key)).id, intent.id);
+    assert.equal((await b.sendText(account, room, text, key, { quote, mentions })).id, intent.id);
+    if (path === "cli") assert.equal((await cliSend(text, key, mentions, quote, room, true)).id, intent.id);
+    uncertain.push({ key, id: intent.id });
+  }
+  // The remote accepted each logical send exactly once, including lost ACKs.
+  const remoteAccount = (await remoteState()).accounts.find(item => item.id === account);
+  assert.equal(remoteAccount.acceptedSends, 10);
+  assert.equal(remoteAccount.acceptedMediaSends, 0);
+  return { account, quote, accepted, uncertain };
+}
+async function verifyQuoteMentionRestart(journey) {
+  for (const retained of journey.accepted) {
+    const intent = await b.sendByKey(journey.account, retained.key);
+    assert.equal(intent.id, retained.id);
+    const message = await b.message(journey.account, retained.localMessageId);
+    assert.equal(message.threadId, retained.threadId);
+    assert.equal(message.type, 49);
+    assert.equal(message.quote.serverId, retained.quote.serverId);
+    assert.equal(message.quote.type, retained.quoteType);
+    assert.equal(message.appMessageType, 57);
+    if (retained.mentions?.all) assert.equal(message.mentions.all, true);
+    else if (retained.mentions) assert.deepEqual(message.mentions.userIds, retained.mentions.userIds);
+  }
+  for (const retained of journey.uncertain) {
+    const intent = await b.sendByKey(journey.account, retained.key);
+    assert.equal(intent.id, retained.id);
+    assert.equal(intent.state, "needs_review");
+  }
+  const remoteAccount = (await remoteState()).accounts.find(item => item.id === journey.account);
+  assert.equal(remoteAccount.acceptedSends, 10);
+  assert.equal(remoteAccount.acceptedMediaSends, 0);
+}
+
 try {
   remote = await start("upstream");
   controlToken = (await readFile(remote.ready.controlTokenFile, "utf8")).trim();
@@ -266,6 +388,7 @@ try {
   assert.equal((await cli("messages", "get", "filehelper", selfMessage.id)).body, selfMessage.body);
 
   await pinJourney([streamA, streamB]);
+  const quoteMentionReceipts = await quoteMentionJourney();
 
   const beforeInbound = streamA.events.at(-1).cursor;
   await control({ op: "inbound", account: "personal", peer: "sim_mei", body: "Incoming through real sync" });
@@ -289,6 +412,7 @@ try {
   const restarted = await attach();
   assert.equal(restarted.serverId, initialStatus.serverId);
   assert.notEqual(restarted.ownershipGeneration, initialStatus.ownershipGeneration);
+  await verifyQuoteMentionRestart(quoteMentionReceipts);
   await waitFor("durable catch-up after hub restart", async () => (await a.messages("personal", "sim_mei")).items.some(item => item.body === "Arrived while the hub was stopped"));
   const caughtUp = (await a.messages("personal", "sim_mei")).items.find(item => item.body === "Arrived while the hub was stopped");
   assert.equal((await a.events("personal", resumeCursor, 200)).items.find(event => event.kind === "message.committed" && event.data.messageId === caughtUp.id).data.origin, "catchup");
@@ -339,6 +463,87 @@ try {
     assert.notEqual((await a.mediaAsset("personal", candidate.id)).state, "available");
   }
 
+  const photo = zstdDecompressSync(await readFile(join(repository, "packages/native-client-rust/crates/wechat-core/tests/fixtures/send-images/50mp-baseline.jpg.zst")));
+  const photoSource = await a.upload("personal", photo, "synthetic-50mp.jpg", "image/jpeg");
+  const photoRequest = { threadId: "sim_mei", kind: "image", sourceId: photoSource.id,
+    standardSourceId: null, thumbnailSourceId: null, playSeconds: null, durationMs: null };
+  const photoSend = await a.sendMedia("personal", photoRequest, "large-photo-send");
+  const photoDone = await waitFor("50 MP image accepted and projected", async () => {
+    const job = await a.job("personal", photoSend.id);
+    assert.ok(!["failed", "cancelled", "needs_review"].includes(job.state), job.reason);
+    return job.state === "accepted" && job.result?.messageIds?.length && job;
+  });
+  assert.equal(photoDone.result.imagePreparation.sourceSha256, createHash("sha256").update(photo).digest("hex"));
+  assert.equal(photoDone.result.imagePreparation.sourcePreserved, false);
+  assert.ok(photoDone.result.imagePreparation.width <= 1280);
+  assert.ok(photoDone.result.imagePreparation.height <= 1280);
+  for (const id of photoDone.result.messageIds) {
+    const assets = await a.mediaAssets("personal", id);
+    for (const quality of ["original", "standard", "thumbnail"]) {
+      const asset = assets.items.find(asset => asset.variant === quality);
+      assert.equal(asset?.state, "available");
+      const content = await a.mediaContent("personal", asset.id);
+      assert.equal(content.contentType, "image/jpeg");
+      assert.ok(content.bytes.length <= 65520);
+      assert.equal(createHash("sha256").update(content.bytes).digest("hex"), asset.sha256);
+    }
+  }
+  assert.equal((await a.sendMedia("personal", photoRequest, "large-photo-send")).id, photoDone.id);
+  assert.equal((await a.sendByKey("personal", "large-photo-send")).id, photoDone.id);
+
+  const moviePath = join(repository, "packages/native-client-rust/crates/wechat-core/tests/fixtures/send-videos/legacy-mjpeg.mov");
+  const movie = await readFile(moviePath);
+  assert.notEqual(movie.subarray(4, 8).toString(), "ftyp");
+  const movieHash = createHash("sha256").update(movie).digest("hex");
+  const movieSource = await a.upload("personal", movie, "legacy.mov", "video/quicktime");
+  const movieRequest = { threadId: "sim_mei", kind: "video", sourceId: movieSource.id,
+    standardSourceId: null, thumbnailSourceId: null, playSeconds: null, durationMs: null,
+    videoQuality: "normal" };
+  for (const quality of ["normal", "original"]) {
+    const key = `legacy-mov-${quality}`;
+    const submitted = quality === "original"
+      ? await cli("messages", "send", "sim_mei", "--video", moviePath, "--video-quality", quality, "--idempotency-key", key, "--detach")
+      : await a.sendMedia("personal", movieRequest, key);
+    const done = await waitFor(`${quality} MOV accepted and projected`, async () => {
+      const current = await a.job("personal", submitted.id);
+      assert.ok(!["failed", "cancelled", "needs_review"].includes(current.state), current.reason);
+      return current.state === "accepted" && current.result?.messageIds?.length && current;
+    });
+    assert.equal(done.result.uploadReadbackVerified, true);
+    assert.equal(done.result.profileProjection, "complete");
+    assert.equal(done.result.officialMediaWriteback, "complete");
+    assert.equal(done.result.videoPreparation.quality, quality);
+    assert.equal(done.result.videoPreparation.sourceSha256, movieHash);
+    assert.equal(done.result.videoPreparation.originalIncluded, quality === "original");
+    assert.notEqual(done.result.videoPreparation.normalSha256, movieHash);
+    for (const id of done.result.messageIds) {
+      const assets = (await a.mediaAssets("personal", id)).items;
+      assert.equal(assets.some(asset => asset.variant === "original"), quality === "original");
+      for (const variant of quality === "original" ? ["normal", "thumbnail", "original"] : ["normal", "thumbnail"]) {
+        const asset = assets.find(asset => asset.variant === variant);
+        assert.equal(asset?.state, "available");
+        const content = await a.mediaContent("personal", asset.id);
+        assert.equal(createHash("sha256").update(content.bytes).digest("hex"), asset.sha256);
+        assert.equal(content.contentType, variant === "original" ? "video/quicktime" : variant === "normal" ? "video/mp4" : "image/jpeg");
+        if (variant === "original") {
+          assert.equal(asset.filename, "original.mov");
+          assert.deepEqual(content.bytes, new Uint8Array(movie));
+        }
+        if (variant === "normal") assert.equal(asset.sha256, done.result.videoPreparation.normalSha256);
+      }
+      if (quality === "original") {
+        const savedMovie = join(temporary, "downloaded-original.mov");
+        await cli("messages", "media", "sim_mei", id, "--quality", "original", "--output", savedMovie);
+        assert.deepEqual(await readFile(savedMovie), movie);
+      }
+    }
+    assert.equal((await a.sendByKey("personal", key)).id, done.id);
+    if (quality === "original")
+      assert.equal((await cli("messages", "send", "sim_mei", "--video", moviePath, "--video-quality", quality, "--idempotency-key", key, "--detach")).id, done.id);
+    else
+      assert.equal((await a.sendMedia("personal", movieRequest, key)).id, done.id);
+  }
+
   const controlCursor = streamA.events.at(-1).cursor;
   await control({ op: "status_notification", account: "personal", operation_id: 2 });
   await control({ op: "status_notification", account: "personal", operation_id: 11 });
@@ -378,7 +583,7 @@ try {
   if (process.platform !== "win32") assert.equal(launcher.child.exitCode, 0);
   await assert.rejects(stat(launcher.ready.dataDir), error => error.code === "ENOENT");
   await assert.rejects(fetch(launcherRemote));
-  console.log(JSON.stringify({ ok: true, checks: ["real QR login and profile projection", "two SDK event consumers", "actual wx CLI status and message fetch", "direct/group CLI and API pin/unpin with independent remote refresh", "group owner capability and denied all-members send without an intent", "pin/mute independence and keyed replay", "queued/accepted/uncertain sends", "local_send without default echo", "fault-injected echo deduplication", "synthetic phone self-send and File Transfer", "incoming/live and catchup origins", "inbound push", "SSE resume", "restart and catch-up", "account isolation", "revocation/logout", "virtual clock expiry", "advertised media stays unavailable", "unhandled status controls do not block live messages", "unknown sync retention", "launcher startup/shutdown and cleanup"] }));
+  console.log(JSON.stringify({ ok: true, checks: ["real QR login and profile projection", "two SDK event consumers", "actual wx CLI status and message fetch", "direct/group CLI and API pin/unpin with independent remote refresh", "group owner capability and denied all-members send without an intent", "pin/mute independence and keyed replay", "queued/accepted/uncertain sends", "quoted SDK and CLI member/Everyone mentions, inline positions, lost ACKs and restart recovery", "local_send without default echo", "fault-injected echo deduplication", "synthetic phone self-send and File Transfer", "50 MP image preparation, cached copies and idempotent replay", "legacy MOV normal/original CLI/API sends, exact original download and idempotent replay", "incoming/live and catchup origins", "inbound push", "SSE resume", "restart and catch-up", "account isolation", "revocation/logout", "virtual clock expiry", "advertised media stays unavailable", "unhandled status controls do not block live messages", "unknown sync retention", "launcher startup/shutdown and cleanup"] }));
 } finally {
   for (const subscription of subscriptions) subscription.controller.abort();
   await Promise.allSettled(subscriptions.map(subscription => subscription.done));

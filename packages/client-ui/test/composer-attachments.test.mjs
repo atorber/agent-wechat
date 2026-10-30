@@ -7,6 +7,8 @@ import {
   bindComposerAttachments,
   hasTransferredFiles,
   COMPOSER_MAX_SOURCE_BYTES,
+  accountAttachmentLimits,
+  attachmentSourceLimit,
 } from "../src/composer-attachments.ts";
 
 test("attachment classification uses supported MIME types, then extensions when MIME is absent", () => {
@@ -21,11 +23,23 @@ test("attachment classification uses supported MIME types, then extensions when 
     ["clip", "video/mp4", "video"],
     ["clip.MP4", "", "video"],
     ["clip.mp4", "application/octet-stream", "video"],
+    ["camera.MOV", "video/quicktime", "video"],
+    ["camera.MOV", "", "video"],
+    ["camera.mov", "application/octet-stream", "video"],
+    ["clip.3gp", "video/3gpp", "video"],
+    ["clip.3GP", "application/octet-stream", "video"],
+    ["clip.3g2", "video/3gpp2", "video"],
+    ["clip.3G2", "", "video"],
+    ["clip.mj2", "VIDEO/MJ2; codecs=jpeg2000", "video"],
+    ["clip.MJ2", "", "video"],
     ["report.pdf", "application/pdf", "file"],
     ["voice.mp3", "audio/mpeg", "file"],
     ["photo.heic", "image/heic", "file"],
     ["image.svg", "image/svg+xml", "file"],
     ["clip.webm", "video/webm", "file"],
+    ["clip.avi", "video/x-msvideo", "file"],
+    ["clip.mov", "application/pdf", "file"],
+    ["voice.3gp", "audio/3gpp", "file"],
     ["report.png", "application/pdf", "file"],
     ["unknown", "", "file"],
   ])
@@ -41,20 +55,20 @@ test("mixed batches retain every file with its detected type and enforce size/ca
   const result = reviewAttachments(files, ["image", "video", "file"]);
   assert.deepEqual(
     result.map((item) => item.kind),
-    ["image", "video", "file"]
+    ["image", "video", "file"],
   );
   assert.deepEqual(
     result.map((item) => item.file),
-    files
+    files,
   );
   assert.throws(() => reviewAttachments([], ["file"]), /Choose a file/);
   assert.throws(
     () => reviewAttachments(Array(11).fill(files[0]), ["image"]),
-    /up to 10/
+    /up to 10/,
   );
   assert.throws(
     () => reviewAttachments([new File([], "empty.txt")], ["file"]),
-    /nonempty/
+    /nonempty/,
   );
   assert.throws(
     () =>
@@ -66,13 +80,13 @@ test("mixed batches retain every file with its detected type and enforce size/ca
             size: COMPOSER_MAX_SOURCE_BYTES + 1,
           },
         ],
-        ["file"]
+        ["file"],
       ),
-    /smaller than 25 MB/
+    /file source limit is 512 MiB/,
   );
   assert.throws(
     () => reviewAttachments(files, ["file"]),
-    /doesn't support image/
+    /doesn't support image/,
   );
   assert.equal(
     reviewAttachments(
@@ -83,9 +97,63 @@ test("mixed batches retain every file with its detected type and enforce size/ca
           size: COMPOSER_MAX_SOURCE_BYTES,
         },
       ],
-      ["file"]
+      ["file"],
     ).length,
-    1
+    1,
+  );
+});
+
+test("source bounds follow kind and hub capabilities, including 80 MiB native files", () => {
+  const MiB = 1024 * 1024;
+  const capabilities = {
+    mediaUploadMaxBytes: 512 * MiB,
+    mediaSendMaxBytes: {
+      file: 512 * MiB,
+      video: 50 * MiB,
+      image: 25 * MiB - 17,
+    },
+  };
+  const native = accountAttachmentLimits(capabilities);
+  const review = (name, size, limits = native) =>
+    reviewAttachments(
+      [{ name, size, type: "" }],
+      ["file", "video", "image"],
+      limits,
+    );
+  assert.equal(review("large.bin", 80 * MiB)[0].kind, "file");
+  assert.equal(review("limit.bin", 512 * MiB)[0].kind, "file");
+  assert.equal(review("clip.mov", 50 * MiB)[0].kind, "video");
+  assert.throws(
+    () => review("clip.mov", 80 * MiB),
+    /video source limit is 50 MiB/,
+  );
+  assert.throws(
+    () => review("photo.jpg", 80 * MiB),
+    /image source limit is just under 25 MiB/,
+  );
+  const simulator = accountAttachmentLimits({
+    mediaUploadMaxBytes: 25 * MiB - 17,
+    mediaSendMaxBytes: { file: 25 * MiB - 17 },
+  });
+  assert.throws(
+    () => review("large.bin", 80 * MiB, simulator),
+    /file source limit is just under 25 MiB/,
+  );
+  assert.equal(
+    accountAttachmentLimits({}).file,
+    attachmentSourceLimit("image"),
+  );
+  assert.equal(
+    accountAttachmentLimits({
+      mediaUploadMaxBytes: 0,
+      mediaSendMaxBytes: { file: Infinity },
+    }).file,
+    attachmentSourceLimit("image"),
+  );
+  assert.equal(
+    accountAttachmentLimits({ ...capabilities, mediaUploadMaxBytes: 64 * MiB })
+      .file,
+    64 * MiB,
   );
 });
 
@@ -104,7 +172,7 @@ function binding(t) {
   const remove = bindComposerAttachments(
     root,
     (files) => received.push(files),
-    (value) => hover.push(value)
+    (value) => hover.push(value),
   );
   t.after(() => {
     remove();
@@ -121,7 +189,7 @@ function binding(t) {
       Object.defineProperty(
         event,
         name === "paste" ? "clipboardData" : "dataTransfer",
-        { value: transfer }
+        { value: transfer },
       );
       root.dispatchEvent(event);
       return event;
@@ -174,7 +242,7 @@ test("protected drag data shows a drop target; nested drag leaves, dropping and 
   assert.equal(handler.hover.at(-1), false);
   assert.equal(
     handler.fire("drop", data([], ["text/plain"])).defaultPrevented,
-    false
+    false,
   );
 });
 

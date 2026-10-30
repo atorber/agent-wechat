@@ -2,9 +2,10 @@ import {
   type MediaJob,
   type MediaKind,
   type NativeWeChatClient,
+  type VideoSendQuality,
 } from "@agent-wechat/shared";
 import { pause, readableError } from "./session.ts";
-import { COMPOSER_MAX_SOURCE_BYTES } from "./composer-attachments.ts";
+import { validateAttachmentSource } from "./composer-attachments.ts";
 
 export type PendingMedia = {
   key: string;
@@ -12,6 +13,7 @@ export type PendingMedia = {
   name: string;
   kind: MediaKind;
   size: number;
+  videoQuality?: VideoSendQuality;
   stage:
     | "uploading"
     | "submitting"
@@ -95,15 +97,12 @@ export class MediaOutbox {
     threadId: string,
     file: FileSource,
     kind: MediaKind,
+    videoQuality: VideoSendQuality = "normal",
   ): Promise<void> {
     if (this.controller.signal.aborted) return;
-    if (
-      !file.size ||
-      file.size > COMPOSER_MAX_SOURCE_BYTES
-    )
-      throw new Error("Choose a file smaller than 25 MB.");
     if (!threadId || !["file", "image", "video", "voice"].includes(kind))
       throw new Error("Choose a conversation and attachment type.");
+    validateAttachmentSource(file, kind === "voice" ? "image" : kind as "image" | "video" | "file");
     const key = crypto.randomUUID();
     this.value = [
       ...this.value,
@@ -113,6 +112,7 @@ export class MediaOutbox {
         name: file.name,
         kind,
         size: file.size,
+        ...(kind === "video" ? { videoQuality } : {}),
         stage: "uploading",
       },
     ];
@@ -123,7 +123,7 @@ export class MediaOutbox {
     try {
       const source = await this.client.upload(
         this.account,
-        new Uint8Array(await file.arrayBuffer()),
+        file instanceof Blob ? file : new Uint8Array(await file.arrayBuffer()),
         file.name,
         file.type || "application/octet-stream",
         AbortSignal.any([upload.signal, this.controller.signal]),
@@ -141,6 +141,7 @@ export class MediaOutbox {
           thumbnailSourceId: null,
           playSeconds: null,
           durationMs: null,
+          ...(kind === "video" ? { videoQuality } : {}),
         },
         key,
       );
@@ -169,7 +170,13 @@ export class MediaOutbox {
       job,
       stage: "job",
       uncertain: job.state === "needs_review",
-      error: undefined,
+      error: job.state === "failed"
+        ? job.reason === "image_decode_limit"
+          ? "Image is too large to process. Resize it or send it as a file."
+          : job.reason === "image_decode_failed"
+            ? "Couldn't read this image. Try exporting it as JPEG or PNG."
+            : undefined
+        : undefined,
     });
   }
   async check(key: string): Promise<void> {

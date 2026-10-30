@@ -32,6 +32,8 @@ const moved = {
   'use/quoted-replies': 'use/cli',
   'use/downloads': 'use/settings',
   'reference/environment-vars': 'reference/configuration',
+  'reference/rust-protocol': 'reference/rust-libraries#send-one-text-message',
+  'reference/rust-profile': 'reference/rust-libraries#profile-writes',
 };
 
 export default defineConfig({
@@ -109,6 +111,7 @@ export default defineConfig({
           { label: 'CLI', translations: { 'zh-CN': 'CLI 命令' }, slug: 'reference/cli' },
           { label: 'Configuration', translations: { 'zh-CN': '配置选项' }, slug: 'reference/configuration' },
           { label: 'API tokens', translations: { 'zh-CN': 'API 令牌' }, slug: 'reference/tokens' },
+          { label: 'Rust libraries', slug: 'reference/rust-libraries' },
           { label: 'Troubleshooting', translations: { 'zh-CN': '故障排查' }, slug: 'reference/troubleshooting' },
           { label: 'Build from source', translations: { 'zh-CN': '源码构建' }, slug: 'reference/build' },
         ] },

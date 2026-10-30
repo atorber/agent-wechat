@@ -6,7 +6,7 @@ import { readFile, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NativeWeChatClient } from "../packages/shared/dist/index.js";
+import { NativeApiError, NativeWeChatClient } from "../packages/shared/dist/index.js";
 import { HubSession } from "../packages/client-ui/src/session.ts";
 import { HistorySearch } from "../packages/client-ui/src/history-search.ts";
 import { LoginAttempt } from "../packages/client-ui/src/login-attempt.ts";
@@ -39,6 +39,38 @@ async function wait(label, condition, timeout = 30000) {
     await new Promise((done) => setTimeout(done, 40));
   }
   throw new Error(`Timed out: ${label}`, { cause: last });
+}
+async function successfulOperation(label, operation) {
+  const result = await wait(label, async () => {
+    const current = await client.operation(operation.accountId, operation.id);
+    return (
+      ["succeeded", "failed", "cancelled", "needs_review"].includes(current.state) &&
+      current
+    );
+  });
+  assert.equal(result.state, "succeeded", `${label}: ${JSON.stringify(result)}`);
+  return result;
+}
+async function connectWhenIdle(account) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    try {
+      return await client.connect(account);
+    } catch (error) {
+      // A busy account rejects login before admitting an operation. Reads or
+      // the previous worker can briefly retain its gate after polling finishes.
+      // Never resubmit after a transport error or an uncertain admission.
+      if (
+        !(error instanceof NativeApiError) ||
+        error.status !== 409 ||
+        error.code !== "operation_in_progress" ||
+        Date.now() >= deadline
+      ) {
+        throw error;
+      }
+      await new Promise((done) => setTimeout(done, 40));
+    }
+  }
 }
 async function start(command, args = []) {
   const child = spawn(binary, [command, "--data-dir", data, ...args], {
@@ -580,6 +612,13 @@ try {
       .length,
     1
   );
+  // Exercise manual history sync independently of the restarted push loop.
+  // Push/replay assertions above and below keep their normal connected account.
+  await client.disconnect("personal");
+  assert.equal(
+    (await client.account("personal")).incomingTransport,
+    "disconnected"
+  );
   await control({ op: "advance", seconds: 1 });
   for (let index = 0; index < 110; index++)
     await control({
@@ -589,12 +628,20 @@ try {
       body: `History pagination fixture ${index}`,
       notify: false,
     });
-  const searchSync = await client.sync("personal");
-  await wait(
-    "search history synchronized",
-    async () =>
-      (await client.operation("personal", searchSync.id)).state === "succeeded"
-  );
+  let historyDrained = false;
+  // Manual sync exposes continuation pages; the fixture must drain them itself.
+  for (let page = 0; page < 8; page++) {
+    const synced = await successfulOperation(
+      `search history page ${page + 1} synchronized`,
+      await client.sync("personal")
+    );
+    assert.equal(typeof synced.result.continuation, "boolean");
+    if (!synced.result.continuation) {
+      historyDrained = true;
+      break;
+    }
+  }
+  assert.ok(historyDrained, "search fixture history drained within eight pages");
   await wait(
     "all search fixtures committed",
     async () =>
@@ -621,6 +668,13 @@ try {
   while (historySearch.snapshot().nextCursor) await historySearch.more();
   assert.equal(historySearch.snapshot().items.length, 110);
   historySearch.close();
+  await successfulOperation(
+    "search fixture account reconnected",
+    await connectWhenIdle("personal")
+  );
+  await wait("search fixture push resumed", async () =>
+    (await client.account("personal")).incomingTransport === "simulator_push"
+  );
   await client.createAccount("login-resume");
   let savedLogin = null;
   const loginStorage = {

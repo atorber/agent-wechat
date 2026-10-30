@@ -1,5 +1,60 @@
 # @agent-wechat/cli
 
+## 1.3.2
+
+### Patch Changes
+
+- [#353](https://github.com/thisnick/agent-wechat/pull/353) [`e882dc3`](https://github.com/thisnick/agent-wechat/commit/e882dc3e2c8b4be4b1b6104a871aaf3152a48f4e) Thanks [@thisnick](https://github.com/thisnick)! - Fix slow startup by avoiding repeated full-profile reads for completed recall history.
+
+## 1.3.1
+
+### Patch Changes
+
+- [#343](https://github.com/thisnick/agent-wechat/pull/343) [`139e9e8`](https://github.com/thisnick/agent-wechat/commit/139e9e85a9180fac8e40a4f139bafacbbd3cd396) Thanks [@thisnick](https://github.com/thisnick)! - Recognize MOV, 3GP, 3G2 and MJ2 attachments as videos and prepare them as MP4 playback, including older QuickTime movies without an `ftyp` header. Add an Original video choice in the desktop and web attachment review to include the unchanged source alongside playback. Use the verified container type for original-video download extensions and show a fallback when the browser cannot preview a selected video.
+
+- [#345](https://github.com/thisnick/agent-wechat/pull/345) [`956459a`](https://github.com/thisnick/agent-wechat/commit/956459a75980a6099b1472bdceb1cdd72a4c1f47) Thanks [@thisnick](https://github.com/thisnick)! - Allow group mentions in quoted text replies, retaining the original mention names and quote reference across recovery. Add quotes for ordinary/shared stickers, music/video cards, shared contacts, static locations and forwarded-message summaries while keeping unsupported or recalled targets blocked.
+
+## 1.3.1-beta.0
+
+### Patch Changes
+
+- [#343](https://github.com/thisnick/agent-wechat/pull/343) [`139e9e8`](https://github.com/thisnick/agent-wechat/commit/139e9e85a9180fac8e40a4f139bafacbbd3cd396) Thanks [@thisnick](https://github.com/thisnick)! - Recognize MOV, 3GP, 3G2 and MJ2 attachments as videos and prepare them as MP4 playback, including older QuickTime movies without an `ftyp` header. Add an Original video choice in the desktop and web attachment review to include the unchanged source alongside playback. Use the verified container type for original-video download extensions and show a fallback when the browser cannot preview a selected video.
+
+- [#345](https://github.com/thisnick/agent-wechat/pull/345) [`956459a`](https://github.com/thisnick/agent-wechat/commit/956459a75980a6099b1472bdceb1cdd72a4c1f47) Thanks [@thisnick](https://github.com/thisnick)! - Allow group mentions in quoted text replies, retaining the original mention names and quote reference across recovery. Add quotes for ordinary/shared stickers, music/video cards, shared contacts, static locations and forwarded-message summaries while keeping unsupported or recalled targets blocked.
+
+## 1.3.0
+
+### Minor Changes
+
+- [#328](https://github.com/thisnick/agent-wechat/pull/328) [`28f8ea8`](https://github.com/thisnick/agent-wechat/commit/28f8ea85f08d2811b162dc84b228a3ab6c25f690) Thanks [@thisnick](https://github.com/thisnick)! - Receive and read static location pins from profile history as structured coordinates, place names and addresses, with a readable text body. Location cards provide a place search near the shared coordinates, a direct Google Maps pin and coordinate copying, without converting coordinates. Preserve the supplied map type and leave the coordinate system unknown. Show location-sharing notices (application subtype 17) as supplied text without joining live tracking. OpenClaw applies its existing sender, mention and recall rules. Retained static pins can recover into ordinary profile history; live-tracking controls remain separate and unsupported. Location thumbnails and official preview-cache compatibility are not implemented.
+
+- [#340](https://github.com/thisnick/agent-wechat/pull/340) [`5aef80e`](https://github.com/thisnick/agent-wechat/commit/5aef80ef4c3b43ac655ff7c4900690b87dafeff6) Thanks [@thisnick](https://github.com/thisnick)! - Publish the Rust protocol and official-profile libraries, with their media and
+  platform dependencies, as part of the native release. Add Rust library reference
+  documentation, standalone package validation and checks for aligned dependency
+  versions and safe publication recovery.
+
+### Patch Changes
+
+- [#334](https://github.com/thisnick/agent-wechat/pull/334) [`a940706`](https://github.com/thisnick/agent-wechat/commit/a940706d1f290936d2cfa343e0b6a7872e1c08b7) Thanks [@thisnick](https://github.com/thisnick)! - Allow history and cached media reads to run alongside account updates using request-owned WAL snapshots. Separate incoming download limits from the send queue, release the account writer during download and sync network waits, and preserve login, cancellation and local repair checks before committing results. Keep serialized reads for other journal modes and expose read timings in HTTP response headers.
+
+- [#332](https://github.com/thisnick/agent-wechat/pull/332) [`a064296`](https://github.com/thisnick/agent-wechat/commit/a064296263ddf11f0c26c30ef40d70f280bccdac) Thanks [@thisnick](https://github.com/thisnick)! - Restrict group-wide mentions to the group owner and administrators. Refresh the administrator list from WeChat into the official profile and expose administrator IDs and mention eligibility through group info. Check permission before queuing and submitting a new message, while retaining existing send receipts and idempotency.
+
+  Show Everyone in the composer when the server permits it, preserve drafts after permission changes, and retain the existing behavior with older servers that omit the permission field.
+
+- [#338](https://github.com/thisnick/agent-wechat/pull/338) [`bb2c31b`](https://github.com/thisnick/agent-wechat/commit/bb2c31bbe003647bbacbd9da03161c950281bc88) Thanks [@thisnick](https://github.com/thisnick)! - Prepare large JPEG photos with reduced-resolution decoding, including 50-megapixel camera images, while retaining source, dimension and output limits. Show an actionable error when an image exceeds processing limits or cannot be decoded, without retrying its send automatically.
+
+- [`7527cfc`](https://github.com/thisnick/agent-wechat/commit/7527cfc455be74b258cba34f75f38523b59ba1c7) Thanks [@thisnick](https://github.com/thisnick)! - Declare the project MIT license in package metadata and include its text with npm packages, native release notices, desktop resources, and the native container. Preserve all existing third-party license notices.
+
+- [#328](https://github.com/thisnick/agent-wechat/pull/328) [`28f8ea8`](https://github.com/thisnick/agent-wechat/commit/28f8ea85f08d2811b162dc84b228a3ab6c25f690) Thanks [@thisnick](https://github.com/thisnick)! - Show plain system notices, including location-sharing end notices, with their supplied text and without attributing the transport peer as their author. Desktop and web clients display them as centered notices without an avatar or sender name. Recall messages retain their separate author-evidence handling, and raw system XML is not exposed as message text.
+
+- [#328](https://github.com/thisnick/agent-wechat/pull/328) [`28f8ea8`](https://github.com/thisnick/agent-wechat/commit/28f8ea85f08d2811b162dc84b228a3ab6c25f690) Thanks [@thisnick](https://github.com/thisnick)! - Correct the cancellation and codec-format fields in outgoing voice uploads so SILK notes declare format 4 in the transmitted request, including continuation and final ranges.
+
+## 1.3.0-beta.1
+
+### Patch Changes
+
+- [#338](https://github.com/thisnick/agent-wechat/pull/338) [`bb2c31b`](https://github.com/thisnick/agent-wechat/commit/bb2c31bbe003647bbacbd9da03161c950281bc88) Thanks [@thisnick](https://github.com/thisnick)! - Prepare large JPEG photos with reduced-resolution decoding, including 50-megapixel camera images, while retaining source, dimension and output limits. Show an actionable error when an image exceeds processing limits or cannot be decoded, without retrying its send automatically.
+
 ## 1.3.0-beta.0
 
 ### Minor Changes

@@ -1073,6 +1073,20 @@ impl Core {
         asset.animation_frames = if mime == "image/x-wxgf" { None } else { frames };
         if mime == "image/x-wxgf" {
             asset.filename = Some(format!("{id}.wxgf"));
+        } else if asset.kind == MediaKind::Video
+            && asset.variant == MediaVariant::Original
+            && asset.filename.as_deref() == Some("original.mp4")
+        {
+            let extension = match mime {
+                "video/quicktime" => Some("mov"),
+                "video/3gpp" => Some("3gp"),
+                "video/3gpp2" => Some("3g2"),
+                "video/mj2" => Some("mj2"),
+                _ => None,
+            };
+            if let Some(extension) = extension {
+                asset.filename = Some(format!("original.{extension}"));
+            }
         }
         let sealed = self
             .vault
@@ -2025,11 +2039,9 @@ fn validate_media_bytes(kind: MediaKind, bytes: &[u8]) -> Result<(String, Option
             Ok((result.content_type, frames))
         }
         MediaKind::Video => {
-            ensure!(
-                bytes.len() >= 12 && bytes[4..8] == *b"ftyp",
-                "media_integrity_failed"
-            );
-            Ok(("video/mp4".into(), None))
+            let content_type = wechat_media::inspect_video_container(bytes)
+                .map_err(|_| anyhow::anyhow!("media_integrity_failed"))?;
+            Ok((content_type.into(), None))
         }
         MediaKind::File => Ok(("application/octet-stream".into(), None)),
         MediaKind::Voice => {
@@ -2817,11 +2829,7 @@ impl Core {
                     self.phase_media(account, id, "uploading")?;
                     let fence = self.media_authorization_fence(account)?;
                     let uploaded = cdn_transfer(permit.as_deref_mut(), self, account, || {
-                        raw_cdn.native()?.upload_video_original_with_progress(
-                            &prepared,
-                            raw_material.task_id,
-                            callback,
-                        )
+                        raw_cdn.upload_video_original(&prepared, raw_material.task_id, &callback)
                     })?;
                     plan.uploaded_video.as_mut().unwrap().original = Some(uploaded);
                     self.save_send_plan(account, id, &plan)?;
@@ -3242,7 +3250,11 @@ impl Core {
                                     .original
                                     .as_ref()
                                     .context("uploaded_media_missing")?;
-                                (bytes.clone().into(), original.sha256.clone(), "video/mp4")
+                                (
+                                    bytes.clone().into(),
+                                    original.sha256.clone(),
+                                    wechat_media::inspect_video_container(&bytes)?,
+                                )
                             } else {
                                 continue;
                             }
@@ -3295,23 +3307,15 @@ fn image_variants(
     standard: Option<Vec<u8>>,
     thumbnail: Option<Vec<u8>>,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    reader.limits(limits);
-    let decoded = reader.decode()?;
-    ensure!(
-        decoded.width() as u64 * decoded.height() as u64 <= 16_777_216,
-        "image_decode_limit"
-    );
-    let original =
-        if bytes.len() <= 65520 && image::guess_format(bytes)? == image::ImageFormat::Jpeg {
-            bytes.to_vec()
-        } else {
-            fit_jpeg(&decoded, 1280, 65520)?
-        };
+    let decoded = decode_send_image(bytes)?;
+    let original = if bytes.len() <= 65520
+        && image::guess_format(bytes)? == image::ImageFormat::Jpeg
+        && wechat_protocol::media::inspect_image(bytes).is_ok()
+    {
+        bytes.to_vec()
+    } else {
+        fit_jpeg(&decoded, 1280, 65520)?
+    };
     let original_image = image::load_from_memory(&original)?;
     let supplied_jpeg = |raw: Vec<u8>| -> Result<Vec<u8>> {
         ensure!(
@@ -3332,6 +3336,76 @@ fn image_variants(
     };
     Ok((original, standard, thumbnail))
 }
+
+fn image_decode_error(error: image::ImageError) -> anyhow::Error {
+    anyhow::anyhow!(match error {
+        image::ImageError::Limits(_) => "image_decode_limit",
+        image::ImageError::Unsupported(_) => "unsupported_media",
+        _ => "image_decode_failed",
+    })
+}
+
+fn decode_send_image(bytes: &[u8]) -> Result<image::DynamicImage> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_ORDINARY_SOURCE_BYTES,
+        "source_size_limit"
+    );
+    let format = image::guess_format(bytes).map_err(image_decode_error)?;
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(image_decode_error)?;
+    let pixels = u64::from(width) * u64::from(height);
+    ensure!(
+        width > 0 && height > 0 && width <= 8192 && height <= 8192,
+        "image_decode_limit"
+    );
+    if format == image::ImageFormat::Jpeg && pixels > 16_777_216 {
+        // Bound source/coefficient work separately from the reduced pixel buffer.
+        // JPEG IDCT scaling avoids allocating a full 50 MP RGB image just to
+        // resize it to the existing 1280-pixel send representation.
+        ensure!(pixels <= 64_000_000, "image_decode_limit");
+        return decode_large_send_jpeg(bytes);
+    }
+    ensure!(pixels <= 16_777_216, "image_decode_limit");
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(image_decode_error)
+}
+
+fn decode_large_send_jpeg(bytes: &[u8]) -> Result<image::DynamicImage> {
+    use jpeg_decoder::PixelFormat;
+
+    let failure = |_| anyhow::anyhow!("image_decode_failed");
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_max_decoding_buffer_size(128 * 1024 * 1024);
+    decoder.read_info().map_err(failure)?;
+    let info = decoder.info().context("image_decode_failed")?;
+    ensure!(
+        matches!(info.pixel_format, PixelFormat::L8 | PixelFormat::RGB24),
+        "unsupported_media"
+    );
+    let (width, height) = decoder.scale(1280, 1280).map_err(failure)?;
+    let (width, height) = (u32::from(width), u32::from(height));
+    ensure!(
+        u64::from(width) * u64::from(height) <= 16_777_216,
+        "image_decode_limit"
+    );
+    let pixels = decoder.decode().map_err(failure)?;
+    match info.pixel_format {
+        PixelFormat::L8 => {
+            image::GrayImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageLuma8)
+        }
+        PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+        }
+        _ => unreachable!(),
+    }
+    .context("image_decode_failed")
+}
 fn fit_jpeg(image: &image::DynamicImage, max_edge: u32, max_bytes: usize) -> Result<Vec<u8>> {
     for edge in [max_edge, max_edge / 2, max_edge / 4, max_edge / 8] {
         let resized = image.thumbnail(edge.max(1), edge.max(1)).to_rgb8();
@@ -3349,6 +3423,7 @@ fn fit_jpeg(image: &image::DynamicImage, max_edge: u32, max_bytes: usize) -> Res
 fn run_ffmpeg(
     input: &[u8],
     output: &str,
+    input_formats: &str,
     options: &[&str],
     mut cancelled: impl FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
@@ -3367,20 +3442,34 @@ fn run_ffmpeg(
     f.write_all(input)?;
     drop(f);
     let mut command = Command::new("ffmpeg");
+    command.args([
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-protocol_whitelist",
+        if input_formats == "mov" {
+            "file"
+        } else {
+            "file,pipe"
+        },
+        "-format_whitelist",
+        input_formats,
+        "-threads",
+        "1",
+    ]);
+    if input_formats == "mov" {
+        command.args([
+            "-max_alloc",
+            "67108864",
+            "-enable_drefs",
+            "0",
+            "-use_absolute_path",
+            "0",
+        ]);
+    }
     command
-        .args([
-            "-v",
-            "error",
-            "-nostdin",
-            "-y",
-            "-protocol_whitelist",
-            "file,pipe",
-            "-format_whitelist",
-            "wav,mp3,flac,ogg,aac,mov,matroska,webm",
-            "-threads",
-            "1",
-            "-i",
-        ])
+        .arg("-i")
         .arg(&input_path)
         .args(options)
         .args(["-fs", "33554432"])
@@ -3494,6 +3583,7 @@ fn audio_pcm(bytes: &[u8], cancelled: impl FnMut() -> Result<()>) -> Result<Vec<
     let raw = run_ffmpeg(
         bytes,
         "audio.pcm",
+        "wav,mp3,flac,ogg,aac,mov,matroska,webm",
         &[
             "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-t", "301",
         ],
@@ -3513,6 +3603,8 @@ fn video_duration(input: &[u8], mut cancelled: impl FnMut() -> Result<()>) -> Re
         io::Write,
         process::{Command, Stdio},
     };
+    cancelled()?;
+    wechat_media::inspect_video_container(input)?;
     let dir = wechat_platform::private_tempdir("wechat-media-")?;
     let input_path = dir.path().join("input.bin");
     let result_path = dir.path().join("probe.json");
@@ -3532,10 +3624,16 @@ fn video_duration(input: &[u8], mut cancelled: impl FnMut() -> Result<()>) -> Re
         .args([
             "-v",
             "error",
+            "-max_alloc",
+            "67108864",
             "-protocol_whitelist",
-            "file,pipe",
+            "file",
             "-format_whitelist",
             "mov",
+            "-enable_drefs",
+            "0",
+            "-use_absolute_path",
+            "0",
             "-show_entries",
             "format=duration",
             "-of",
@@ -3593,9 +3691,11 @@ fn video_duration(input: &[u8], mut cancelled: impl FnMut() -> Result<()>) -> Re
     Ok(duration.ceil() as u32)
 }
 fn video_thumbnail(bytes: &[u8], cancelled: impl FnMut() -> Result<()>) -> Result<Vec<u8>> {
+    wechat_media::inspect_video_container(bytes)?;
     let jpeg = run_ffmpeg(
         bytes,
         "thumb.jpg",
+        "mov",
         &[
             "-frames:v",
             "1",
@@ -4929,6 +5029,130 @@ mod tests {
         assert!(core.media_content("two", "asset_synthetic").is_err());
     }
     #[test]
+    fn verified_original_video_cache_uses_its_container_extension_without_renaming_other_files() {
+        let (_dir, core) = test_core();
+        fn movie(brand: &[u8; 4]) -> Vec<u8> {
+            fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+                let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+                bytes.extend_from_slice(kind);
+                bytes.extend_from_slice(payload);
+                bytes
+            }
+            [
+                atom(b"ftyp", &[brand.as_slice(), &[0; 4]].concat()),
+                atom(b"moov", &[0; 8]),
+                atom(b"mdat", b"synthetic container media"),
+            ]
+            .concat()
+        }
+        for (index, (brand, mime, kind, variant, name, expected)) in [
+            (
+                b"qt  ",
+                "video/quicktime",
+                "video",
+                "original",
+                "original.mp4",
+                "original.mov",
+            ),
+            (
+                b"3gp4",
+                "video/3gpp",
+                "video",
+                "original",
+                "original.mp4",
+                "original.3gp",
+            ),
+            (
+                b"3g2a",
+                "video/3gpp2",
+                "video",
+                "original",
+                "original.mp4",
+                "original.3g2",
+            ),
+            (
+                b"mjp2",
+                "video/mj2",
+                "video",
+                "original",
+                "original.mp4",
+                "original.mj2",
+            ),
+            (
+                b"isom",
+                "video/mp4",
+                "video",
+                "original",
+                "original.mp4",
+                "original.mp4",
+            ),
+            (
+                b"qt  ",
+                "video/quicktime",
+                "file",
+                "original",
+                "original.mp4",
+                "original.mp4",
+            ),
+            (
+                b"qt  ",
+                "video/quicktime",
+                "video",
+                "normal",
+                "video.mp4",
+                "video.mp4",
+            ),
+            (
+                b"qt  ",
+                "video/quicktime",
+                "video",
+                "original",
+                "custom.mp4",
+                "custom.mp4",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = movie(brand);
+            assert_eq!(wechat_media::inspect_video_container(&bytes).unwrap(), mime);
+            let id = format!("asset_movie_filename_{index}");
+            let asset: MediaAsset = serde_json::from_value(json!({
+                "id":id, "accountId":"one", "kind":kind, "variant":variant,
+                "filename":name, "state":"pending", "retryable":true,
+                "officialWriteback":"unsupported"
+            }))
+            .unwrap();
+            core.store
+                .put_media_asset(
+                    "one",
+                    &MediaAssetRecord {
+                        id: id.clone(),
+                        message_id: None,
+                        variant: variant.into(),
+                        kind: kind.into(),
+                        metadata: serde_json::to_value(&asset).unwrap(),
+                        plan: vec![],
+                        payload: None,
+                    },
+                )
+                .unwrap();
+            let available = core
+                .cache_asset("one", &id, &bytes, mime, Some(asset.variant), None)
+                .unwrap();
+            assert_eq!(available.filename.as_deref(), Some(expected));
+            assert_eq!(available.content_type.as_deref(), Some(mime));
+            assert_eq!(
+                core.media_asset("one", &id).unwrap().filename.as_deref(),
+                Some(expected)
+            );
+            let content = core.media_content("one", &id).unwrap();
+            assert_eq!(content.bytes, bytes);
+            assert_eq!(content.content_type, mime);
+            assert_eq!(content.filename.as_deref(), Some(expected));
+        }
+    }
+    #[test]
     fn wxgf_source_and_preview_remain_distinct_encrypted_account_scoped_and_restartable() {
         let (dir, core) = test_core();
         let raw = include_bytes!("../../wechat-media/tests/fixtures/static.wxgf");
@@ -5220,6 +5444,81 @@ mod tests {
             wechat_protocol::media::inspect_image(bytes).unwrap();
         }
         assert_ne!(digest(&a), digest(&c));
+    }
+    #[test]
+    fn large_jpeg_preparation_scales_before_allocating_output_pixels() {
+        for compressed in [
+            include_bytes!("../tests/fixtures/send-images/50mp-baseline.jpg.zst").as_slice(),
+            include_bytes!("../tests/fixtures/send-images/50mp-progressive.jpg.zst").as_slice(),
+        ] {
+            let source = zstd::stream::decode_all(compressed).unwrap();
+            let decoded = decode_send_image(&source).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (1532, 2040));
+            assert!(decoded.as_bytes().len() < 10 * 1024 * 1024);
+            let top = decoded.to_rgb8().get_pixel(0, 0).0;
+            assert!(top[2] > top[0] + 100, "lost the synthetic blue pixels");
+            let (original, standard, thumbnail) = image_variants(&source, None, None).unwrap();
+            for (bytes, edge) in [(&original, 1280), (&standard, 640), (&thumbnail, 160)] {
+                let inspected = wechat_protocol::media::inspect_image(bytes).unwrap();
+                assert!(inspected.width <= edge && inspected.height <= edge);
+                assert!(bytes.len() <= 65520);
+            }
+            assert_ne!(digest(&source), digest(&original));
+            assert!(decode_send_image(&source[..source.len() / 2]).is_err());
+        }
+    }
+    #[test]
+    fn image_source_limits_are_checked_before_decoding_pixels() {
+        let source = zstd::stream::decode_all(
+            include_bytes!("../tests/fixtures/send-images/50mp-baseline.jpg.zst").as_slice(),
+        )
+        .unwrap();
+        let marker = source.windows(2).position(|b| b == [0xff, 0xc0]).unwrap();
+        for (width, height) in [(8192u16, 8192u16), (8193, 100)] {
+            let mut oversized = source.clone();
+            oversized[marker + 5..marker + 7].copy_from_slice(&height.to_be_bytes());
+            oversized[marker + 7..marker + 9].copy_from_slice(&width.to_be_bytes());
+            let error = decode_send_image(&oversized).unwrap_err();
+            assert_eq!(classify_error(&error), "image_decode_limit");
+        }
+        let mut oversized_png = std::io::Cursor::new(vec![]);
+        image::DynamicImage::new_luma8(4097, 4096)
+            .write_to(&mut oversized_png, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(
+            classify_error(&decode_send_image(oversized_png.get_ref()).unwrap_err()),
+            "image_decode_limit"
+        );
+        assert_eq!(
+            classify_error(&image_decode_error(image::ImageError::Limits(
+                image::error::LimitError::from_kind(
+                    image::error::LimitErrorKind::InsufficientMemory
+                )
+            ))),
+            "image_decode_limit"
+        );
+    }
+    #[test]
+    fn large_grayscale_jpeg_preparation_retains_luminance() {
+        let source = zstd::stream::decode_all(
+            include_bytes!("../tests/fixtures/send-images/50mp-gray.jpg.zst").as_slice(),
+        )
+        .unwrap();
+        let decoded = decode_send_image(&source).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1532, 2040));
+        assert_eq!(decoded.as_luma8().unwrap().get_pixel(0, 0).0, [128]);
+        let (original, _, _) = image_variants(&source, None, None).unwrap();
+        wechat_protocol::media::inspect_image(&original).unwrap();
+    }
+    #[test]
+    fn small_jpeg_source_bytes_are_still_preserved() {
+        let mut source = std::io::Cursor::new(vec![]);
+        image::DynamicImage::new_rgb8(80, 60)
+            .write_to(&mut source, image::ImageFormat::Jpeg)
+            .unwrap();
+        let source = source.into_inner();
+        let (original, _, _) = image_variants(&source, None, None).unwrap();
+        assert_eq!(source, original);
     }
     #[test]
     fn accepted_local_xml_preserves_distinct_variants_and_escapes_opaque_ids() {
