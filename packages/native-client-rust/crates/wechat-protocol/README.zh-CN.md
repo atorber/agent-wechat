@@ -4,6 +4,36 @@
 
 针对 Linux 4.1.13.26 Profile 的同步阻塞式原生协议库。这是使用 OpenSSL 原语实现的纯 Rust 协议代码；它不执行 Node 也不加载官方微信可执行文件或动态库。异步调用方必须使用阻塞 Worker。
 
+## 从 NativeClient 开始
+
+大部分服务端操作都是 [`NativeClient`](https://docs.rs/wechat-protocol/latest/wechat_protocol/struct.NativeClient.html) 上的方法。Crate 顶层的函数列表主要包含辅助工具函数。
+
+| 任务 | API 方法 |
+| --- | --- |
+| 登录认证 | `start_qr_login`、`poll_login`、`complete_login` |
+| 接收与同步 | `sync`、`sync_scene`、`heartbeat`、`push_connection` |
+| 发送消息 | `send_text`、`send_share`、`send_quote`、`send_file`、`send_image`、`send_video`、`send_voice` |
+| 联系人与群 | `lookup_contacts`、`lookup_room`、`init_contacts` |
+| 底层操作 | `wire`、`media`、群聊请求构建器与响应解码器 |
+
+`AccountState` 保存已被服务端接受的凭据，并以可变引用形式传入，因为服务端响应可能会更新凭据或路由状态。后台守护进程的原生上游适配器调用这些 API；并在其之上提供了账号协调、故障恢复与 Profile 数据回写能力。部分底层操作使用请求构建器、客户端 RPC 方法与解码器组合完成，而非单一的快捷方法。
+
+在本地代码仓库中，可以直接运行以下示例：
+
+```bash
+cargo run --manifest-path packages/native-client-rust/Cargo.toml -p wechat-protocol --example qr_login
+cargo run --manifest-path packages/native-client-rust/Cargo.toml -p wechat-protocol --example send_text -- RECIPIENT UNIQUE_TASK_ID "来自 Rust 示例的问候"
+cargo run --manifest-path packages/native-client-rust/Cargo.toml -p wechat-protocol --example sync_once
+```
+
+每个示例都会为测试账号请求全新的二维码登录，打印私有临时 PNG 路径并等待手机端确认。登录成功后二维码即刻删除；凭据仅保存在内存中。`send_text` 仅提交一次并输出回执；`sync_once` 汇总一页同步结果，不保存历史或游标。这些是独立运行的示例，并非连接已有守护进程的客户端。全新登录可能会顶掉其他活跃的桌面端登录。运行 `--help` 不会发起任何网络请求。
+
+发送消息需要传入确切的微信号（用户名），而非好友备注或昵称。任务 ID 并不等同于服务端绝对幂等保证：在重新提交之前，必须先核实状态未决的发送。生产应用程序在提交前必须持久化保存该操作及其时间戳，并对敏感的账号状态进行加密存储。
+
+使用已认证账号发送文本的简短代码示例请参见 [Rust 开发库指南](https://thisnick.github.io/agent-wechat/zh-cn/reference/rust-libraries/#发送单条文本消息)。
+
+## 传输层与受支持的操作
+
 传输层在解码业务消息之前，会对配置的公共服务端证书公钥固定（Pin）、握手 Finished 值、每个 GCM 记录、业务签名（凭据 1）以及业务 GCM 信封进行严格鉴权。不存在任何不安全的对等端或签名绕过设置。仅接受来自已认证响应的路由重定向，且严格限制在受支持的官方域名后缀中。
 
 条件性局域网登录挑战属于实验性功能。通知中的字段 17 是包含非存储风险扩展的 SKBuffer；状态 11 会启动带有本地 IPv4 地址/端口条目、当前登录标识符和全新 16 字节 SKBuffer 的 CGI 22312。临时 TCP 监听器返回大端序的 u32 总长度，后跟包含返回的不透明令牌和字符串 `scene: "xwechat"` 的 JSON 数据。它绝不直接授予授权；常规轮询与最终鉴权依然适用。监听器/令牌状态绝不被序列化，并受取消操作和尝试截止时间的约束。针对签发的登录标识符仅尝试上传提交一次；可重复的轮询路径不会重试不确定的上传。`poll_login_guarded` 允许所有者提供更早的截止时间和非阻塞取消回调。该路径具有离线固件和模拟手机测试覆盖；真实手机/服务端验收仍未经验证。

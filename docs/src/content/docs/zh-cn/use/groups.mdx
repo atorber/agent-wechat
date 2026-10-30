@@ -118,7 +118,7 @@ wx messages send GROUP_ID --text "会议马上开始" --mention-all
 
 使用 `userIds` 或 `all: true`（二选一）。使用 `GET /sends/SEND_ID` 查询发送收据与进度。
 
-`GET /groups/GROUP_ID` 包含 `ownerId`、`administratorIds`（除非微信协议单独下发，否则不重复包含群主）以及 `canMentionAll`。`null` 权限表示根据本地已存数据尚无法确认权限资格；请先刷新群成员后再重试。普通群成员提交新的 `all: true` 发送将返回 `403 mention_all_forbidden`；权限未知时返回 `409 mention_all_permission_unavailable`。排队中的发送在实际提交前会重新核验权限。复用已有发送幂等键仍会返回该发送记录。
+`GET /groups/GROUP_ID` 包含 `ownerId`、`administratorIds`（除非微信协议单独下发，否则不重复包含群主）以及 `canMentionAll`。`null` 权限表示根据本地已存数据尚无法确认权限资格；请先刷新群成员后再重试。普通群成员提交新的 `all: true` 发送将返回 `403 mention_all_forbidden`；权限未知时返回 `409 mention_all_permission_unavailable`。排队中的发送在实际提交前会重新核验当前群成员身份与权限，同时保留其原有的成员名称。复用已有发送幂等键仍会返回该发送记录。
 
 ```ts
 await client.sendText(accountId, groupId, "请帮忙查阅一下", "mention-001", {
@@ -158,5 +158,5 @@ await client.sendText(accountId, groupId, "你好 @Alice\u2005，请查收此文
 - 已保存的群聊变更会触发 `group.updated`；版本号变动通知可能会触发群名单和公告的主动刷新。联系人同步流也会携带群免打扰状态。群免打扰处理具备测试 Fixture；独立的手机端免打扰切换以及其他设备编辑操作的自动下发仍待实机验证。
 - 未知的同步指令字段保持挂起状态。未完整重建的本地提示消息、全文搜索索引和部分私有配置可能会在受支持字段保存后使操作报告 `profileProjection: "partial"`。
 - 免打扰支持普通联系人单聊与群聊。自定义群备注、发布群公告、生成邀请二维码链接、转让群主及变更群管理员等操作暂不支持。OpenClaw 仅暴露了群主/管理员权限的[群信息工具](/zh-cn/openclaw/tools/)，未开放群修改工具。
-- 群成员提醒目前仅支持在本地已保存的群聊中发送普通文本。未知或重复的成员 ID、单聊会话、引用回复以及富媒体消息载荷均不支持提醒。包含成员名称在内的完整文本内容不得超出 64 KiB 的文本上限。遇到网络超时请保留原有的发送幂等键；详见[消息发送与恢复机制](/zh-cn/how-it-works/sends/)。
+- 群成员提醒支持在本地已保存的群聊中发送普通文本。未知或重复的成员 ID、单聊会话以及富媒体消息载荷均不支持提醒。提醒可以配合[引用纯文本回复](/zh-cn/use/cli/#引用回复)同时使用；包含成员名称在内的引用评论正文上限为 16 KiB，其他文本（含名称）上限为 64 KiB。遇到网络超时请保留原有的发送幂等键；详见[消息发送与恢复机制](/zh-cn/how-it-works/sends/)。
 </Aside>

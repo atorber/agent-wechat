@@ -1,6 +1,18 @@
-# 离线官方 Profile 库 (Offline official-profile library)
+# wechat-profile
 
 [English](README.md) | [简体中文](README.zh-CN.md)
+
+读取和更新受支持的官方 Profile 文件。查询操作推荐使用 `ProfileReader`；安全检查的写入器服务于独占拥有该 Profile 的应用程序。格式适配器完整遵循受支持的微信存储行为规范。集成该库的应用自行负责网络操作、账号策略和崩溃恢复。
+
+`stage_*` 负责在内存中准备数据，不改变物理文件。`apply_*` 与 `publish_*` 均会执行写入操作：前者通常表示逻辑记录更新，后者通常表示将数据安装到本地路径。这些命名并不定义不同的事务级别。例如，`publish_saved_key_info` 可以同时更新数据库和一个旧式文件。MMKV 更新首先在内存中暂存新的加密数据及匹配的 CRC 元数据，随后将这些数据发布到既有的 Profile 路径中，不涉及任何服务端上传。
+
+新的 Profile 变更推荐使用 `apply_*`。既有的 `publish_*` API 保留其名称以维持向下兼容。
+
+现有的公共 API 还公开了协调钩子，如 `WriteOptions::durable_intent_id`。这是对调用方先前保存的持久化恢复记录的引用；该库会检查传入的引用，但无法证明该记录确实存在或外部进程已停止。这些钩子并不增加新的官方 Profile 格式，也不直接提供守护进程的恢复日志。
+
+有关 API 边界和写入阶段术语的详细说明，请参见 [Rust 开发库指南](https://thisnick.github.io/agent-wechat/zh-cn/reference/rust-libraries/#profile-写入操作)。
+
+## 读取已停止的 Profile
 
 `wechat-profile` 用于读取显式指定的、已停止运行的 Linux 微信账号 Profile。它在没有官方可执行文件、Agent 服务端、网络连接或原生登录的情况下运行。它不负责破解密码，也不从运行中的进程内存中获取数据。
 

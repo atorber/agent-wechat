@@ -49,6 +49,8 @@ flowchart LR
 
 [`packages/native-client-rust`](https://github.com/thisnick/agent-wechat/tree/main/packages/native-client-rust) 下的 Rust Crate 同样遵循此职责划分：`wechat-protocol`、`wechat-profile`、`wechat-store`、`wechat-core`、`wechat-api` 以及可执行程序 `wx`。
 
+如需直接调用底层库，请参考 [Rust 开发库](/zh-cn/reference/rust-libraries/)。
+
 <Aside title="使用提示">
 - **单个 Daemon 可同时托管多个账号**，每个账号具备独立的 Worker 进程、登录凭据和事件日志。
 - **遇到未知协议格式严格留存而非盲目猜测。** 当微信下发 Daemon 尚未支持的数据载荷时，原始数据会被妥善存证，避免污染损坏 Profile。

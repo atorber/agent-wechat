@@ -170,6 +170,19 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 await client.sendText(accountId, threadId, "赞同", key, { messageId, serverId });
 ```
 
+在引用群消息时若需要同时 @ 群成员，可同时传入两项配置：
+
+```ts
+await client.sendText(accountId, groupId, "赞同", key, {
+  quote: { messageId, serverId },
+  mentions: { userIds: [memberId] },
+});
+```
+
+对于群聊纯文本，HTTP 请求同样支持同时携带 `quote` 与 `mentions` 字段。
+
+受支持的原消息类型及边界限制请参考 [CLI 指南中的引用回复](/zh-cn/use/cli/#引用回复)。
+
 发送文件、图片、视频和语音时，先通过 `POST /uploads` 上传暂存文件，随后将生成的 source ID 传入发送请求中。参考[发送附件与媒体](/zh-cn/use/media/)。
 
 ## 接收事件

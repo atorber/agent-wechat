@@ -224,4 +224,4 @@ wx --account test messages read THREAD_ID --expected-version OBSERVED_READ_STATE
 
 受支持的现有 Profile 工作流具有明确的兼容性边界，尚未准备好直接替换任意生产环境的官方 Profile。此处执行的验证不包含任何生产部署、发布或生产 Profile 交接。
 
-工作区内的 Crate 均设置为 `publish = false`。它们可在工作区内部或通过固定的 Git/路径依赖复用；本发布版不向 crates.io 发布包。可执行文件的分发方式为 GitHub Releases 构件、npm 启动器及原生容器。后续可设计具有独立版本控制的公共 Crate API，而无需阻塞当前的二进制分发。
+`wechat-protocol` 与 `wechat-profile` 是面向开发者的公共库入口点。其底层的支撑库 `wechat-media` 与 `wechat-platform` 同样配置了 crates.io 发布支持。这四个 Crate 均与原生发布版本保持一致；工作区内的其他 Crate 仍保持非公开状态。发布注册表从包含此变更的下一个版本开始。带 Tag 的 Git 依赖或本地路径依赖可继续正常使用。安装说明、调用示例与兼容性请参见 [Rust 开发库参考](https://thisnick.github.io/agent-wechat/zh-cn/reference/rust-libraries/)，发布流程请参见 `RELEASING.md`。
