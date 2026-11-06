@@ -1,5 +1,16 @@
 # @agent-wechat/desktop
 
+## 1.6.0-beta.0
+
+### Minor Changes
+
+- [`5677ed5`](https://github.com/thisnick/agent-wechat/commit/5677ed5420af533af3d233360a09b8bf311bd013) Thanks [@atorber](https://github.com/atorber)! - Add Simplified Chinese (zh-CN) localization support and runtime language switching across onboarding, desktop settings, tray menus, and notifications.
+
+### Patch Changes
+
+- Updated dependencies [[`5677ed5`](https://github.com/thisnick/agent-wechat/commit/5677ed5420af533af3d233360a09b8bf311bd013)]:
+  - @agent-wechat/client-ui@0.4.0-beta.0
+
 ## 1.5.1
 
 ## 1.5.0
