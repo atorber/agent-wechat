@@ -9,5 +9,7 @@
     "@agent-wechat/agent-wechat": "1.5.1",
     "@agent-wechat/shared": "1.1.1"
   },
-  "changesets": []
+  "changesets": [
+    "desktop-chinese-support"
+  ]
 }
