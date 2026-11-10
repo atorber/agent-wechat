@@ -1,5 +1,18 @@
 # @agent-wechat/desktop
 
+## 2.3.0
+
+### Minor Changes
+
+- [`5677ed5`](https://github.com/thisnick/agent-wechat/commit/5677ed5420af533af3d233360a09b8bf311bd013) Thanks [@atorber](https://github.com/atorber)! - Add Simplified Chinese (zh-CN) localization support and runtime language switching across onboarding, desktop settings, tray menus, and notifications.
+
+### Patch Changes
+
+- [#439](https://github.com/thisnick/agent-wechat/pull/439) [`7921590`](https://github.com/thisnick/agent-wechat/commit/7921590128af8bad472051d129697487be5dc340) Thanks [@thisnick](https://github.com/thisnick)! - Filter the Messages sidebar by multiple conversation categories, see unread counts, and return to the full inbox with All.
+
+- Updated dependencies [[`5677ed5`](https://github.com/thisnick/agent-wechat/commit/5677ed5420af533af3d233360a09b8bf311bd013)]:
+  - @agent-wechat/client-ui@0.4.0
+
 ## 2.2.1
 
 ### Patch Changes
