@@ -1,5 +1,7 @@
 # @agent-wechat/desktop
 
+## 2.4.0
+
 ## 2.3.2
 
 ### Patch Changes
