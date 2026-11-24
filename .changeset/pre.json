@@ -8,7 +8,8 @@
     "@agent-wechat/desktop": "2.9.0",
     "@agent-wechat/agent-wechat": "2.9.0",
     "@agent-wechat/rust-crates": "2.9.0",
-    "@agent-wechat/shared": "2.2.0"
+    "@agent-wechat/shared": "2.2.0",
+    "@agent-wechat/deepseek-harness-extension": "3.0.0-beta.1"
   },
   "changesets": [
     "big-xml-forwarded-cards",
@@ -16,10 +17,17 @@
     "calls-stage3-desktop",
     "calls-stage3-ui",
     "consistent-call-header-action-spacing",
+    "deepseek-harness-extension-plugin",
+    "deepseek-harness-extension-push",
+    "deepseek-harness-extension-session-cwd",
+    "deepseek-harness-extension-settings-ui",
+    "deepseek-harness-extension-unarchive-resume",
+    "deepseek-harness-extension-zombie-hardening",
     "fix-call-search-zh",
     "fix-calls-ipv6-relay-checkin",
     "fix-incoming-video-call-rx",
     "fix-incoming-video-keyframe-recovery",
+    "fix-rsm-additive-fec-parity",
     "fix-video-calls-reliability-and-preview",
     "fix-video-calls-self-view-cli-and-smoothness",
     "github-star-support-prompt",
