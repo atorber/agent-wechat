@@ -329,24 +329,32 @@ export function toDshUserMessage(message: FollowupMessage): {
 // ---------------------------------------------------------------------------
 
 /**
- * Wrap a shared native client as the two outbox transport functions. The
- * native send intent uses `serverId`/`localMessageId`/`clientId`; null/empty
- * serverId means the send was not accepted and we fail closed.
+ * Wrap a shared native client as the two outbox transport functions.
+ *
+ * The daemon's send lifecycle is asynchronous: a successful POST returns a
+ * send intent in `queued`/`submitting` state and `serverId` stays null until
+ * WeChat accepts the message (then `state` becomes `accepted`). A null
+ * serverId therefore means "accepted, ACK pending" — not a rejection; real
+ * rejections surface as HTTP errors from the client. Confirmation rides the
+ * `sendByKey` poll: `accepted` + ids confirms, `failed`/`cancelled`/
+ * `needs_review` never confirm, and a still-pending intent returns undefined
+ * so the outbox keeps polling.
  */
 export function createOutboxTransport(client: SharedNativeClientLike): {
   sendText: NonNullable<OutboxDeps['sendText']>;
   sendByKey: NonNullable<OutboxDeps['sendByKey']>;
 } {
-  /** Extract non-empty ids from a NativeSendIntent, or throw without secrets. */
+  /** Extract ids from a NativeSendIntent, or throw without secrets. */
   function ids(intent: any): { serverId: string; serverMessageId: string } {
-    const serverId = intent?.serverId;
-    if (serverId === null || serverId === undefined || String(serverId).length === 0) {
-      throw new Error('Native send was not accepted (no serverId)');
+    const sendId = intent?.id;
+    if (sendId === null || sendId === undefined || String(sendId).length === 0) {
+      throw new Error('Native send was not accepted (no send id)');
     }
+    const serverId = intent?.serverId;
     const serverMessageId = String(
-      intent?.localMessageId ?? intent?.clientId ?? serverId,
+      intent?.localMessageId ?? intent?.clientId ?? (serverId == null ? sendId : serverId),
     );
-    return { serverId: String(serverId), serverMessageId };
+    return { serverId: serverId == null ? '' : String(serverId), serverMessageId };
   }
 
   return {
@@ -357,15 +365,23 @@ export function createOutboxTransport(client: SharedNativeClientLike): {
     sendByKey: async (accountId, key) => {
       const intent = await client.sendByKey(accountId, key);
       if (intent === undefined || intent === null) return undefined;
+      const state = typeof intent?.state === 'string' ? intent.state : undefined;
+      // Definitive non-delivery or unknown outcome never confirms — the outbox
+      // holds the row for review instead of trusting a message WeChat did not
+      // accept.
+      if (state === 'failed' || state === 'cancelled' || state === 'needs_review') {
+        return undefined;
+      }
       const base = ids(intent);
+      if (base.serverId.length === 0) return undefined;
       /*
-       * `text` is required for canonical readback confirmation. Only include
-       * it when the intent confidently exposes the sent text; otherwise
-       * return undefined so the outbox treats the send as unconfirmed
-       * (fail-closed) rather than verifying against a guessed payload.
+       * The send-intent readback does not echo the payload text, so
+       * confirmation rests on the daemon's per-key record (`accepted` + ids).
+       * Include `text` only when the intent confidently exposes it, so the
+       * outbox can byte-compare when the daemon ever starts returning it.
        */
       const rawText = intent?.text ?? intent?.content;
-      if (typeof rawText !== 'string') return undefined;
+      if (typeof rawText !== 'string') return { ...base };
       return { ...base, text: rawText };
     },
   };
