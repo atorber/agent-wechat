@@ -147,12 +147,18 @@ Everything else stays closed by default. Groups additionally require
 `groupPolicy: 'allowlist'` + `groupAllowFrom` (+ `groupSenderAllowFrom` to
 admit specific senders; `requireMentionInGroups` defaults to true).
 
+WeChat chat sessions are created with a workspace-owned working directory
+(`sessionCwd`; unset means the first registered workspace path) so they appear
+in the host conversation list. Changing it rebinds existing chats once — the
+next message in each chat starts a fresh, visible session.
+
 ## Settings UI
 
 The bundle ships a client half (`client/client.js`) that renders a visual
-settings page for the 19 most relevant config fields — hub address
+settings page for the 20 most relevant config fields — hub address
 (`native.endpoint`), run mode, DM/group admission, owner allowlist, tool
-grants, the calls block, and message push — in two host surfaces:
+grants, the calls block, message push, and the session working directory — in
+two host surfaces:
 
 - **Settings → 微信通道** — a dedicated page in the Settings panel nav
   (`settings.section`, id `wechat-channel`).

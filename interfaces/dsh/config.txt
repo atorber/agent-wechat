@@ -37,4 +37,5 @@ push.enabled | boolean, default false | Arm the wechat_push tool for every DSH s
 push.targets | string[], default [] | Exact wxids / @chatroom ids wechat_push may deliver to; at least one is required
 readPolicy | values on_inbound|never|on_model_dispatch, default on_inbound | Reserved read-receipt policy; the native daemon exposes no read API today, so this has no effect yet
 requireMentionInGroups | boolean, default true | Require a real mention before answering in groups
+sessionCwd | string, optional | Working directory for new chat sessions; unset uses the first registered workspace so chats appear in the conversation list
 tools.ownerAllowFrom | string[], default [] | Exact DM wxids treated as the account owner (enables owner tools; archive stays deny-by-default)

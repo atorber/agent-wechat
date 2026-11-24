@@ -40,8 +40,10 @@ import type { ReplyEventView, ReplyState } from './reply-collector.ts';
 import { extractAssistantText, replyProjection } from './reply-collector.ts';
 import {
   openWechatTables,
+  CALLS_STORAGE_UNIT_NAME,
   wechatCallsDomainSpec,
   wechatDomainSpec,
+  WECHAT_STORAGE_UNIT_NAME,
   type TableView,
   type WechatTables,
 } from './storage.ts';
@@ -126,6 +128,39 @@ interface SessionsLike {
   list(): readonly unknown[];
 }
 
+/** The host workspace registry surface the binding needs. */
+export interface WorkspaceRegistryLike {
+  readonly archivedSessionIds: readonly string[];
+  unarchiveSession(sessionId: string): Promise<unknown>;
+  /** Registered workspaces (used to pick a default session cwd). */
+  list?: () => readonly { readonly path?: string }[];
+}
+
+/**
+ * Resolve the host workspace registry without a Cordis `inject` declaration.
+ * Reading `ctx.workspaceRegistry` on a real context throws ("cannot get
+ * property … without inject"), so scan the reflection store by implementation
+ * name instead — the same pattern dsh-app-boot / dsh-agent-preset-registry
+ * use. Falls back to a direct property read only when `ctx.reflect` is absent
+ * (plain test doubles). Returns undefined when the service is not provided.
+ */
+function softWorkspaceRegistry(ctx: HostContextLike): WorkspaceRegistryLike | undefined {
+  const reflect = ctx.reflect;
+  if (reflect === undefined) return ctx.workspaceRegistry;
+  const store = (reflect as { store?: Record<symbol, { name?: string; value?: unknown }> }).store;
+  if (store === undefined) return undefined;
+  let match: WorkspaceRegistryLike | undefined;
+  for (const key of Object.getOwnPropertySymbols(store)) {
+    const impl = store[key];
+    if (impl?.name !== 'workspaceRegistry') continue;
+    const candidate = impl.value as WorkspaceRegistryLike | undefined;
+    if (candidate === undefined) continue;
+    match = candidate;
+    if (typeof candidate.unarchiveSession === 'function') return candidate;
+  }
+  return match;
+}
+
 /** The subset of Cordis Context the binding touches. */
 export interface HostContextLike {
   storageDomain: StorageDomainFacilityLike;
@@ -146,6 +181,18 @@ export interface HostContextLike {
     | undefined;
   /** DSH attachment store (`ctx.attachments`); absent → no media sink. */
   attachments?: HostAttachmentsLike | undefined;
+  /**
+   * Host workspace registry (`ctx.workspaceRegistry`); absent → the archived
+   * session check on resume is skipped (no unarchive recovery). Reading this
+   * property requires a Cordis `inject` declaration, so production resolves
+   * it softly via `ctx.reflect.get('workspaceRegistry', false)` instead.
+   */
+  workspaceRegistry?: WorkspaceRegistryLike | undefined;
+  /**
+   * Cordis reflection service (`ctx.reflect`); `reflect.get(name, false)` is
+   * the soft path for services the plugin does not declare in `inject`.
+   */
+  reflect?: { get(name: string, strict?: boolean): unknown } | undefined;
   /** DSH HTTP host (`ctx.webServer`); absent → the settings status endpoint is skipped. */
   webServer?: HostWebServerLike | undefined;
   /**
@@ -455,6 +502,13 @@ export interface WechatConfigView {
     readonly enabled?: boolean;
     readonly targets?: readonly string[];
   };
+  /**
+   * Working directory for newly created chat sessions. Sessions without a
+   * cwd belong to no workspace and are invisible in the host conversation
+   * list; a workspace-owned path attaches them there. Defaults to the first
+   * registered workspace path.
+   */
+  readonly sessionCwd?: string;
 }
 
 /** Credential refs are POSIX identifiers — same grammar the host enforces. */
@@ -495,8 +549,15 @@ function admissionFromConfig(config: WechatConfigView): AdmissionConfig {
   };
 }
 
+/** Deterministic session id; `seed` shifts all ids after a cwd migration so
+ * rebound chats never collide with the persisted session under the old id. */
+function makeSessionIdFor(seed: string) {
+  return (routeKey: string) =>
+    asSessionId(`wht-${stableHash32(seed === '' ? routeKey : `${routeKey}|${seed}`)}`);
+}
+
 function sessionIdFor(routeKey: string) {
-  return asSessionId(`wht-${stableHash32(routeKey)}`);
+  return makeSessionIdFor('')(routeKey);
 }
 
 function toFollowup(message: InboundMessage, _binding: RouteBinding) {
@@ -561,6 +622,8 @@ export interface AssemblyDeps {
   readonly log: LogFn;
   /** Optional test seam replacing the real native client. */
   readonly createNativeClient?: NativeClientFactory;
+  /** Optional test seam replacing runtime construction. */
+  readonly createRuntime?: typeof createWechatRuntime;
 }
 
 const defaultNativeClientFactory: NativeClientFactory = ({ baseUrl, token }) =>
@@ -672,10 +735,34 @@ export async function assembleWechatBinding(deps: AssemblyDeps): Promise<WechatB
   // once per attempt so parked retries also pick up live settings updates.
   const config = unwrapVolatileConfig(deps.config);
 
-  // 1. Durable storage domain + typed tables.
-  const domain = await traceStep('assemble', 'storage-domain open', () =>
-    ctx.storageDomain.open(wechatDomainSpec()),
-  );
+  // 1. Durable storage domain + typed tables. A hot reload can race the
+  // previous generation's cleanup: if that cleanup crashed before freeing the
+  // domain name, the facility still holds it reserved ("already-open"). Reclaim
+  // the orphaned handle from the facility and retry once, so a hot reload
+  // self-heals instead of parking until the next host restart.
+  const openDomainUnit = async (
+    name: string,
+    spec: Parameters<typeof ctx.storageDomain.open>[0],
+  ): Promise<unknown> => {
+    try {
+      return await ctx.storageDomain.open(spec);
+    } catch (error) {
+      if (!/already open/.test(errorText(error))) throw error;
+      const orphaned = (
+        ctx.storageDomain as unknown as {
+          domains?: Map<string, { close(): Promise<void> }>;
+        }
+      ).domains?.get(name);
+      if (orphaned !== undefined) {
+        log('warn', `wechat: reclaiming an orphaned storage domain '${name}' from a previous generation`);
+        await orphaned.close().catch(() => {});
+      }
+      return ctx.storageDomain.open(spec);
+    }
+  };
+  const domain = (await traceStep('assemble', 'storage-domain open', () =>
+    openDomainUnit(WECHAT_STORAGE_UNIT_NAME, wechatDomainSpec()),
+  )) as Awaited<ReturnType<typeof ctx.storageDomain.open>>;
   let tables: WechatTables;
   try {
     tables = openWechatTables(domain);
@@ -744,12 +831,66 @@ export async function assembleWechatBinding(deps: AssemblyDeps): Promise<WechatB
     // 4. Agent factory + session router. The host's live default model
     // selection rides along so fresh session Agents can actually run a turn.
     const agentFactory = createAgentFactoryAdapter(ctx.agents, ctx.agentDefaultModel);
+    const workspace = softWorkspaceRegistry(ctx);
+
+    // 4b. Session cwd: sessions created without a cwd belong to no workspace
+    // and never appear in the host conversation list. New sessions get a
+    // workspace-owned directory (explicit config wins, else the first
+    // registered workspace); existing cwd-less bindings are rebound exactly
+    // once per resolved cwd so their next message starts a visible session.
+    const sessionCwd = (() => {
+      const configured = typeof config.sessionCwd === 'string' && config.sessionCwd.trim() !== ''
+        ? config.sessionCwd.trim()
+        : undefined;
+      if (configured !== undefined) return configured;
+      for (const entry of workspace?.list?.() ?? []) {
+        if (typeof entry?.path === 'string' && entry.path.trim() !== '') return entry.path.trim();
+      }
+      return undefined;
+    })();
+    // Versioned seed: the seed shifts every deterministic session id, so a
+    // bump re-mints ids exactly once (used when a rollout created sessions
+    // before the cwd actually reached the host session identity). The marker
+    // stores the seed itself so re-migration triggers exactly once per seed.
+    const sessionSeed = sessionCwd === undefined ? undefined : `${sessionCwd}|v2`;
+    if (sessionSeed !== undefined) {
+      const marker = (domain.global.get() as { sessionCwdMigration?: string }).sessionCwdMigration;
+      if (marker !== sessionSeed) {
+        let rebound = 0;
+        for (const [routeKey] of tables.threads.entries()) {
+          await tables.threads.delete(routeKey);
+          rebound += 1;
+        }
+        await domain.global.set({
+          ...(domain.global.get() as { generation?: number }),
+          sessionCwdMigration: sessionSeed,
+        } as never);
+        if (rebound > 0) {
+          log(
+            'warn',
+            `wechat: rebound ${rebound} chat(s) into workspace cwd ${sessionCwd} (previous sessions had no cwd and were invisible in the conversation list)`,
+          );
+        }
+      }
+    }
+
     const router: SessionRouter = createSessionRouter({
       tables: { threads: tables.threads },
       agents: agentFactory,
-      sessionIdFor,
+      // Seed shifts every session id after a cwd migration so rebound chats
+      // never collide with the persisted session under the old id.
+      sessionIdFor: makeSessionIdFor(sessionSeed ?? ''),
       toUserMessage,
       now: Date.now,
+      // An archived session rejects every model step (ArchivedSessionGate) and
+      // turns end `blocked` with no reply — lift the archive before resuming.
+      ...(workspace === undefined
+        ? {}
+        : {
+            archivedSessionIds: () => workspace.archivedSessionIds,
+            unarchiveSession: (sessionId: string) => workspace.unarchiveSession(sessionId),
+          }),
+      log,
     });
 
     // 5. Durable outbox with canonical readback (never auto-resend).
@@ -813,7 +954,7 @@ export async function assembleWechatBinding(deps: AssemblyDeps): Promise<WechatB
     const generation = (): number => domain.global.get().generation ?? 0;
 
     // 9. Orchestration runtime.
-    const runtime = createWechatRuntime({
+    const runtime = (deps.createRuntime ?? createWechatRuntime)({
       native,
       router,
       outbox,
@@ -827,6 +968,7 @@ export async function assembleWechatBinding(deps: AssemblyDeps): Promise<WechatB
       toFollowup,
       log,
       generation,
+      ...(sessionCwd === undefined ? {} : { sessionCwd }),
       idleEvictMs: 0, // idle eviction is wired by the timer in a later milestone
     });
 
@@ -949,7 +1091,8 @@ export async function assembleWechatBinding(deps: AssemblyDeps): Promise<WechatB
         };
 
         // Durable call memory in its own domain unit (wipable separately).
-        const callsDomain = (await ctx.storageDomain.open(
+        const callsDomain = (await openDomainUnit(
+          CALLS_STORAGE_UNIT_NAME,
           wechatCallsDomainSpec(),
         )) as unknown as CallsDomainLike;
         const callMemory = new CallSummaryStore({
@@ -1113,6 +1256,10 @@ export function bindWechatHost(
     readonly createNativeClient?: NativeClientFactory;
     /** Override the first retry delay (tests). */
     readonly retryInitialMs?: number;
+    readonly watchdogIntervalMs?: number;
+    readonly disposeTimeoutMs?: number;
+    /** Override runtime construction (tests: inject a controllable stub). */
+    readonly createRuntime?: typeof createWechatRuntime;
   } = {},
 ): HostBindingResult {
   const log = asLog(ctx);
@@ -1135,10 +1282,15 @@ export function bindWechatHost(
   };
 
   const retryInitial = options.retryInitialMs ?? RETRY_INITIAL_MS;
+  const watchdogInterval = options.watchdogIntervalMs ?? 30_000;
+  const disposeTimeout = options.disposeTimeoutMs ?? 8_000;
 
   ctx.effect(() => {
     const life = new AbortController();
     let cleanup: (() => Promise<void>) | undefined;
+    // The runtime of the live binding; the watchdog polls this so a channel
+    // whose consumer died without a dispose gets revived automatically.
+    let activeRuntime: WechatRuntime | undefined;
 
     // Settings-page connection status: registered before the activation loop
     // so the page can watch the channel through park/retry progress. Reads the
@@ -1191,6 +1343,37 @@ export function bindWechatHost(
         life.signal.addEventListener('abort', onAbort, { once: true });
       });
 
+    /**
+     * Run one dispose step under a timeout. A hung host-side dispose (a
+     * storage domain waiting on an in-flight transaction, a projection reader
+     * that never settles) must never wedge the effect disposer — that would
+     * leave the fiber stuck mid-unload with a stale status route and no way
+     * to re-apply. Each step is fault-tolerant: failures are traced and the
+     * remaining steps still run.
+     */
+    const bounded = (label: string, step: () => Promise<unknown>): Promise<void> =>
+      new Promise<void>((resolve) => {
+        let done = false;
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          debugTrace('cleanup', `${label} timed out after ${disposeTimeout}ms; continuing`);
+          resolve();
+        }, disposeTimeout);
+        void Promise.resolve()
+          .then(step)
+          .catch((error: unknown) => {
+            debugTrace('cleanup', `${label} failed: ${errorText(error)}`);
+          })
+          .then(finish, finish);
+      });
+
     /** Background activation loop: assemble → start, or park and retry. */
     const activate = async (): Promise<void> => {
       let delay = retryInitial;
@@ -1205,6 +1388,7 @@ export function bindWechatHost(
             ...(options.createNativeClient === undefined
               ? {}
               : { createNativeClient: options.createNativeClient }),
+            ...(options.createRuntime === undefined ? {} : { createRuntime: options.createRuntime }),
           });
 
           // Turn-completion listener: drain committed replies into the outbox.
@@ -1235,6 +1419,7 @@ export function bindWechatHost(
             // Roll this attempt back completely before parking: registered
             // tools must not linger while the channel retries.
             activeSearch = undefined;
+            activeRuntime = undefined;
             binding.disposeTools();
             await binding.disposeCalls?.().catch(() => {});
             await binding.runtime.stop().catch(() => {});
@@ -1247,19 +1432,31 @@ export function bindWechatHost(
             serverId: binding.serverId,
             attempts: state.attempts,
           };
+          activeRuntime = binding.runtime;
           debugTrace(
             'activate',
             `activated serverId=${binding.serverId} running=${String(binding.runtime.running)}`,
           );
           cleanup = async () => {
-            offEvent();
+            debugTrace('cleanup', 'disposing binding');
+            activeRuntime = undefined;
+            await bounded('offEvent', async () => {
+              offEvent();
+            });
             activeSearch = undefined;
-            binding.disposeTools();
-            await binding.disposeCalls?.().catch(() => {});
-            await binding.runtime.stop();
-            await binding.replyHandle.dispose().catch(() => {});
-            await binding.domain.close().catch(() => {});
+            await bounded('disposeTools', async () => {
+              binding.disposeTools();
+            });
+            if (binding.disposeCalls !== undefined) {
+              await bounded('disposeCalls', binding.disposeCalls);
+            }
+            await bounded('runtime.stop', binding.runtime.stop);
+            await bounded('replyHandle.dispose', binding.replyHandle.dispose);
+            await bounded('domain.close', async () => {
+              await binding.domain.close();
+            });
             state = { running: false, serverId: binding.serverId, attempts: state.attempts };
+            debugTrace('cleanup', 'binding disposed');
           };
           settle();
           return;
@@ -1278,8 +1475,27 @@ export function bindWechatHost(
 
     void activate();
 
+    // Watchdog: once activated, a runtime whose consumer loop died without a
+    // dispose would otherwise stay dead forever (the activate loop only runs
+    // on failure). Poll liveness and revive through the normal park/retry
+    // path, releasing the old binding first.
+    const watchdog = setInterval(() => {
+      if (life.signal.aborted) return;
+      if (cleanup === undefined || activeRuntime === undefined) return;
+      if (activeRuntime.running) return;
+      debugTrace('activate', 'watchdog: runtime is not running; reviving channel');
+      const previous = cleanup;
+      cleanup = undefined;
+      activeRuntime = undefined;
+      void (async () => {
+        await previous();
+        await activate();
+      })();
+    }, watchdogInterval);
+
     // Return the disposer immediately so Cordis can always unload the effect.
     return async () => {
+      clearInterval(watchdog);
       life.abort();
       if (cleanup !== undefined) await cleanup();
       if (disposeStatusRoute !== undefined) {

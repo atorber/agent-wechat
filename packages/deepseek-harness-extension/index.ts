@@ -84,6 +84,14 @@ export const Config = z
       })
       .default({}),
     /**
+     * Working directory for newly created WeChat chat sessions. Sessions
+     * without a cwd belong to no workspace and are invisible in the host
+     * conversation list. Defaults to the first registered workspace path.
+     * Changing it rebinds existing chats once so the next message starts a
+     * visible session in the new workspace.
+     */
+    sessionCwd: z.string().volatile(),
+    /**
      * Calls configuration (M5). Validated by resolveWeChatCallsConfig — see
      * README for the full shape (calls.voice.* mirrors the OpenClaw voice
      * calling config; `realtime.apiKeyCredentialRef` names a harness

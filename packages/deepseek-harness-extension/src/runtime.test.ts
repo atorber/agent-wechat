@@ -14,6 +14,7 @@ import {
   type RouteKey,
 } from './contracts.ts';
 import { createWechatRuntime, createJournalCursorStore, type RuntimeDeps } from './runtime.ts';
+import type { EnsureOptions } from './session-router.ts';
 import type { ReplyState } from './reply-collector.ts';
 import type { AdmissionConfig } from './admission.ts';
 import { JournalRecordSchema, type JournalRecord, type TableView } from './storage.ts';
@@ -106,6 +107,7 @@ function binding(overrides: Partial<RouteBinding> = {}): RouteBinding {
 interface Harness {
   deps: RuntimeDeps;
   ensured: RouteKey[];
+  ensuredOpts: Array<Record<string, unknown> | undefined>;
   followed: FollowupMessage[];
   enqueued: Array<Omit<OutboundRecord, 'status' | 'createdAt' | 'updatedAt'>>;
   delivered: string[];
@@ -120,6 +122,7 @@ function makeHarness(opts: {
 } = {}): Harness {
   const routeBinding = opts.binding ?? binding();
   const ensured: RouteKey[] = [];
+  const ensuredOpts: Array<Record<string, unknown> | undefined> = [];
   const followed: FollowupMessage[] = [];
   const enqueued: Harness['enqueued'] = [];
   const delivered: string[] = [];
@@ -130,8 +133,9 @@ function makeHarness(opts: {
     async binding() {
       return routeBinding;
     },
-    async ensure(routeKey: RouteKey) {
+    async ensure(routeKey: RouteKey, opts?: EnsureOptions) {
       ensured.push(routeKey);
+      ensuredOpts.push(opts as unknown as Record<string, unknown> | undefined);
       return routeBinding;
     },
     async followup(_routeKey: RouteKey, message: FollowupMessage) {
@@ -228,7 +232,7 @@ function makeHarness(opts: {
     log: (_level, msg) => logs.push(msg),
   };
 
-  return { deps, ensured, followed, enqueued, delivered, logs };
+  return { deps, ensured, ensuredOpts, followed, enqueued, delivered, logs };
 }
 
 // ---------------------------------------------------------------------------
@@ -347,4 +351,20 @@ test('start and stop are idempotent and flip the running flag', async () => {
   assert.equal(rt.running, false);
   await rt.stop();
   assert.equal(rt.running, false);
+});
+
+test('sessionCwd is forwarded into ensure options for new sessions', async () => {
+  const h = makeHarness();
+  const rt = createWechatRuntime({ ...h.deps, sessionCwd: '/Users/luyuchao/Documents/ws' });
+  await rt.handleInbound(dmMessage('m-cwd'));
+  const opts = h.ensuredOpts[0] as { cwd?: string } | undefined;
+  assert.equal(opts?.cwd, '/Users/luyuchao/Documents/ws');
+});
+
+test('ensure options omit cwd when sessionCwd is unset', async () => {
+  const h = makeHarness();
+  const rt = createWechatRuntime(h.deps);
+  await rt.handleInbound(dmMessage('m-nocwd'));
+  const opts = h.ensuredOpts[0] as { cwd?: string } | undefined;
+  assert.equal(opts?.cwd, undefined);
 });

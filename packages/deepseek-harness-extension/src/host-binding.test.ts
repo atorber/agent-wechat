@@ -17,6 +17,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createWechatRuntime, type WechatRuntime } from './runtime.ts';
 import {
   assembleWechatBinding,
   bindWechatHost,
@@ -1042,4 +1043,173 @@ test('after activation the search route serves whitelist-ready directory rows', 
   } finally {
     await disposeAll(host);
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// watchdog + bounded cleanup (zombie-channel hardening)
+// ---------------------------------------------------------------------------
+
+/** Poll a condition with a deadline (ms). */
+async function until(condition: () => boolean, deadlineMs: number): Promise<void> {
+  const started = Date.now();
+  while (!condition()) {
+    if (Date.now() - started > deadlineMs) throw new Error('until: condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test('watchdog revives the channel when the runtime dies without a dispose', async () => {
+  const host = makeFakeHost();
+  const runtimes: Array<{ running: boolean; starts: number; stops: number }> = [];
+  const result = bindWechatHost(host.ctx, CONFIG, {
+    createNativeClient: fakeClientFactory(host),
+    retryInitialMs: 5,
+    watchdogIntervalMs: 20,
+    createRuntime: (() => {
+      const stub = { running: false, starts: 0, stops: 0 };
+      runtimes.push(stub);
+      return {
+        get running(): boolean {
+          return stub.running;
+        },
+        start: async () => {
+          stub.starts += 1;
+          stub.running = true;
+        },
+        stop: async () => {
+          stub.stops += 1;
+          stub.running = false;
+        },
+        handleInbound: async () => {
+          throw new Error('not used');
+        },
+        drainReplies: async () => {},
+        recoverOutbox: async () => {},
+      } as unknown as WechatRuntime;
+    }) as typeof createWechatRuntime,
+  });
+  try {
+    await result.ready;
+    assert.equal(result.getState().running, true);
+    assert.equal(runtimes.length, 1);
+    // Simulate the zombie mode: the consumer loop died, no dispose ran.
+    runtimes[0]!.running = false;
+    // The watchdog must notice within its interval, release the old binding,
+    // and activate a fresh one through the normal path.
+    await until(() => runtimes.length >= 2, 2000);
+    assert.equal(runtimes[1]!.starts, 1);
+    assert.equal(result.getState().running, true, 'revived binding reports running');
+  } finally {
+    await disposeAll(host);
+  }
+});
+
+test('bounded cleanup completes even when a dispose step hangs forever', async () => {
+  const host = makeFakeHost();
+  // Make the storage domain's close() hang forever — the wedged-dispose mode.
+  let domainCloseCalls = 0;
+  const originalOpen = host.ctx.storageDomain.open.bind(host.ctx.storageDomain);
+  (host.ctx as unknown as {
+    storageDomain: { open: typeof originalOpen };
+  }).storageDomain.open = (async (spec: unknown) => {
+    const domain = await originalOpen(spec as never);
+    return {
+      ...domain,
+      close: async () => {
+        domainCloseCalls += 1;
+        await new Promise<void>(() => {}); // never settles
+      },
+    } as typeof domain;
+  }) as typeof originalOpen;
+  const result = bindWechatHost(host.ctx, CONFIG, {
+    createNativeClient: fakeClientFactory(host),
+    retryInitialMs: 5,
+    disposeTimeoutMs: 25,
+  });
+  await result.ready;
+  // Without the bounded cleanup this await would hang forever and the state
+  // would keep reporting running:true (the observed zombie incident).
+  await disposeAll(host);
+  assert.equal(domainCloseCalls >= 1, true, 'close was attempted');
+  assert.equal(result.getState().running, false, 'state flips to stopped despite the hang');
+});
+
+
+test('cwd-less chat bindings are rebound once into a workspace-owned session cwd', async () => {
+  const host = makeFakeHost();
+  (host.ctx as { workspaceRegistry?: unknown }).workspaceRegistry = {
+    archivedSessionIds: [],
+    unarchiveSession: async () => {},
+    list: () => [{ path: '/Users/luyuchao/Documents/ws' }],
+  };
+  const threads = host.domain.tables.get('threads')!;
+  const row = () => ({
+    routeKey: 'default:wxid_peer',
+    sessionId: 'wht-old',
+    accountId: 'default',
+    chatJid: 'wxid_peer',
+    policyFingerprint: 'fp',
+    revision: 1,
+    lastActivityAt: new Date().toISOString(),
+  });
+  threads.set('default:wxid_peer', row() as never);
+
+  // Mutable domain global so the one-shot marker persists across assembles.
+  const globalState: Record<string, unknown> = { generation: 0 };
+  const originalOpen = host.ctx.storageDomain.open.bind(host.ctx.storageDomain);
+  host.ctx.storageDomain.open = (async (spec: unknown) => {
+    const view = (await originalOpen(spec)) as {
+      table: (name: string) => unknown;
+      global: { get: () => unknown; set: (value: unknown) => Promise<void> };
+      close: () => Promise<void>;
+    };
+    return {
+      ...view,
+      global: {
+        get: () => ({ ...globalState }),
+        set: async (value: Record<string, unknown>) => {
+          Object.assign(globalState, value);
+        },
+      },
+    };
+  }) as typeof host.ctx.storageDomain.open;
+
+  const createdOptions: Array<Record<string, unknown>> = [];
+  const originalCreate = host.ctx.agents.create.bind(host.ctx.agents);
+  host.ctx.agents.create = (async (options: Record<string, unknown>) => {
+    createdOptions.push(options);
+    return originalCreate(options as never);
+  }) as typeof host.ctx.agents.create;
+
+  const logs: string[] = [];
+  const assemble = () =>
+    assembleWechatBinding({
+      ctx: host.ctx,
+      config: CONFIG,
+      log: (level, message) => logs.push(`${level}: ${message}`),
+      createNativeClient: fakeClientFactory(host),
+    });
+
+  const first = await assemble();
+  assert.equal(threads.size, 0, 'cwd-less binding was removed');
+  assert.equal(globalState['sessionCwdMigration'], '/Users/luyuchao/Documents/ws|v2');
+
+  // The next inbound message creates the session with the workspace cwd.
+  await first.runtime.handleInbound(inboundDm('m-cwd'));
+  assert.equal(createdOptions.length, 1);
+  assert.equal((createdOptions[0] as { meta?: { cwd?: string } }).meta?.cwd, '/Users/luyuchao/Documents/ws');
+
+  // A stored binding plus a set marker means a second assemble never rebinds.
+  threads.set('default:wxid_peer', row() as never);
+  const second = await assemble();
+  assert.equal(threads.size, 1, 'marker prevents rebinding again');
+
+  void logs;
+  await second.runtime.stop();
+  await second.replyHandle.dispose();
+  await second.domain.close();
+  await first.runtime.stop();
+  await first.replyHandle.dispose();
+  await first.domain.close();
 });

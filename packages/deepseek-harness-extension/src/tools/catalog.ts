@@ -109,4 +109,5 @@ export const dshConfigShape: readonly CatalogConfigEntry[] = [
   { path: 'gatewayFacade', attributes: ['boolean', 'default false'], description: 'Expose the local gateway facade (M6; default off)' },
   { path: 'push.enabled', attributes: ['boolean', 'default false'], description: 'Arm the wechat_push tool for every DSH session (fail-closed default)' },
   { path: 'push.targets', attributes: ['string[]', 'default []'], description: 'Exact wxids / @chatroom ids wechat_push may deliver to; at least one is required' },
+  { path: 'sessionCwd', attributes: ['string', 'optional'], description: 'Working directory for new chat sessions; unset uses the first registered workspace so chats appear in the conversation list' },
 ];

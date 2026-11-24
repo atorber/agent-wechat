@@ -90,10 +90,13 @@ function makeHarness(opts: {
   failCreate?: boolean;
   failResume?: boolean;
   sessionIdFor?: (routeKey: RouteKey) => SessionId;
+  archivedSessionIds?: readonly string[];
 } = {}) {
   const threads = new MemoryTable();
   const created: CreateCall[] = [];
   const resumed: ResumeCall[] = [];
+  const unarchived: string[] = [];
+  const logs: Array<{ level: string; message: string }> = [];
   const agents: FakeAgent[] = [];
   let nextId = 1;
   const factory = {
@@ -123,8 +126,19 @@ function makeHarness(opts: {
       routeKey: binding.routeKey,
     }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    ...(opts.archivedSessionIds === undefined
+      ? {}
+      : {
+          archivedSessionIds: () => opts.archivedSessionIds!,
+          unarchiveSession: async (sessionId: string) => {
+            unarchived.push(sessionId);
+          },
+        }),
+    log: (level, message) => {
+      logs.push({ level, message });
+    },
   });
-  return { threads, created, resumed, agents, router, factory };
+  return { threads, created, resumed, unarchived, logs, agents, router, factory };
 }
 
 function sessionIdOf(routeKey: RouteKey): SessionId {
@@ -404,4 +418,168 @@ test('router exposes every SessionRouterPort method plus evictIdle', () => {
   ] as const) {
     assert.equal(typeof r[method], 'function', `missing ${method}`);
   }
+});
+
+  // ---------------------------------------------------------------------------
+  // 13. Resuming an archived session unarchives it first
+  // ---------------------------------------------------------------------------
+
+  test('resume of an archived session unarchives it before resuming and logs a warning', async () => {
+    const h = makeHarness({ archivedSessionIds: [sessionIdOf(ROUTE)] });
+    await h.threads.put(ROUTE, {
+      routeKey: ROUTE,
+      sessionId: sessionIdOf(ROUTE),
+      accountId: 'acct',
+      chatJid: 'chat@jid',
+      policyFingerprint: 'fp-7',
+      revision: 4,
+      lastActivityAt: new Date(T0).toISOString(),
+    });
+
+    const binding = await h.router.ensure(ROUTE, { policyFingerprint: 'fp-7' });
+
+    assert.deepEqual(h.unarchived, [sessionIdOf(ROUTE)]);
+    assert.equal(h.resumed.length, 1);
+    assert.equal(h.created.length, 0);
+    assert.equal(binding.revision, 5);
+    assert.ok(
+      h.logs.some((entry) => entry.level === 'warn' && entry.message.includes('archived')),
+      JSON.stringify(h.logs),
+    );
+  });
+
+  test('unarchive failure does not block the resume', async () => {
+    const threads = new MemoryTable();
+    await threads.put(ROUTE, {
+      routeKey: ROUTE,
+      sessionId: sessionIdOf(ROUTE),
+      accountId: 'acct',
+      chatJid: 'chat@jid',
+      policyFingerprint: 'fp-7',
+      revision: 4,
+      lastActivityAt: new Date(T0).toISOString(),
+    });
+    const factory = {
+      async create(): Promise<LiveAgent> {
+        throw new Error('not used');
+      },
+      async resume(): Promise<LiveAgent> {
+        return new FakeAgent('agent-x');
+      },
+    };
+    const router = createSessionRouter({
+      tables: { threads },
+      agents: factory,
+      sessionIdFor: sessionIdOf,
+      toUserMessage: (message: FollowupMessage) => message,
+      archivedSessionIds: () => [sessionIdOf(ROUTE)],
+      unarchiveSession: async () => {
+        throw new Error('registry offline');
+      },
+    });
+
+    const binding = await router.ensure(ROUTE, {});
+
+    assert.equal(binding.revision, 5);
+    assert.ok(threads.get(ROUTE));
+  });
+
+  test('fresh sessions never consult the archive set', async () => {
+    const h = makeHarness({ archivedSessionIds: [sessionIdOf(ROUTE)] });
+    await h.router.ensure(ROUTE, {});
+    assert.deepEqual(h.unarchived, []);
+    assert.equal(h.created.length, 1);
+  });
+
+test('cwd rides session creation but is stripped from resume', async () => {
+  const h = makeHarness();
+  await h.router.ensure(ROUTE, { policyFingerprint: 'fp-1', cwd: '/Users/luyuchao/Documents/ws' });
+  assert.equal(h.created.length, 1);
+  assert.equal((h.created[0] as { meta?: { cwd?: string } }).meta?.cwd, '/Users/luyuchao/Documents/ws');
+
+  // Simulate a restart: a stored record without a live route forces resume.
+  const threads = new MemoryTable();
+  await threads.put(ROUTE, {
+    routeKey: ROUTE,
+    sessionId: sessionIdOf(ROUTE),
+    accountId: 'acct',
+    chatJid: 'chat@jid',
+    policyFingerprint: 'fp-1',
+    revision: 4,
+    lastActivityAt: new Date(T0).toISOString(),
+  });
+  const resumed: ResumeCall[] = [];
+  const router2 = createSessionRouter({
+    tables: { threads },
+    agents: {
+      async create(): Promise<LiveAgent> {
+        throw new Error('not used');
+      },
+      async resume(options: AgentResumeOptions): Promise<LiveAgent> {
+        resumed.push(options);
+        return new FakeAgent('agent-x');
+      },
+    },
+    sessionIdFor: sessionIdOf,
+    toUserMessage: (message: FollowupMessage) => message,
+  });
+  await router2.ensure(ROUTE, { policyFingerprint: 'fp-1', cwd: '/Users/luyuchao/Documents/ws' });
+  assert.equal(resumed.length, 1);
+  assert.equal(
+    (resumed[0] as { meta?: unknown }).meta,
+    undefined,
+    'resume options must not carry cwd (creation-only in the host API)',
+  );
+});
+
+test('create collision on a deterministic id mints a fresh id once', async () => {
+  const threads = new MemoryTable();
+  let attempts = 0;
+  const created: Array<AgentCreateOptions> = [];
+  const router = createSessionRouter({
+    tables: { threads },
+    agents: {
+      async create(options: AgentCreateOptions): Promise<LiveAgent> {
+        attempts += 1;
+        created.push(options);
+        if (attempts === 1) throw new Error(`session "${options.sessionId}" already exists`);
+        return new FakeAgent('agent-x');
+      },
+      async resume(): Promise<LiveAgent> {
+        throw new Error('not used');
+      },
+    },
+    sessionIdFor: (routeKey: RouteKey) => `wht-${stableHash32(routeKey)}` as SessionId,
+    toUserMessage: (message: FollowupMessage) => message,
+  });
+
+  const binding = await router.ensure(ROUTE, { policyFingerprint: 'fp-1' });
+
+  assert.equal(attempts, 2, 'one retry after the collision');
+  assert.notEqual(created[1]!.sessionId, created[0]!.sessionId, 'fresh id differs');
+  assert.equal(binding.sessionId, created[1]!.sessionId);
+  assert.ok(threads.get(ROUTE), 'binding persisted under the fresh id');
+});
+
+test('non-collision create errors propagate without retry', async () => {
+  const threads = new MemoryTable();
+  let attempts = 0;
+  const router = createSessionRouter({
+    tables: { threads },
+    agents: {
+      async create(): Promise<LiveAgent> {
+        attempts += 1;
+        throw new Error('registry exploded');
+      },
+      async resume(): Promise<LiveAgent> {
+        throw new Error('not used');
+      },
+    },
+    sessionIdFor: (routeKey: RouteKey) => `wht-${stableHash32(routeKey)}` as SessionId,
+    toUserMessage: (message: FollowupMessage) => message,
+  });
+
+  await assert.rejects(() => router.ensure(ROUTE, { policyFingerprint: 'fp-1' }), /registry exploded/);
+  assert.equal(attempts, 1, 'no retry for unrelated failures');
+  assert.equal(threads.size, 0, 'fail-closed: nothing persisted');
 });

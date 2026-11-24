@@ -74,6 +74,12 @@ export interface RuntimeDeps {
   readonly generation?: () => number;
   /** Idle eviction threshold; 0 disables the idle timer. */
   readonly idleEvictMs?: number;
+  /**
+   * Working directory for newly created chat sessions. Sessions without a
+   * cwd belong to no workspace and are invisible in the host conversation
+   * list; setting a workspace-owned path attaches them there.
+   */
+  readonly sessionCwd?: string;
 }
 
 export interface DispatchResult {
@@ -172,6 +178,7 @@ export function createWechatRuntime(deps: RuntimeDeps): WechatRuntime {
     const routeKey = makeRouteKey(message.ref.accountId, message.ref.chatJid);
     const binding = await deps.router.ensure(routeKey, {
       policyFingerprint: decision.policyFingerprint,
+      ...(deps.sessionCwd === undefined ? {} : { cwd: deps.sessionCwd }),
     });
     // A followup wakes the Agent turn; never use `inject` for wakeups (DESIGN.md §3.4).
     await deps.router.followup(routeKey, deps.toFollowup(message, binding));
@@ -257,7 +264,12 @@ export function createWechatRuntime(deps: RuntimeDeps): WechatRuntime {
         if (signal.aborted) break;
         await sleep(backoff.next(), signal);
       } catch (error) {
-        if (signal.aborted) break;
+        if (signal.aborted) {
+          // Stop() aborts the watch, so this is the normal shutdown exit —
+          // say so, or the bare "loop exit" line looks like a mystery death.
+          debugTrace('wechat', `[consumer] aborted account=${accountId}`);
+          break;
+        }
         debugTrace('wechat', `[consumer] failed account=${accountId}: ${errorText(error)}`);
         log('error', `wechat: consumer ${accountId} failed: ${errorText(error)}`);
         await sleep(backoff.next(), signal);

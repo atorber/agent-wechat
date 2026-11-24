@@ -12,6 +12,7 @@
  * port/table types here never loads the host-backed `storage.ts` module.
  */
 
+import { randomUUID } from 'node:crypto';
 import type {
   FollowupMessage,
   RouteBinding,
@@ -42,7 +43,8 @@ export interface LiveAgent {
 export interface AgentCreateOptions {
   readonly sessionId: string;
   readonly setup?: SetupFn;
-  readonly cwd?: string;
+  /** Host session metadata; `cwd` must ride `meta` (CreateAgentOptions.meta). */
+  readonly meta?: { readonly cwd?: string };
   readonly agentOptions?: Record<string, unknown>;
 }
 
@@ -50,7 +52,6 @@ export interface AgentCreateOptions {
 export interface AgentResumeOptions {
   readonly resumeSessionId: string;
   readonly setup?: SetupFn;
-  readonly cwd?: string;
   readonly agentOptions?: Record<string, unknown>;
 }
 
@@ -79,6 +80,12 @@ export interface SessionRouterDeps {
   readonly toUserMessage: (message: FollowupMessage, binding: RouteBinding) => unknown;
   /** Injectable clock for deterministic last-activity timestamps. */
   readonly now?: () => number;
+  /** Host workspace archive set; absent in unit tests. */
+  readonly archivedSessionIds?: () => readonly string[];
+  /** Lift a session out of the host archive set before resuming it. */
+  readonly unarchiveSession?: (sessionId: string) => Promise<unknown>;
+  /** Optional logger for the unarchive recovery path. */
+  readonly log?: (level: 'info' | 'warn' | 'error', message: string) => void;
 }
 
 /** The port plus one extra helper for the future idle-timer wiring. */
@@ -138,11 +145,14 @@ export function createSessionRouter(deps: SessionRouterDeps): SessionRouter {
 
   /** `exactOptionalPropertyTypes`-safe spread of the non-setup passthrough. */
   function passthrough(opts: EnsureOptions): {
-    cwd?: string;
+    meta?: { cwd?: string };
     agentOptions?: Record<string, unknown>;
   } {
     return {
-      ...(opts.cwd === undefined ? {} : { cwd: opts.cwd }),
+      // The host factory only accepts the workspace cwd as session metadata
+      // (`CreateAgentOptions.meta.cwd`); a top-level field is dropped and the
+      // session persists cwd-less, invisible to the conversation list.
+      ...(opts.cwd === undefined ? {} : { meta: { cwd: opts.cwd } }),
       ...(opts.agentOptions === undefined ? {} : { agentOptions: opts.agentOptions }),
     };
   }
@@ -157,11 +167,26 @@ export function createSessionRouter(deps: SessionRouterDeps): SessionRouter {
 
     let resumed = false;
     if (stored !== undefined) {
+      // The host refuses every model step for an archived session
+      // (ArchivedSessionGate), so resuming one would silently swallow the
+      // reply. Lift the archive before resuming; unarchive failure is not
+      // fatal — resume may still work, and the next message retries.
+      if (deps.archivedSessionIds?.().includes(stored.sessionId) === true) {
+        try {
+          await deps.unarchiveSession?.(stored.sessionId);
+          deps.log?.('warn', `wechat: session ${stored.sessionId} was archived; unarchived so replies continue`);
+        } catch (error) {
+          deps.log?.('warn', `wechat: unarchive of session ${stored.sessionId} failed: ${String(error)}`);
+        }
+      }
       // Evicted/restarted route: resume the durable session, never re-create.
+      // Session metadata is creation-only (ResumeAgentOptions has no meta),
+      // so it is stripped from the resume call.
       try {
+        const { meta: _resumeMeta, ...resumeShared } = shared;
         agent = await deps.agents.resume({
           resumeSessionId: stored.sessionId,
-          ...shared,
+          ...resumeShared,
           ...setupPart,
         });
         // Bump via update so a concurrent writer cannot clobber the revision.
@@ -180,13 +205,27 @@ export function createSessionRouter(deps: SessionRouterDeps): SessionRouter {
       }
     }
     if (!resumed) {
-      const sessionId = deps.sessionIdFor(routeKey);
+      let sessionId = deps.sessionIdFor(routeKey);
       const { accountId, chatJid } = parseRouteKey(routeKey);
-      agent = await deps.agents.create({
-        sessionId,
-        ...shared,
-        ...setupPart,
-      });
+      try {
+        agent = await deps.agents.create({
+          sessionId,
+          ...shared,
+          ...setupPart,
+        });
+      } catch (error) {
+        // A persisted session can still exist under a deterministic id (for
+        // example after a session-cwd migration rebind). Mint a fresh id once
+        // instead of crash-looping on `session ... already exists`.
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/already exists/i.test(message)) throw error;
+        sessionId = deps.sessionIdFor(asRouteKey(`${String(routeKey)}:${randomUUID()}`));
+        agent = await deps.agents.create({
+          sessionId,
+          ...shared,
+          ...setupPart,
+        });
+      }
       binding = {
         routeKey,
         sessionId,

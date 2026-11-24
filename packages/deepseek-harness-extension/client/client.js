@@ -36,6 +36,9 @@ window.__ModuleLoader__.load({
       groupOwner: 'Owner 与工具授权',
       groupCalls: '语音通话（默认关闭）',
       groupPush: '消息推送（默认关闭）',
+      groupSession: '会话位置',
+      sessionCwd: '会话工作目录',
+      sessionCwdHint: '微信会话创建时使用的目录；留空则自动使用第一个工作区，会话才会出现在左侧对话列表中。修改后已有的微信会话会在下一条消息时重建。',
       pushEnabled: '启用推送工具',
       pushEnabledHint: '开启后 wechat_push 工具对每个 DSH 会话可见；目标仅限下方白名单。',
       pushTargets: '推送目标',
@@ -113,6 +116,9 @@ window.__ModuleLoader__.load({
       groupOwner: 'Owner & tool grants',
       groupCalls: 'Voice calls (off by default)',
       groupPush: 'Message push (off by default)',
+      groupSession: 'Session location',
+      sessionCwd: 'Session working directory',
+      sessionCwdHint: 'Directory used when creating WeChat sessions; leave empty to use the first registered workspace so chats appear in the conversation list. Changing it rebinds existing chats on their next message.',
       pushEnabled: 'Enable push tool',
       pushEnabledHint: 'When on, the wechat_push tool is visible to every DSH session; delivery is limited to the whitelist below.',
       pushTargets: 'Push targets',
@@ -204,6 +210,7 @@ window.__ModuleLoader__.load({
       { key: 'callsInbound', path: ['calls', 'voice', 'inboundAllowFrom'], kind: 'csv', group: 'calls', pick: 'contacts' },
       { key: 'callsKeyRef', path: ['calls', 'voice', 'realtime', 'apiKeyCredentialRef'], kind: 'text', group: 'calls' },
       { key: 'pushEnabled', path: ['push', 'enabled'], kind: 'bool', group: 'push' },
+      { key: 'sessionCwd', path: ['sessionCwd'], kind: 'text', group: 'session' },
       { key: 'pushTargets', path: ['push', 'targets'], kind: 'csv', group: 'push', pick: 'both' },
     ];
     const GROUPS = [
@@ -212,6 +219,7 @@ window.__ModuleLoader__.load({
       { key: 'groupOwner', fields: FIELDS.filter((f) => f.group === 'owner') },
       { key: 'groupCalls', fields: FIELDS.filter((f) => f.group === 'calls') },
       { key: 'groupPush', fields: FIELDS.filter((f) => f.group === 'push') },
+      { key: 'groupSession', fields: FIELDS.filter((f) => f.group === 'session') },
     ];
 
     function pathGet(obj, path) {
