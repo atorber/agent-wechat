@@ -1,7 +1,7 @@
 //! Conference receive tracks, one paced uplink and optional generated diagnostics.
 use super::{
-    connect_relay, reconcile_roster, BoundConferenceReceiver, DirectAudioFrame, DirectMediaHost,
-    DirectVideoTx, MediaMetric, TxAudioJitterBuffer, TxVideoQueue,
+    connect_relay_with_early, reconcile_roster, BoundConferenceReceiver, DirectAudioFrame,
+    DirectMediaHost, DirectVideoTx, MediaMetric, TxAudioJitterBuffer, TxVideoQueue,
 };
 use crate::{
     conference_media::{ConferenceReceiver as Receiver, DecodedAudio, StreamReport},
@@ -149,7 +149,7 @@ pub fn run_conference_media_with_video<H: ConferenceMediaHost>(
             selected.connection_id,
             epoch,
         )?;
-        let socket = connect_relay(
+        let (socket, mut early_packets) = connect_relay_with_early(
             &selected,
             relay_epoch,
             started,
@@ -371,7 +371,7 @@ pub fn run_conference_media_with_video<H: ConferenceMediaHost>(
                             }
                         }
                         if last_p2s_tx.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-                            if let Ok(p2s) = encode_p2s(p2s_seq, 1, 0x19, 15) {
+                            if let Ok(p2s) = encode_p2s(p2s_seq, 2, 0x1d, 15) {
                                 p2s_seq = p2s_seq.wrapping_add(1);
                                 if let Ok(datagram) = sender.seal_qos_p2s(ready_at.elapsed(), &p2s)
                                 {
@@ -452,7 +452,14 @@ pub fn run_conference_media_with_video<H: ConferenceMediaHost>(
             stage = "receive_failed";
             let mut drained = 0usize;
             while drained < 64 {
-                match socket.recv_from(&mut buffer) {
+                let recv_outcome = if let Some(early) = early_packets.pop_front() {
+                    let n = early.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&early[..n]);
+                    Ok((n, selected.endpoint))
+                } else {
+                    socket.recv_from(&mut buffer)
+                };
+                match recv_outcome {
                     Ok((n, source)) if source == selected.endpoint && n <= 8197 => {
                         drained += 1;
                         report.datagrams += 1;
@@ -494,7 +501,22 @@ pub fn run_conference_media_with_video<H: ConferenceMediaHost>(
                             if consumed.peer_requested_keyframe {
                                 host.on_peer_keyframe_requested();
                             }
-                            if consumed.need_keyframe
+                            if audio.is_some() {
+                                for frame in consumed.audio {
+                                    host.receive_track_pcm(member, bound.generation, frame)?;
+                                }
+                            }
+                            let mut need_keyframe = consumed.need_keyframe;
+                            if let Some(video_frame) = consumed.video {
+                                host.receive_video(video_frame)?;
+                            }
+                            while let Some(video_frame) = bound.receiver.pop_ready_video() {
+                                if video_frame.prior_frames_dropped && !video_frame.is_keyframe {
+                                    need_keyframe = true;
+                                }
+                                host.receive_video(video_frame)?;
+                            }
+                            if need_keyframe
                                 && last_irequest_tx
                                     .get(&member)
                                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(1200))
@@ -518,14 +540,6 @@ pub fn run_conference_media_with_video<H: ConferenceMediaHost>(
                                         last_irequest_tx.insert(member, Instant::now());
                                     }
                                 }
-                            }
-                            if audio.is_some() {
-                                for frame in consumed.audio {
-                                    host.receive_track_pcm(member, bound.generation, frame)?;
-                                }
-                            }
-                            if let Some(video_frame) = consumed.video {
-                                host.receive_video(video_frame)?;
                             }
                         } else {
                             report.unselected_member += 1;

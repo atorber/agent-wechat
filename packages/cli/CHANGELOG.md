@@ -1,5 +1,27 @@
 # @agent-wechat/cli
 
+## 3.0.0-beta.5
+
+### Patch Changes
+
+- [#674](https://github.com/thisnick/agent-wechat/pull/674) [`a59d3ab`](https://github.com/thisnick/agent-wechat/commit/a59d3ab67274c74070f49f926b8b74443cb1f36c) Thanks [@thisnick](https://github.com/thisnick)! - Improve direct video call startup and keyframe recovery, including camera-off answers.
+
+  - Cache the latest contiguous inbound video GOP (or latest JPEG frame) per active receive track in `CallService` and replay it immediately when a client attaches its media socket (`attach_media`), eliminating the early-keyframe drop race between call connection and media WebSocket setup; if pre-attach frames arrived without a contiguous keyframe, trigger `request_video_keyframe` immediately on attach.
+  - Apply receive P-frame loss gating and cached VPS/SPS/PPS parameter-set prepending to passthrough (`H.264`/`H.265`) tracks as well as transcoded tracks, so passthrough WebCodecs/H.264 decoders do not stall on unreferenced P-frames or bare recovery IDRs.
+  - Join and invite direct video calls with the video status bit set (`av_status = 3`) even when `cameraEnabled` is `false` (while keeping local camera send inactive) so the relay forwards initial keyframe requests, then send `SwitchAV` to clear the camera bit once the first remote frame arrives or the startup grace window elapses.
+  - Send unforced (`force = false`) direct-call `0x66` `IRequest` packets by default so remote hardware encoders run their keyframe-request callback, escalating to `force = true` after unanswered retries and pacing retries at 1000 ms.
+
+## 3.0.0-beta.4
+
+### Patch Changes
+
+- [#669](https://github.com/thisnick/agent-wechat/pull/669) [`72c6055`](https://github.com/thisnick/agent-wechat/commit/72c6055abac1eaff737cc431f9e4288d4aa7a3a4) Thanks [@thisnick](https://github.com/thisnick)! - Fix incoming direct video calls failing to receive and decode remote video.
+
+  - Send `mode.av_status()` (`3` for video, `1` for voice) in `AckReq` field 13, set `group` field 7 (`member_flag`) to `1` after `AckRsp` on incoming joins, and send `network_type = 4` in `RelayCheckIn` field 13 so peers stream video on incoming direct video calls.
+  - Buffer non-check-in datagrams arriving during the UDP relay handshake (`connect_relay_with_early`) and match the 200 ms check-in retransmit interval so incoming video frame #0 IDR bursts are preserved instead of discarded.
+  - Stop dropping real RSM video packets whose `EncFecHeader` byte 13 bit 4 (`0x10`) bandwidth-probe flag is set (mobile H.264 IDR keyframe packets carry this bit alongside valid SPS/PPS/IDR bytes), while keeping `f_tot_pkts == 0 || f_pkt_idx == 0 || s_per_group == 0` filtering for degenerate/padding-only headers.
+  - Advertise `HW265` (`0x04` and fields 21/22) plus standard video feature bits (`0x3f9d`, excluding proprietary `Vcodec1`/`MixVcodec1`), accept `extension_byte <= 2` on `0x20`/`0x40` video packets, send the initial `0x70` control probe after relay Ready, align `encode_p2s` with the nested `inner.f1` + `inner.f3.f1` wire layout, and encode 64-bit `lost_point_seq` and `force` in `encode_irequest_with_force`.
+
 ## 3.0.0-beta.3
 
 ### Patch Changes
