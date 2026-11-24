@@ -27,6 +27,7 @@
     "fix-calls-ipv6-relay-checkin",
     "fix-incoming-video-call-rx",
     "fix-incoming-video-keyframe-recovery",
+    "fix-local-call-video-preview-framing",
     "fix-rsm-additive-fec-parity",
     "fix-video-calls-reliability-and-preview",
     "fix-video-calls-self-view-cli-and-smoothness",

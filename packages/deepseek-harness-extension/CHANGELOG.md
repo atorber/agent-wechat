@@ -1,5 +1,7 @@
 # @agent-wechat/deepseek-harness-extension
 
+## 3.0.0-beta.7
+
 ## 3.0.0-beta.6
 
 ### Minor Changes
