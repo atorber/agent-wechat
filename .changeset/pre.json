@@ -8,8 +8,7 @@
     "@agent-wechat/desktop": "2.9.0",
     "@agent-wechat/agent-wechat": "2.9.0",
     "@agent-wechat/rust-crates": "2.9.0",
-    "@agent-wechat/shared": "2.2.0",
-    "@agent-wechat/deepseek-harness-extension": "3.0.0-beta.1"
+    "@agent-wechat/shared": "2.2.0"
   },
   "changesets": [
     "big-xml-forwarded-cards",
@@ -27,13 +26,16 @@
     "fix-calls-ipv6-relay-checkin",
     "fix-incoming-video-call-rx",
     "fix-incoming-video-keyframe-recovery",
+    "fix-local-call-video-preview-framing",
     "fix-rsm-additive-fec-parity",
+    "fix-video-call-recovery-and-conference-teardown",
     "fix-video-calls-reliability-and-preview",
     "fix-video-calls-self-view-cli-and-smoothness",
     "github-star-support-prompt",
     "native-video-calls-protocol-v3",
     "openclaw-2026-11-7",
     "receive-vweixinf-stickers",
+    "refactor-calls-protocol-runtime-boundary",
     "wecom-tp-media-downloads"
   ]
 }

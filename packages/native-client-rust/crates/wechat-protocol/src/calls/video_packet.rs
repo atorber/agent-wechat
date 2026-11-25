@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 
 /// Maximum unframed Annex-B access unit accepted by the packetizer or reassembler.
 pub const MAX_VIDEO_FRAME_BYTES: usize = 512 * 1024;
+/// Maximum packet sequence ranges encoded in a single `0x06` video NACK payload.
+pub const MAX_VIDEO_NACK_RANGES: usize = 16;
 /// Default source payload chunk size per UDP video packet (leaves room for Live96/Live98 + RSM headers inside MTU).
 pub const DEFAULT_RSM_CHUNK_BYTES: usize = 1100;
 /// Default wire orientation code (`2` = upright 0° in `EncFecHeader` byte 13 bits 7..5).
@@ -177,8 +179,11 @@ pub fn encode_irequest(
     )
 }
 
-/// Encode a 58-byte `0x66` `IRequest` keyframe request packet with explicit
+/// Encode a 58-byte `0x66` `IRequest` camera keyframe request packet with explicit
 /// `ullLostPointSeq` (`body[0x24..0x2c]`) and `force` flag (`body[0x2c] & 1`).
+///
+/// Bit 1 of `body[0x2c..0x30]` selects screen-share (`1`) versus camera (`0`)
+/// video and remains `0` for camera streams.
 pub fn encode_irequest_with_force(
     local_member: u16,
     target_member: u16,
@@ -190,6 +195,7 @@ pub fn encode_irequest_with_force(
     let mut out = vec![0u8; 58];
     let local_packed = pack_rtcp_member(local_member, stream_id);
     let target_packed = pack_rtcp_member(target_member, stream_id);
+    let flags = u32::from(force);
     out[0] = 0x66;
     out[1] = local_packed[0];
     out[2] = local_packed[1];
@@ -201,7 +207,7 @@ pub fn encode_irequest_with_force(
     out[6 + 0x0c] = 0x03;
     out[6 + 0x1c..6 + 0x24].copy_from_slice(&timestamp_ms.to_le_bytes());
     out[6 + 0x24..6 + 0x2c].copy_from_slice(&lost_point_seq.to_le_bytes());
-    out[6 + 0x2c..6 + 0x30].copy_from_slice(&u32::from(force).to_le_bytes());
+    out[6 + 0x2c..6 + 0x30].copy_from_slice(&flags.to_le_bytes());
     out
 }
 
@@ -220,6 +226,92 @@ pub fn parse_irequest(payload: &[u8]) -> Result<VideoIRequest> {
         target_member,
         target_stream_id,
         timestamp_ms,
+    })
+}
+
+/// Decoded `0x06` video ARQ/NACK payload carried on `0x60..0x6f` (TX) / `0x20..0x2f` (RX).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoNack {
+    /// Target member ID whose sender should retransmit the missing packets.
+    pub target_member: u16,
+    /// Target video stream ID.
+    pub target_stream_id: u8,
+    /// Requesting member ID.
+    pub local_member: u16,
+    /// Requesting video stream ID.
+    pub local_stream_id: u8,
+    /// Nonzero for screen-share streams; `0` for camera video.
+    pub is_screen: u8,
+    /// Monotonic wrapping NACK sequence number.
+    pub arq_seq: u8,
+    /// Half-open `[start_seq, end_seq)` missing 16-bit packet sequence ranges (`pkg_seq`).
+    pub ranges: Vec<(u16, u16)>,
+}
+
+/// Encode a `0x06` video ARQ/NACK payload for `packed_kind = 0x60 | stream_id`.
+///
+/// Empty ranges (`start == end`) are omitted and the list is bounded to
+/// [`MAX_VIDEO_NACK_RANGES`].
+pub fn encode_video_nack(
+    local_member: u16,
+    target_member: u16,
+    stream_id: u8,
+    arq_seq: u8,
+    ranges: &[(u16, u16)],
+) -> Vec<u8> {
+    let valid: Vec<(u16, u16)> = ranges
+        .iter()
+        .copied()
+        .filter(|(start, end)| start != end)
+        .take(MAX_VIDEO_NACK_RANGES)
+        .collect();
+    let target_packed = pack_rtcp_member(target_member, stream_id);
+    let local_packed = pack_rtcp_member(local_member, stream_id);
+    let mut out = Vec::with_capacity(8 + valid.len() * 4 + 16);
+    out.push(0x06);
+    out.extend_from_slice(&target_packed);
+    out.extend_from_slice(&local_packed);
+    out.push(0x00); // camera video (non-screen)
+    out.push(arq_seq);
+    out.push(valid.len() as u8);
+    for (start, end) in valid {
+        out.extend_from_slice(&start.to_be_bytes());
+        out.extend_from_slice(&end.to_be_bytes());
+    }
+    out.extend_from_slice(&[0u8; 16]);
+    out
+}
+
+/// Parse a `0x06` video ARQ/NACK payload.
+pub fn parse_video_nack(payload: &[u8]) -> Result<VideoNack> {
+    ensure!(
+        payload.len() >= 8 && payload[0] == 0x06,
+        "Invalid video NACK packet"
+    );
+    let (target_member, target_stream_id) = unpack_rtcp_member(payload[1], payload[2]);
+    let (local_member, local_stream_id) = unpack_rtcp_member(payload[3], payload[4]);
+    let is_screen = payload[5];
+    let arq_seq = payload[6];
+    let count = usize::from(payload[7]);
+    ensure!(
+        count <= 49 && payload.len() >= 8 + count * 4,
+        "Truncated video NACK ranges"
+    );
+    let mut ranges = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 8 + i * 4;
+        let start = u16::from_be_bytes([payload[off], payload[off + 1]]);
+        let end = u16::from_be_bytes([payload[off + 2], payload[off + 3]]);
+        ranges.push((start, end));
+    }
+    Ok(VideoNack {
+        target_member,
+        target_stream_id,
+        local_member,
+        local_stream_id,
+        is_screen,
+        arq_seq,
+        ranges,
     })
 }
 
@@ -310,6 +402,178 @@ pub fn parse_s2p(payload: &[u8]) -> Result<ParsedS2p> {
     Ok(parsed)
 }
 
+/// Per-interval video QoS telemetry reported in `0x0b` MP P2S packets (`video_p2s` + `video_new_p2s`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoP2sReport {
+    /// Remote sender member ID (`video_p2s` field 1).
+    pub remote_member_id: u32,
+    /// Video stream ID (`video_p2s` field 2).
+    pub stream_id: u32,
+    /// Relay connection ID (`video_new_p2s.videoLink` field 1).
+    pub conn_id: u32,
+    /// Maximum inter-packet arrival gap in the reporting interval in milliseconds (`field 5`).
+    pub recv_data_interval_ms: u32,
+    /// Smoothed inter-arrival delay/jitter estimate in milliseconds (`field 6`).
+    pub delay_ms: u32,
+    /// Estimated receive bandwidth in kbps (`field 7`).
+    pub est_bw_kbps: u32,
+    /// Outbound video bitrate in kbps (`field 8`).
+    pub send_kbps: u32,
+    /// Inbound video bitrate in kbps (`field 9`).
+    pub recv_kbps: u32,
+    /// Outbound video frame rate (`field 10`).
+    pub send_fps: u32,
+    /// Inbound video frame rate (`field 11`).
+    pub recv_fps: u32,
+    /// Local capture frame rate (`field 12`).
+    pub capt_fps: u32,
+    /// Packet loss percentage (`0..=100`, `field 14`).
+    pub loss_pct: u32,
+    /// Supported video codec capability bitmask (`field 24`).
+    pub codec_support_mask: u32,
+    /// Lost packet count in the reporting interval (`field 26`).
+    pub loss_pkts: u32,
+    /// Active receive wire codec (`9` = H.264, `15` = H.265, `field 29`).
+    pub decode_type: u32,
+    /// Rendered/delivered frame rate (`field 30`).
+    pub play_fps: u32,
+    /// Cumulative delivered frame count (`field 31`).
+    pub play_frames: u32,
+    /// Light freeze event count (`200..500 ms` gaps, `field 32`).
+    pub light_freeze_cnt: u32,
+    /// Heavy freeze event count (`>= 500 ms` gaps, `field 33`).
+    pub heavy_freeze_cnt: u32,
+    /// Percentage of the interval spent in light freeze (`0..=100`, `field 34`).
+    pub light_freeze_time_ratio: u32,
+    /// Percentage of the interval spent in heavy freeze (`0..=100`, `field 35`).
+    pub heavy_freeze_time_ratio: u32,
+    /// Short-window packet loss percentage (`0..=100`, `field 47`).
+    pub short_loss_pct: u32,
+    /// Smoothed long-window packet loss percentage (`0..=100`, `field 48`).
+    pub long_loss_pct: u32,
+    /// Received packet count in the reporting interval (`videoLink` field 2).
+    pub recv_pkgs: u32,
+    /// Expected active remote member count (`videoLink` field 4).
+    pub expected_member_num: u32,
+    /// Actual active remote member count delivering video (`videoLink` field 5).
+    pub actual_member_num: u32,
+    /// Packets recovered via ARQ/NACK retransmission in the interval (`videoLink` field 6).
+    pub recv_arq_resp_pkgs: u32,
+}
+
+impl Default for VideoP2sReport {
+    fn default() -> Self {
+        Self {
+            remote_member_id: 0,
+            stream_id: 1,
+            conn_id: 0,
+            recv_data_interval_ms: 0,
+            delay_ms: 0,
+            est_bw_kbps: 500,
+            send_kbps: 500,
+            recv_kbps: 500,
+            send_fps: 15,
+            recv_fps: 15,
+            capt_fps: 15,
+            loss_pct: 0,
+            codec_support_mask: 0x1d,
+            loss_pkts: 0,
+            decode_type: 15,
+            play_fps: 15,
+            play_frames: 0,
+            light_freeze_cnt: 0,
+            heavy_freeze_cnt: 0,
+            light_freeze_time_ratio: 0,
+            heavy_freeze_time_ratio: 0,
+            short_loss_pct: 0,
+            long_loss_pct: 0,
+            recv_pkgs: 0,
+            expected_member_num: 1,
+            actual_member_num: 1,
+            recv_arq_resp_pkgs: 0,
+        }
+    }
+}
+
+fn encode_p2s_client_header() -> Result<Vec<u8>> {
+    p::message(&[
+        p::uint(1, 11),
+        p::uint(2, 0),
+        p::uint(3, 0),
+        p::uint(4, 1),
+        p::uint(5, 4),
+        p::uint(6, 111),
+        p::uint(7, 0x050000cb),
+    ])
+}
+
+/// Encode an `0x0b` MP P2S QoS heartbeat payload for `packed_kind = 0x30`
+/// using the supplied live receiver/sender telemetry (`inner.f1` + `inner.f3.f1` + `inner.f6.f1`).
+pub fn encode_p2s_report(sequence: u16, cap_seq: u32, report: &VideoP2sReport) -> Result<Vec<u8>> {
+    let client_hdr = encode_p2s_client_header()?;
+    let loss_clamped = report.loss_pct.min(100);
+    let short_loss = report.short_loss_pct.min(100);
+    let long_loss = report.long_loss_pct.min(100);
+    let video_p2s = p::message(&[
+        p::uint(1, u64::from(report.remote_member_id)),
+        p::uint(2, u64::from(report.stream_id)),
+        p::uint(4, 0x7e),
+        p::uint(5, u64::from(report.recv_data_interval_ms)),
+        p::uint(6, u64::from(report.delay_ms)),
+        p::uint(7, u64::from(report.est_bw_kbps.min(u32::from(u16::MAX)))),
+        p::uint(8, u64::from(report.send_kbps.min(u32::from(u16::MAX)))),
+        p::uint(9, u64::from(report.recv_kbps.min(u32::from(u16::MAX)))),
+        p::uint(10, u64::from(report.send_fps.min(255))),
+        p::uint(11, u64::from(report.recv_fps.min(255))),
+        p::uint(12, u64::from(report.capt_fps.min(255))),
+        p::uint(14, u64::from(loss_clamped)),
+        p::uint(15, 15),
+        p::uint(16, 8),
+        p::uint(17, 1),
+        p::uint(19, 1),
+        p::uint(20, 1),
+        p::uint(24, u64::from(report.codec_support_mask)),
+        p::uint(26, u64::from(report.loss_pkts)),
+        p::uint(29, u64::from(report.decode_type)),
+        p::uint(30, u64::from(report.play_fps.min(255))),
+        p::uint(31, u64::from(report.play_frames)),
+        p::uint(32, u64::from(report.light_freeze_cnt)),
+        p::uint(33, u64::from(report.heavy_freeze_cnt)),
+        p::uint(34, u64::from(report.light_freeze_time_ratio.min(100))),
+        p::uint(35, u64::from(report.heavy_freeze_time_ratio.min(100))),
+        p::uint(47, u64::from(short_loss)),
+        p::uint(48, u64::from(long_loss)),
+    ])?;
+    let video_wrapper = p::message(&[p::bytes(1, &video_p2s)])?;
+    let mut inner_fields = vec![p::bytes(1, &client_hdr), p::bytes(3, &video_wrapper)];
+    if report.conn_id != 0 || report.recv_pkgs != 0 || report.recv_arq_resp_pkgs != 0 {
+        let video_link = p::message(&[
+            p::uint(1, u64::from(report.conn_id)),
+            p::uint(2, u64::from(report.recv_pkgs.min(u32::from(u16::MAX)))),
+            p::uint(3, u64::from(loss_clamped)),
+            p::uint(4, u64::from(report.expected_member_num.min(255))),
+            p::uint(5, u64::from(report.actual_member_num.min(255))),
+            p::uint(
+                6,
+                u64::from(report.recv_arq_resp_pkgs.min(u32::from(u16::MAX))),
+            ),
+        ])?;
+        let video_new_wrapper = p::message(&[p::bytes(1, &video_link)])?;
+        inner_fields.push(p::bytes(6, &video_new_wrapper));
+    }
+    let inner = p::message(&inner_fields)?;
+    let outer = p::message(&[
+        p::uint(1, u64::from(sequence)),
+        p::uint(2, u64::from(cap_seq)),
+        p::bytes(3, &inner),
+        p::uint(4, 2),
+    ])?;
+    let mut out = Vec::with_capacity(1 + outer.len());
+    out.push(0x0b);
+    out.extend_from_slice(&outer);
+    Ok(out)
+}
+
 /// Encode an `0x0b` MP P2S QoS heartbeat payload for `packed_kind = 0x30`
 /// matching the nested `inner.f1` (client header) + `inner.f3.f1` (`video_p2s`) wire layout.
 pub fn encode_p2s(
@@ -318,15 +582,7 @@ pub fn encode_p2s(
     codec_support_mask: u32,
     decode_type: u32,
 ) -> Result<Vec<u8>> {
-    let client_hdr = p::message(&[
-        p::uint(1, 11),
-        p::uint(2, 0),
-        p::uint(3, 0),
-        p::uint(4, 1),
-        p::uint(5, 4),
-        p::uint(6, 111),
-        p::uint(7, 0x050000cb),
-    ])?;
+    let client_hdr = encode_p2s_client_header()?;
     let video_p2s = p::message(&[
         p::uint(1, 0),
         p::uint(2, 1),
@@ -537,6 +793,253 @@ pub fn split_annexb_nalus(data: &[u8]) -> Vec<(usize, usize, usize)> {
         }
     }
     out
+}
+
+/// Return `true` when an Annex-B access unit contains an IDR/IRAP keyframe NALU for `codec`.
+pub fn is_annexb_keyframe(codec: VideoWireCodec, annexb: &[u8]) -> bool {
+    split_annexb_nalus(annexb)
+        .into_iter()
+        .any(|(start, _end, sc_len)| classify_nalu(codec, annexb[start + sc_len]).1)
+}
+
+/// Extract the wire NALU type number for every Annex-B NALU in `annexb`.
+pub fn annexb_nalu_types(codec: VideoWireCodec, annexb: &[u8]) -> Vec<u8> {
+    split_annexb_nalus(annexb)
+        .into_iter()
+        .map(|(start, _end, sc_len)| {
+            let header_byte = annexb[start + sc_len];
+            match codec {
+                VideoWireCodec::H265 => (header_byte >> 1) & 0x3f,
+                _ => header_byte & 0x1f,
+            }
+        })
+        .collect()
+}
+
+/// Advance a monotonic 64-bit sequence counter from a wrapping 16-bit wire sequence number.
+///
+/// When `prev` is `None`, anchors at `u64::from(seq16)` (supporting high initial values such as
+/// `>= 0x8000`). Older or out-of-order sequences (negative signed 16-bit delta) leave the
+/// counter unchanged.
+pub const fn advance_seq16(prev: Option<u64>, seq16: u16) -> u64 {
+    match prev {
+        None => seq16 as u64,
+        Some(current) => {
+            let delta = seq16.wrapping_sub(current as u16) as i16;
+            if delta > 0 {
+                current.wrapping_add(delta as u64)
+            } else {
+                current
+            }
+        }
+    }
+}
+
+/// Parsed header of an MP/iLink kind-3 RSM video packet (`[codecType, mid/sid, EncFecHeader, TLV]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RsmPacketHeader {
+    /// Wire codec identifier from byte 0 of the MP/iLink prefix.
+    pub codec: VideoWireCodec,
+    /// Sender member ID from bytes 1..3.
+    pub member_id: u16,
+    /// Video stream ID from bytes 1..3 (`0..=15`).
+    pub stream_id: u8,
+    /// Full reconstructed 16-bit frame index (`(frame_idx_hi << 5) | frame_idx_lo`).
+    pub frame_index: u32,
+    /// Wrapping 16-bit total packet sequence (`EncFecHeader[2..4]`, incremented for all kind-3 packets).
+    pub total_pkg_seq: u16,
+    /// Wrapping 16-bit media packet sequence (`EncFecHeader[4..6]`), or `None` for virtual-frame
+    /// metadata and degenerate/padding packets outside the media sequence space.
+    pub pkg_seq: Option<u16>,
+    /// Sender millisecond timestamp (`EncFecHeader[6..10]`).
+    pub timestamp_ms: u32,
+    /// Raw 3-bit orientation code from `EncFecHeader` byte 13 bits 7..5 (`0..=7`).
+    pub orientation: u8,
+    /// Display orientation parsed from a virtual-frame `VideoPktExtHeader` protobuf (`field 3`), if present.
+    pub virtual_frame_orientation: Option<u8>,
+    /// True when `EncFecHeader` byte 0 bit 2 marks an IDR/keyframe packet.
+    pub is_iframe: bool,
+    /// True when the header matches a virtual-frame metadata packet (`s = 1, r = 0, x = 1, pkg_idx = 3`).
+    pub is_virtual_frame: bool,
+    /// Number of framed sections (`(hdr[12] & 0x03) + 1`, `1..=4`).
+    pub frame_count: u8,
+    /// Number of horizontal FEC groups (`1..=7`).
+    pub x_groups: u8,
+    /// Zero-based horizontal FEC group index (`0..=7`).
+    pub group_idx_x: u8,
+    /// Number of 2D vertical FEC parity groups (`0..=7`).
+    pub y_groups: u8,
+    /// True when this packet carries 2D vertical RS parity data.
+    pub is_vert_parity: bool,
+    /// Zero-based vertical FEC parity group index (`0..=7`).
+    pub vert_group_idx: u8,
+    /// Source chunk count in this horizontal group (`s_per_group`).
+    pub s_per_group: u16,
+    /// Horizontal Reed-Solomon parity count in this group (`r_per_group`).
+    pub r_per_group: u16,
+    /// One-based packet index within its FEC group (`1..=s_per_group + r_per_group`).
+    pub pkg_idx_in_group: u16,
+    /// One-based packet index within the overall frame (`f_pkt_idx`).
+    pub frame_pkt_idx: u16,
+    /// Total advertised packets in the overall frame (`f_tot_pkts`).
+    pub frame_total_pkts: u16,
+    /// High byte of XPS section length (`xps_len >> 16`) from TLV `0x0002`.
+    pub xps_len_hi: u8,
+    /// High byte of slice section length (`slice_len >> 16`) from TLV `0x0002`.
+    pub slice_len_hi: u8,
+    /// Byte offset where the RSM packet payload starts (`3 + 21 + ext_len`).
+    pub payload_offset: usize,
+}
+
+/// Parse the 3-byte MP/iLink prefix, 21-byte kind-3 `EncFecHeader`, and TLV extensions of a
+/// decrypted RSM video packet without mutating reassembly state.
+pub fn parse_rsm_packet_header(packet: &[u8]) -> Result<RsmPacketHeader> {
+    ensure!(
+        packet.len() >= 3 + 21,
+        "Truncated MP/iLink RSM video packet"
+    );
+    let codec = VideoWireCodec::from_wire(packet[0]);
+    let ms = u16::from_le_bytes([packet[1], packet[2]]);
+    let member_id = ms & 0x7ff;
+    let stream_id = ((ms >> 11) & 0x0f) as u8;
+
+    let hdr = &packet[3..];
+    let hkind = hdr[0] & 0x03;
+    ensure!(hkind == 3, "Unsupported RSM video header kind {hkind}");
+    let is_iframe = (hdr[0] & 0x04) != 0;
+    let frame_idx_lo = u32::from(hdr[0] >> 3);
+
+    let r_lo2 = u32::from(hdr[1] & 0x03);
+    let pkg_idx_lo6 = usize::from(hdr[1] >> 2);
+    let total_pkg_seq = u16::from_be_bytes([hdr[2], hdr[3]]);
+    let raw_pkg_seq = u16::from_be_bytes([hdr[4], hdr[5]]);
+    let timestamp_ms = u32::from_be_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
+    let frame_count = (hdr[12] & 0x03) + 1;
+    let s_lo6 = usize::from(hdr[12] >> 2);
+    let orientation = hdr[13] >> 5;
+    let r_mid2 = u32::from(hdr[13] & 0x03);
+    let r_hi4 = u32::from(hdr[14] & 0x0f);
+    // RS parity count uses additive overflow across `r_lo2` (0..=3), `r_mid2` (0..=3),
+    // and `r_hi4` (0..=15), matching `s_per_group` and `pkg_idx_in_group`.
+    let r_full = (r_lo2 + r_mid2 + r_hi4) as usize;
+    let group_idx_x = hdr[14] >> 5;
+    let x_groups = (hdr[15] & 0x07).max(1);
+
+    let s_ovf_lo = usize::from(hdr[16]);
+    let pkg_ovf_lo = usize::from(hdr[17]);
+    let f_pkt_lo = usize::from(hdr[18]);
+    let f_tot_lo = usize::from(hdr[19]);
+    let ext_len = usize::from(hdr[20]);
+    ensure!(21 + ext_len <= hdr.len(), "Truncated RSM video extension");
+
+    let ext = &hdr[21..21 + ext_len];
+    let mut s_ovf_hi = 0usize;
+    let mut pkg_ovf_hi = 0usize;
+    let mut f_pkt_hi = 0usize;
+    let mut f_tot_hi = 0usize;
+    let mut xps_len_hi = 0u8;
+    let mut slice_len_hi = 0u8;
+    let mut frame_idx_hi = 0u32;
+    let mut y_groups = 0u8;
+    let mut is_vert_parity = false;
+    let mut vert_group_idx = 0u8;
+
+    if ext_len >= 2 {
+        let ext_mask = u16::from_be_bytes([ext[0], ext[1]]);
+        let mut pos = 2usize;
+        if ext_mask & 0x0001 != 0 && pos + 2 <= ext_len {
+            s_ovf_hi = usize::from(ext[pos] & 0x0f);
+            pkg_ovf_hi = usize::from(ext[pos] >> 4);
+            f_pkt_hi = usize::from(ext[pos + 1] & 0x0f);
+            f_tot_hi = usize::from(ext[pos + 1] >> 4);
+            pos += 2;
+        }
+        if ext_mask & 0x0002 != 0 && pos + 2 <= ext_len {
+            xps_len_hi = ext[pos];
+            slice_len_hi = ext[pos + 1];
+            pos += 2;
+        }
+        if ext_mask & 0x0004 != 0 && pos + 2 <= ext_len {
+            frame_idx_hi = u32::from(ext[pos]) | (u32::from(ext[pos + 1] & 0x07) << 8);
+            pos += 2;
+        }
+        if ext_mask & 0x0010 != 0 && !is_iframe && pos < ext_len {
+            let b = ext[pos];
+            let num_entries = usize::from(b & 0x3f);
+            let bits_per_entry = usize::from(b >> 6) + 1;
+            let bit_bytes = if num_entries == 0 {
+                0
+            } else {
+                (num_entries * bits_per_entry).div_ceil(8)
+            };
+            pos = pos.saturating_add(1 + bit_bytes);
+        }
+        if ext_mask & 0x0020 != 0 && pos < ext_len {
+            let b = ext[pos];
+            y_groups = b & 0x07;
+            is_vert_parity = (b & 0x08) != 0;
+            vert_group_idx = (b >> 4) & 0x07;
+            pos += 1;
+        }
+        let _ = pos;
+    }
+
+    let s_per_group = (s_lo6 + s_ovf_lo + (s_ovf_hi << 8)) as u16;
+    let r_per_group = r_full as u16;
+    let pkg_idx_in_group = (pkg_idx_lo6 + pkg_ovf_lo + (pkg_ovf_hi << 8)) as u16;
+    let frame_pkt_idx = (f_pkt_lo + (f_pkt_hi << 8)) as u16;
+    let frame_total_pkts = (f_tot_lo + (f_tot_hi << 8)) as u16;
+    let frame_index = (frame_idx_hi << 5) | frame_idx_lo;
+    let payload_offset = 3 + 21 + ext_len;
+    let payload = &packet[payload_offset..];
+
+    // Virtual-frame metadata packets (`s = 1, r = 0, x = 1, pkg_idx = 3`) carry the
+    // `workMode = 3` protobuf header (including `field 3 = orientation`) after a
+    // 128-byte leading block and do not advance `pkg_seq`.
+    let is_virtual_frame =
+        s_per_group == 1 && r_per_group == 0 && x_groups == 1 && pkg_idx_in_group == 3;
+    let virtual_frame_orientation = if is_virtual_frame && payload.len() > 0x80 {
+        p::decode(&payload[0x80..])
+            .ok()
+            .and_then(|fields| opt_u32(&fields, 3).ok().flatten())
+            .map(|v| (v & 0x07) as u8)
+    } else {
+        None
+    };
+    let pkg_seq = (!is_virtual_frame
+        && frame_total_pkts > 0
+        && frame_pkt_idx > 0
+        && s_per_group > 0
+        && pkg_idx_in_group > 0)
+        .then_some(raw_pkg_seq);
+
+    Ok(RsmPacketHeader {
+        codec,
+        member_id,
+        stream_id,
+        frame_index,
+        total_pkg_seq,
+        pkg_seq,
+        timestamp_ms,
+        orientation,
+        virtual_frame_orientation,
+        is_iframe,
+        is_virtual_frame,
+        frame_count,
+        x_groups,
+        group_idx_x,
+        y_groups,
+        is_vert_parity,
+        vert_group_idx,
+        s_per_group,
+        r_per_group,
+        pkg_idx_in_group,
+        frame_pkt_idx,
+        frame_total_pkts,
+        xps_len_hi,
+        slice_len_hi,
+        payload_offset,
+    })
 }
 
 /// Stateful MP/iLink kind-3 RSM video packetizer (zero-FEC uncoded `x = 1, r = 0, y = 0`).
@@ -799,12 +1302,18 @@ struct PendingAssembly {
     is_iframe: bool,
     frame_count: u8,
     x_groups: usize,
-    s_per_group: usize,
-    r_per_group: usize,
     y_groups: usize,
     xps_len_hi: u8,
     slice_len_hi: u8,
-    /// Per-horizontal-group packets keyed by `slot_in_group` (`0..s` source, `s..s+r` parity).
+    /// Per-horizontal-group source packet counts (`s_per_group` per `group_idx_x`).
+    /// In 1D multi-group frames (`x_groups >= 2, y_groups == 0`), the trailing group
+    /// carries fewer source packets when total source chunks is not divisible by `x_groups`.
+    group_s: Vec<Option<usize>>,
+    /// Per-horizontal-group RS parity packet counts (`r_per_group` per `group_idx_x`).
+    group_r: Vec<Option<usize>>,
+    /// Uniform `s_per_group` advertised on 2D (`y_groups > 0`) packets, when present.
+    vert_s_per_group: Option<usize>,
+    /// Per-horizontal-group packets keyed by `slot_in_group` (`0..s_g` source, `s_g..s_g+r_g` parity).
     groups: Vec<BTreeMap<usize, Vec<u8>>>,
     /// 2D vertical parity packets keyed by `(vert_group_idx, col)` where `col in 0..s`.
     vert_parity: BTreeMap<(usize, usize), Vec<u8>>,
@@ -823,14 +1332,27 @@ fn grace_frames_for(is_iframe: bool, r_per_group: usize, y_groups: usize) -> u32
 }
 
 impl PendingAssembly {
+    fn max_r(&self) -> usize {
+        self.group_r.iter().flatten().copied().max().unwrap_or(0)
+    }
+
     fn grace_frames(&self) -> u32 {
-        grace_frames_for(self.is_iframe, self.r_per_group, self.y_groups)
+        grace_frames_for(self.is_iframe, self.max_r(), self.y_groups)
+    }
+
+    fn effective_group_s(&self, g: usize) -> Option<usize> {
+        self.group_s
+            .get(g)
+            .copied()
+            .flatten()
+            .or(self.vert_s_per_group)
     }
 
     fn source_chunks_complete(&self) -> bool {
-        self.groups
-            .iter()
-            .all(|g| (0..self.s_per_group).all(|col| g.contains_key(&col)))
+        (0..self.x_groups).all(|g| {
+            self.effective_group_s(g)
+                .is_some_and(|s_g| s_g > 0 && (0..s_g).all(|col| self.groups[g].contains_key(&col)))
+        })
     }
 
     /// Attempt horizontal (and, when present, 2D vertical) systematic RS erasure recovery.
@@ -850,21 +1372,23 @@ impl PendingAssembly {
     }
 
     fn recover_horizontal_groups(&mut self) -> bool {
-        if self.r_per_group == 0
-            || self.s_per_group == 0
-            || self.s_per_group + self.r_per_group > 255
-        {
-            return false;
-        }
         let mut recovered = false;
-        for group in &mut self.groups {
-            let missing_src = (0..self.s_per_group)
-                .filter(|col| !group.contains_key(col))
-                .count();
-            if missing_src == 0 || group.len() < self.s_per_group {
+        for g in 0..self.x_groups {
+            let Some(s_g) = self.group_s[g].or(self.vert_s_per_group) else {
+                continue;
+            };
+            let Some(r_g) = self.group_r[g] else {
+                continue;
+            };
+            if r_g == 0 || s_g == 0 || s_g + r_g > 255 {
                 continue;
             }
-            if rs_recover_group(self.s_per_group, self.r_per_group, group) {
+            let group = &mut self.groups[g];
+            let missing_src = (0..s_g).filter(|col| !group.contains_key(col)).count();
+            if missing_src == 0 || group.len() < s_g {
+                continue;
+            }
+            if rs_recover_group(s_g, r_g, group) {
                 recovered = true;
             }
         }
@@ -872,11 +1396,18 @@ impl PendingAssembly {
     }
 
     fn recover_vertical_columns(&mut self) -> bool {
-        if self.y_groups == 0 || self.x_groups < 2 || self.x_groups + self.y_groups > 255 {
+        let Some(s_vert) = self.vert_s_per_group else {
+            return false;
+        };
+        if self.y_groups == 0
+            || self.x_groups < 2
+            || s_vert == 0
+            || self.x_groups + self.y_groups > 255
+        {
             return false;
         }
         let mut recovered = false;
-        for col in 0..self.s_per_group {
+        for col in 0..s_vert {
             let mut col_map = BTreeMap::<usize, Vec<u8>>::new();
             let mut missing_src = 0usize;
             for g in 0..self.x_groups {
@@ -902,6 +1433,7 @@ impl PendingAssembly {
                     if !self.groups[g].contains_key(&col) {
                         if let Some(pkt) = col_map.remove(&g) {
                             self.groups[g].insert(col, pkt);
+                            self.group_s[g] = Some(s_vert);
                             recovered = true;
                         }
                     }
@@ -985,19 +1517,29 @@ impl RsmVideoReassembler {
 
     /// Feed one decrypted MP/iLink RSM video packet (`[codecType, mid/sid, EncFecHeader, ...]`).
     pub fn ingest(&mut self, packet: &[u8]) -> Result<RsmIngestOutcome> {
+        let header = parse_rsm_packet_header(packet)?;
+        self.ingest_with_header(packet, &header)
+    }
+
+    /// Feed one decrypted MP/iLink RSM video packet together with its pre-parsed
+    /// [`RsmPacketHeader`], avoiding redundant `EncFecHeader` and TLV decoding.
+    pub fn ingest_with_header(
+        &mut self,
+        packet: &[u8],
+        header: &RsmPacketHeader,
+    ) -> Result<RsmIngestOutcome> {
         ensure!(
-            packet.len() >= 3 + 21,
-            "Truncated MP/iLink RSM video packet"
+            header.payload_offset <= packet.len(),
+            "RSM packet shorter than parsed header payload offset"
         );
-        let ms = u16::from_le_bytes([packet[1], packet[2]]);
-        let stream_id = ((ms >> 11) & 0x0f) as u8;
+        let stream_id = header.stream_id & 0x0f;
         if !self.streams.contains_key(&stream_id) && self.streams.len() >= 4 {
             return Ok(RsmIngestOutcome::Pending);
         }
         self.streams
             .entry(stream_id)
             .or_default()
-            .ingest_stream(packet)
+            .ingest_stream(packet, header, stream_id)
     }
 }
 
@@ -1043,122 +1585,57 @@ impl StreamReassembler {
         Some(frame)
     }
 
-    fn ingest_stream(&mut self, packet: &[u8]) -> Result<RsmIngestOutcome> {
-        let codec = VideoWireCodec::from_wire(packet[0]);
-        let ms = u16::from_le_bytes([packet[1], packet[2]]);
-        let member_id = ms & 0x7ff;
-        let stream_id = ((ms >> 11) & 0x0f) as u8;
-
-        let hdr = &packet[3..];
-        let hkind = hdr[0] & 0x03;
-        ensure!(hkind == 3, "Unsupported RSM video header kind {hkind}");
-        let is_iframe = (hdr[0] & 0x04) != 0;
-        let frame_idx_lo = u32::from(hdr[0] >> 3);
-
-        let r_lo2 = u32::from(hdr[1] & 0x03);
-        let pkg_idx_lo6 = usize::from(hdr[1] >> 2);
-        let timestamp_ms = u32::from_be_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
-        let frame_count = (hdr[12] & 0x03) + 1;
-        let s_lo6 = usize::from(hdr[12] >> 2);
-        let orientation = hdr[13] >> 5;
-        let r_mid2 = u32::from(hdr[13] & 0x03);
-        let r_hi4 = u32::from(hdr[14] & 0x0f);
-        // RS parity count uses additive overflow across `r_lo2` (0..=3), `r_mid2` (0..=3),
-        // and `r_hi4` (0..=15), matching `s_per_group` and `pkg_idx_in_group`.
-        let r_full = (r_lo2 + r_mid2 + r_hi4) as usize;
-        let group_idx_x = usize::from(hdr[14] >> 5);
-        let x_groups = usize::from(hdr[15] & 0x07).max(1);
-
-        let s_ovf_lo = usize::from(hdr[16]);
-        let pkg_ovf_lo = usize::from(hdr[17]);
-        let f_pkt_lo = usize::from(hdr[18]);
-        let f_tot_lo = usize::from(hdr[19]);
-        let ext_len = usize::from(hdr[20]);
-        ensure!(21 + ext_len <= hdr.len(), "Truncated RSM video extension");
-
-        let ext = &hdr[21..21 + ext_len];
-        let mut s_ovf_hi = 0usize;
-        let mut pkg_ovf_hi = 0usize;
-        let mut f_pkt_hi = 0usize;
-        let mut f_tot_hi = 0usize;
-        let mut xps_len_hi = 0u8;
-        let mut slice_len_hi = 0u8;
-        let mut frame_idx_hi = 0u32;
-        let mut y_groups = 0usize;
-        let mut is_vert_parity = false;
-        let mut vert_group_idx = 0usize;
-
-        if ext_len >= 2 {
-            let ext_mask = u16::from_be_bytes([ext[0], ext[1]]);
-            let mut pos = 2usize;
-            if ext_mask & 0x0001 != 0 && pos + 2 <= ext_len {
-                s_ovf_hi = usize::from(ext[pos] & 0x0f);
-                pkg_ovf_hi = usize::from(ext[pos] >> 4);
-                f_pkt_hi = usize::from(ext[pos + 1] & 0x0f);
-                f_tot_hi = usize::from(ext[pos + 1] >> 4);
-                pos += 2;
-            }
-            if ext_mask & 0x0002 != 0 && pos + 2 <= ext_len {
-                xps_len_hi = ext[pos];
-                slice_len_hi = ext[pos + 1];
-                pos += 2;
-            }
-            if ext_mask & 0x0004 != 0 && pos + 2 <= ext_len {
-                frame_idx_hi = u32::from(ext[pos]) | (u32::from(ext[pos + 1] & 0x07) << 8);
-                pos += 2;
-            }
-            if ext_mask & 0x0010 != 0 && !is_iframe && pos < ext_len {
-                let b = ext[pos];
-                let num_entries = usize::from(b & 0x3f);
-                let bits_per_entry = usize::from(b >> 6) + 1;
-                let bit_bytes = if num_entries == 0 {
-                    0
-                } else {
-                    (num_entries * bits_per_entry).div_ceil(8)
-                };
-                pos = pos.saturating_add(1 + bit_bytes);
-            }
-            if ext_mask & 0x0020 != 0 && pos < ext_len {
-                let b = ext[pos];
-                y_groups = usize::from(b & 0x07);
-                is_vert_parity = (b & 0x08) != 0;
-                vert_group_idx = usize::from((b >> 4) & 0x07);
-                pos += 1;
-            }
-            let _ = pos;
-        }
-
-        let s_per_group = s_lo6 + s_ovf_lo + (s_ovf_hi << 8);
-        let pkg_idx_in_group = pkg_idx_lo6 + pkg_ovf_lo + (pkg_ovf_hi << 8);
-        let f_pkt_idx = f_pkt_lo + (f_pkt_hi << 8);
-        let f_tot_pkts = f_tot_lo + (f_tot_hi << 8);
-        let payload = &hdr[21 + ext_len..];
+    fn ingest_stream(
+        &mut self,
+        packet: &[u8],
+        header: &RsmPacketHeader,
+        stream_id: u8,
+    ) -> Result<RsmIngestOutcome> {
+        let codec = header.codec;
+        let member_id = header.member_id;
+        let is_iframe = header.is_iframe;
+        let timestamp_ms = header.timestamp_ms;
+        let frame_count = header.frame_count;
+        let orientation = header.orientation & 0x07;
+        let xps_len_hi = header.xps_len_hi;
+        let slice_len_hi = header.slice_len_hi;
+        let x_groups = usize::from(header.x_groups);
+        let group_idx_x = usize::from(header.group_idx_x);
+        let y_groups = usize::from(header.y_groups);
+        let is_vert_parity = header.is_vert_parity;
+        let vert_group_idx = usize::from(header.vert_group_idx);
+        let s_per_group = usize::from(header.s_per_group);
+        let r_full = usize::from(header.r_per_group);
+        let pkg_idx_in_group = usize::from(header.pkg_idx_in_group);
+        let payload = &packet[header.payload_offset..];
 
         // Virtual-frame metadata packets (`s = 1, r = 0, x = 1, pkg_idx = 3`) carry the
         // `workMode = 3` protobuf header (including `field 3 = orientation`) after a
-        // 128-byte leading block. Parse orientation before skipping non-media packets.
-        if s_per_group == 1 && r_full == 0 && x_groups == 1 && pkg_idx_in_group == 3 {
-            if payload.len() > 0x80 {
-                if let Ok(fields) = p::decode(&payload[0x80..]) {
-                    if let Ok(Some(vf_orient)) = opt_u32(&fields, 3) {
-                        self.vf_orientation = Some((vf_orient & 0x07) as u8);
-                    }
-                }
+        // 128-byte leading block. Record orientation before skipping non-media packets.
+        if header.is_virtual_frame {
+            if let Some(vf_orient) = header.virtual_frame_orientation {
+                self.vf_orientation = Some(vf_orient & 0x07);
             }
             return Ok(self
                 .pop_next_ready()
                 .map_or(RsmIngestOutcome::Pending, RsmIngestOutcome::Frame));
         }
 
-        // Skip degenerate or padding-only headers. Do not drop packets solely because
+        // Skip degenerate or padding-only headers and reject out-of-range 3-bit group counts
+        // (`x_groups in 1..=7`, `y_groups in 0..=7`). Do not drop packets solely because
         // `hdr[13] & 0x10` is set: peers mark real IDR/media packets with that
         // bandwidth-estimation probe bit while carrying valid frame data.
-        if f_tot_pkts == 0 || f_pkt_idx == 0 || s_per_group == 0 {
+        if header.frame_total_pkts == 0
+            || header.frame_pkt_idx == 0
+            || s_per_group == 0
+            || x_groups == 0
+            || x_groups > 7
+            || y_groups > 7
+        {
             return Ok(RsmIngestOutcome::Pending);
         }
-        let total_source_pkts = x_groups.saturating_mul(s_per_group);
-        if total_source_pkts == 0
-            || total_source_pkts > MAX_FRAGMENTS_PER_FRAME
+        if s_per_group > MAX_FRAGMENTS_PER_FRAME
+            || (y_groups > 0 && x_groups.saturating_mul(s_per_group) > MAX_FRAGMENTS_PER_FRAME)
             || r_full > MAX_FEC_PARITY
             || pkg_idx_in_group == 0
         {
@@ -1172,7 +1649,7 @@ impl StreamReassembler {
             return Ok(RsmIngestOutcome::Pending);
         }
 
-        let full_frame_idx = (frame_idx_hi << 5) | frame_idx_lo;
+        let full_frame_idx = header.frame_index & 0xffff;
         // Drop trailing FEC parity / late duplicate packets belonging to any already-emitted
         // frame (within a 256-frame modular window) so they never re-emit an older frame
         // out of order via RS recovery or re-insert a zombie assembly that triggers false
@@ -1294,26 +1771,60 @@ impl StreamReassembler {
                 is_iframe,
                 frame_count,
                 x_groups,
-                s_per_group,
-                r_per_group: r_full,
                 y_groups,
                 xps_len_hi,
                 slice_len_hi,
+                group_s: vec![None; x_groups],
+                group_r: vec![None; x_groups],
+                vert_s_per_group: (y_groups > 0 || is_vert_parity).then_some(s_per_group),
                 groups: (0..x_groups).map(|_| BTreeMap::new()).collect(),
                 vert_parity: BTreeMap::new(),
                 fec_recovered: false,
                 arrival_order: arrival,
             });
-        // Reject inconsistent stream/group geometry for the same frame index.
-        if entry.stream_id != stream_id
-            || entry.x_groups != x_groups
-            || entry.s_per_group != s_per_group
-        {
+        // Reject inconsistent stream/group geometry for the same frame index while
+        // permitting per-group `s_per_group` / `r_per_group` in 1D multi-group frames
+        // (where the trailing group carries the remainder of source chunks).
+        if entry.stream_id != stream_id || entry.x_groups != x_groups {
             return Ok(RsmIngestOutcome::Pending);
         }
+        if y_groups > 0 || is_vert_parity {
+            if entry.vert_s_per_group.is_some_and(|vs| vs != s_per_group)
+                || entry.group_s.iter().flatten().any(|&gs| gs != s_per_group)
+            {
+                return Ok(RsmIngestOutcome::Pending);
+            }
+            entry.vert_s_per_group = Some(s_per_group);
+        }
+        if !is_vert_parity {
+            if entry.vert_s_per_group.is_some_and(|vs| vs != s_per_group)
+                || entry.group_s[group_idx_x].is_some_and(|gs| gs != s_per_group)
+                || entry.group_r[group_idx_x].is_some_and(|gr| gr != r_full)
+            {
+                return Ok(RsmIngestOutcome::Pending);
+            }
+            let other_chunks: usize = entry
+                .group_s
+                .iter()
+                .enumerate()
+                .filter(|&(g, _)| g != group_idx_x)
+                .filter_map(|(_, &gs)| gs)
+                .sum();
+            if other_chunks.saturating_add(s_per_group) > MAX_FRAGMENTS_PER_FRAME {
+                return Ok(RsmIngestOutcome::Pending);
+            }
+            entry.group_s[group_idx_x] = Some(s_per_group);
+            entry.group_r[group_idx_x] = Some(r_full);
+        }
         entry.is_iframe |= is_iframe;
-        entry.r_per_group = entry.r_per_group.max(r_full);
         entry.y_groups = entry.y_groups.max(y_groups);
+        entry.frame_count = entry.frame_count.max(frame_count);
+        if xps_len_hi != 0 {
+            entry.xps_len_hi = xps_len_hi;
+        }
+        if slice_len_hi != 0 {
+            entry.slice_len_hi = slice_len_hi;
+        }
         if is_vert_parity {
             entry
                 .vert_parity
@@ -1341,20 +1852,26 @@ impl StreamReassembler {
 
         let completed = self.active.remove(&full_frame_idx).expect("just inserted");
 
-        let total_bytes: usize = completed
-            .groups
-            .iter()
-            .flat_map(|g| (0..completed.s_per_group).filter_map(|col| g.get(&col)))
-            .map(Vec::len)
-            .sum();
-        if total_bytes > MAX_VIDEO_FRAME_BYTES + 4096 {
+        let mut total_chunks = 0usize;
+        let mut total_bytes = 0usize;
+        for g in 0..completed.x_groups {
+            let s_g = completed.effective_group_s(g).unwrap_or(0);
+            total_chunks = total_chunks.saturating_add(s_g);
+            for col in 0..s_g {
+                if let Some(chunk) = completed.groups[g].get(&col) {
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                }
+            }
+        }
+        if total_chunks > MAX_FRAGMENTS_PER_FRAME || total_bytes > MAX_VIDEO_FRAME_BYTES + 4096 {
             self.record_drop(full_frame_idx);
             bail!("Reassembled video frame exceeds budget");
         }
         let mut assembled = Vec::with_capacity(total_bytes);
-        for group in &completed.groups {
-            for col in 0..completed.s_per_group {
-                if let Some(chunk) = group.get(&col) {
+        for g in 0..completed.x_groups {
+            let s_g = completed.effective_group_s(g).unwrap_or(0);
+            for col in 0..s_g {
+                if let Some(chunk) = completed.groups[g].get(&col) {
                     assembled.extend_from_slice(chunk);
                 }
             }
@@ -1663,6 +2180,13 @@ mod tests {
         assert_eq!(req.target_member, 5);
         assert_eq!(req.target_stream_id, 1);
         assert_eq!(req.timestamp_ms, 123_456_789);
+        assert_eq!(u32::from_le_bytes(raw[50..54].try_into().unwrap()), 0);
+
+        let unforced = encode_irequest_with_force(1, 0, 1, 999, 44, false);
+        assert_eq!(u64::from_le_bytes(unforced[42..50].try_into().unwrap()), 44);
+        assert_eq!(u32::from_le_bytes(unforced[50..54].try_into().unwrap()), 0);
+        let forced = encode_irequest_with_force(1, 0, 1, 999, 44, true);
+        assert_eq!(u32::from_le_bytes(forced[50..54].try_into().unwrap()), 1);
     }
 
     #[test]
@@ -3623,5 +4147,686 @@ mod tests {
         };
         assert_eq!(out72.frame_index, 72);
         assert!(!out72.prior_frames_dropped);
+    }
+
+    #[test]
+    fn video_nack_encodes_target_first_28_byte_single_range_and_roundtrips() {
+        // Single range: 8-byte header + 4-byte range + 16 zero tail = 28 bytes.
+        let pkt = encode_video_nack(3, 7, 1, 42, &[(100, 103)]);
+        assert_eq!(pkt.len(), 28);
+        assert_eq!(pkt[0], 0x06);
+        // Target member (7, stream 1) comes before local member (3, stream 1).
+        assert_eq!([pkt[1], pkt[2]], pack_rtcp_member(7, 1));
+        assert_eq!([pkt[3], pkt[4]], pack_rtcp_member(3, 1));
+        assert_eq!(pkt[5], 0);
+        assert_eq!(pkt[6], 42);
+        assert_eq!(pkt[7], 1);
+        assert_eq!(&pkt[12..28], &[0u8; 16]);
+
+        let classified = classify_video_channel_payload(&pkt).unwrap();
+        let VideoChannelPayload::Nack(raw) = classified else {
+            panic!("expected Nack classification");
+        };
+        let parsed = parse_video_nack(raw).unwrap();
+        assert_eq!(parsed.target_member, 7);
+        assert_eq!(parsed.target_stream_id, 1);
+        assert_eq!(parsed.local_member, 3);
+        assert_eq!(parsed.local_stream_id, 1);
+        assert_eq!(parsed.is_screen, 0);
+        assert_eq!(parsed.arq_seq, 42);
+        assert_eq!(parsed.ranges, vec![(100, 103)]);
+    }
+
+    #[test]
+    fn video_nack_filters_empty_ranges_and_caps_at_max() {
+        let mut ranges = vec![(10, 10)]; // empty range filtered out
+        for i in 0..25u16 {
+            ranges.push((100 + i * 2, 101 + i * 2));
+        }
+        let pkt = encode_video_nack(1, 2, 0, 9, &ranges);
+        let parsed = parse_video_nack(&pkt).unwrap();
+        assert_eq!(parsed.ranges.len(), MAX_VIDEO_NACK_RANGES);
+        assert_eq!(parsed.ranges[0], (100, 101));
+        assert_eq!(parsed.ranges[MAX_VIDEO_NACK_RANGES - 1], (130, 131));
+        assert_eq!(pkt.len(), 8 + MAX_VIDEO_NACK_RANGES * 4 + 16);
+    }
+
+    #[test]
+    fn p2s_report_encodes_live_video_and_link_telemetry_fields() {
+        let report = VideoP2sReport {
+            remote_member_id: 7,
+            stream_id: 1,
+            conn_id: 42,
+            recv_data_interval_ms: 420,
+            delay_ms: 65,
+            est_bw_kbps: 240,
+            send_kbps: 310,
+            recv_kbps: 185,
+            send_fps: 12,
+            recv_fps: 8,
+            capt_fps: 12,
+            loss_pct: 18,
+            codec_support_mask: 0x1d,
+            loss_pkts: 14,
+            decode_type: 9,
+            play_fps: 8,
+            play_frames: 123,
+            light_freeze_cnt: 2,
+            heavy_freeze_cnt: 1,
+            light_freeze_time_ratio: 35,
+            heavy_freeze_time_ratio: 52,
+            short_loss_pct: 18,
+            long_loss_pct: 11,
+            recv_pkgs: 64,
+            expected_member_num: 1,
+            actual_member_num: 1,
+            recv_arq_resp_pkgs: 5,
+        };
+        let raw = encode_p2s_report(19, 2, &report).unwrap();
+        assert_eq!(raw[0], 0x0b);
+        let outer = p::decode(&raw[1..]).unwrap();
+        assert_eq!(opt_u32(&outer, 1).unwrap(), Some(19));
+        let inner = p::decode(p::optional_data(&outer, 3).unwrap().unwrap()).unwrap();
+        let v_wrap = p::decode(p::optional_data(&inner, 3).unwrap().unwrap()).unwrap();
+        let vp2s = p::decode(p::optional_data(&v_wrap, 1).unwrap().unwrap()).unwrap();
+        assert_eq!(opt_u32(&vp2s, 1).unwrap(), Some(7));
+        assert_eq!(opt_u32(&vp2s, 2).unwrap(), Some(1));
+        assert_eq!(opt_u32(&vp2s, 5).unwrap(), Some(420));
+        assert_eq!(opt_u32(&vp2s, 6).unwrap(), Some(65));
+        assert_eq!(opt_u32(&vp2s, 7).unwrap(), Some(240));
+        assert_eq!(opt_u32(&vp2s, 8).unwrap(), Some(310));
+        assert_eq!(opt_u32(&vp2s, 9).unwrap(), Some(185));
+        assert_eq!(opt_u32(&vp2s, 10).unwrap(), Some(12));
+        assert_eq!(opt_u32(&vp2s, 11).unwrap(), Some(8));
+        assert_eq!(opt_u32(&vp2s, 12).unwrap(), Some(12));
+        assert_eq!(opt_u32(&vp2s, 14).unwrap(), Some(18));
+        assert_eq!(opt_u32(&vp2s, 24).unwrap(), Some(0x1d));
+        assert_eq!(opt_u32(&vp2s, 26).unwrap(), Some(14));
+        assert_eq!(opt_u32(&vp2s, 29).unwrap(), Some(9));
+        assert_eq!(opt_u32(&vp2s, 30).unwrap(), Some(8));
+        assert_eq!(opt_u32(&vp2s, 31).unwrap(), Some(123));
+        assert_eq!(opt_u32(&vp2s, 32).unwrap(), Some(2));
+        assert_eq!(opt_u32(&vp2s, 33).unwrap(), Some(1));
+        assert_eq!(opt_u32(&vp2s, 34).unwrap(), Some(35));
+        assert_eq!(opt_u32(&vp2s, 35).unwrap(), Some(52));
+        assert_eq!(opt_u32(&vp2s, 47).unwrap(), Some(18));
+        assert_eq!(opt_u32(&vp2s, 48).unwrap(), Some(11));
+
+        let vn_wrap = p::decode(p::optional_data(&inner, 6).unwrap().unwrap()).unwrap();
+        let vlink = p::decode(p::optional_data(&vn_wrap, 1).unwrap().unwrap()).unwrap();
+        assert_eq!(opt_u32(&vlink, 1).unwrap(), Some(42));
+        assert_eq!(opt_u32(&vlink, 2).unwrap(), Some(64));
+        assert_eq!(opt_u32(&vlink, 3).unwrap(), Some(18));
+        assert_eq!(opt_u32(&vlink, 4).unwrap(), Some(1));
+        assert_eq!(opt_u32(&vlink, 5).unwrap(), Some(1));
+        assert_eq!(opt_u32(&vlink, 6).unwrap(), Some(5));
+
+        // Baseline encode_p2s keeps the exact original 15-field video_p2s wire layout
+        // and omits inner.f6 (videoLink) so conference P2S heartbeats stay byte-identical.
+        let baseline = encode_p2s(7, 2, 0x1d, 15).unwrap();
+        let expected_client_hdr = p::message(&[
+            p::uint(1, 11),
+            p::uint(2, 0),
+            p::uint(3, 0),
+            p::uint(4, 1),
+            p::uint(5, 4),
+            p::uint(6, 111),
+            p::uint(7, 0x050000cb),
+        ])
+        .unwrap();
+        let expected_video_p2s = p::message(&[
+            p::uint(1, 0),
+            p::uint(2, 1),
+            p::uint(4, 0x7e),
+            p::uint(8, 500),
+            p::uint(9, 500),
+            p::uint(10, 15),
+            p::uint(11, 15),
+            p::uint(12, 15),
+            p::uint(15, 15),
+            p::uint(16, 8),
+            p::uint(17, 1),
+            p::uint(19, 1),
+            p::uint(20, 1),
+            p::uint(24, 0x1d),
+            p::uint(29, 15),
+        ])
+        .unwrap();
+        let expected_video_wrap = p::message(&[p::bytes(1, &expected_video_p2s)]).unwrap();
+        let expected_inner = p::message(&[
+            p::bytes(1, &expected_client_hdr),
+            p::bytes(3, &expected_video_wrap),
+        ])
+        .unwrap();
+        let expected_outer = p::message(&[
+            p::uint(1, 7),
+            p::uint(2, 2),
+            p::bytes(3, &expected_inner),
+            p::uint(4, 2),
+        ])
+        .unwrap();
+        let mut expected_baseline = Vec::with_capacity(1 + expected_outer.len());
+        expected_baseline.push(0x0b);
+        expected_baseline.extend_from_slice(&expected_outer);
+        assert_eq!(baseline, expected_baseline);
+
+        let baseline_outer = p::decode(&baseline[1..]).unwrap();
+        let baseline_inner =
+            p::decode(p::optional_data(&baseline_outer, 3).unwrap().unwrap()).unwrap();
+        let baseline_inner_tags: Vec<u32> = baseline_inner.iter().map(|f| f.number).collect();
+        assert_eq!(baseline_inner_tags, vec![1, 3]);
+        let baseline_vwrap =
+            p::decode(p::optional_data(&baseline_inner, 3).unwrap().unwrap()).unwrap();
+        let baseline_vp2s =
+            p::decode(p::optional_data(&baseline_vwrap, 1).unwrap().unwrap()).unwrap();
+        let baseline_vp2s_tags: Vec<u32> = baseline_vp2s.iter().map(|f| f.number).collect();
+        assert_eq!(
+            baseline_vp2s_tags,
+            vec![1, 2, 4, 8, 9, 10, 11, 12, 15, 16, 17, 19, 20, 24, 29]
+        );
+    }
+
+    #[test]
+    fn multi_group_uneven_tail_s_per_group_reassembles_and_recovers_fec() {
+        let mut annexb = vec![0, 0, 0, 1, 0x41, 0x9a];
+        for i in 0..480u16 {
+            annexb.push(((i * 43 + 17) & 0xff) as u8);
+        }
+        let framed = frame_annexb_access_unit(VideoWireCodec::H264, &annexb).unwrap();
+        // 5 total source chunks across x_groups = 2: group 0 has s = 3, group 1 has s = 2.
+        let s0 = 3usize;
+        let s1 = 2usize;
+        let r = 1usize;
+        let total_src = s0 + s1;
+        let chunk_len = framed.bytes.len().div_ceil(total_src);
+        let mut padded = framed.bytes.clone();
+        padded.resize(total_src * chunk_len, 0);
+        let total_pkts = (s0 + r) + (s1 + r);
+
+        let g0_srcs: Vec<Vec<u8>> = (0..s0)
+            .map(|c| padded[c * chunk_len..(c + 1) * chunk_len].to_vec())
+            .collect();
+        let g1_srcs: Vec<Vec<u8>> = (0..s1)
+            .map(|c| padded[(s0 + c) * chunk_len..(s0 + c + 1) * chunk_len].to_vec())
+            .collect();
+        let g0_par = test_rs_encode(&g0_srcs, r);
+        let g1_par = test_rs_encode(&g1_srcs, r);
+
+        let g0_pkts: Vec<Vec<u8>> = g0_srcs
+            .iter()
+            .enumerate()
+            .map(|(c, src)| {
+                build_2d_rsm_pkt(
+                    VideoWireCodec::H264,
+                    80,
+                    2,
+                    0,
+                    s0,
+                    r,
+                    c + 1,
+                    c + 1,
+                    total_pkts,
+                    0,
+                    false,
+                    0,
+                    src,
+                )
+            })
+            .chain(std::iter::once(build_2d_rsm_pkt(
+                VideoWireCodec::H264,
+                80,
+                2,
+                0,
+                s0,
+                r,
+                s0 + 1,
+                s0 + 1,
+                total_pkts,
+                0,
+                false,
+                0,
+                &g0_par[0],
+            )))
+            .collect();
+        let g1_pkts: Vec<Vec<u8>> = g1_srcs
+            .iter()
+            .enumerate()
+            .map(|(c, src)| {
+                build_2d_rsm_pkt(
+                    VideoWireCodec::H264,
+                    80,
+                    2,
+                    1,
+                    s1,
+                    r,
+                    c + 1,
+                    s0 + r + c + 1,
+                    total_pkts,
+                    0,
+                    false,
+                    0,
+                    src,
+                )
+            })
+            .chain(std::iter::once(build_2d_rsm_pkt(
+                VideoWireCodec::H264,
+                80,
+                2,
+                1,
+                s1,
+                r,
+                s1 + 1,
+                total_pkts,
+                total_pkts,
+                0,
+                false,
+                0,
+                &g1_par[0],
+            )))
+            .collect();
+
+        // 1. In-order group 0 (s=3) -> group 1 (s=2) source packets reassemble without drop.
+        let mut rx = RsmVideoReassembler::new();
+        let mut out = None;
+        for pkt in g0_pkts[..s0].iter().chain(g1_pkts[..s1].iter()) {
+            if let RsmIngestOutcome::Frame(f) = rx.ingest(pkt).unwrap() {
+                out = Some(f);
+            }
+        }
+        let f = out.expect("uneven multi-group P-frame must reassemble in order");
+        assert!(!f.fec_recovered);
+        assert!(!f.prior_frames_dropped);
+        assert_eq!(f.payload, annexb);
+
+        // 2. Out-of-order arrival: group 1 (s=2) arrives completely BEFORE group 0 (s=3);
+        // must stay Pending until group 0 arrives, then emit exact payload.
+        let mut rx_ooo = RsmVideoReassembler::new();
+        for pkt in &g1_pkts[..s1] {
+            assert_eq!(rx_ooo.ingest(pkt).unwrap(), RsmIngestOutcome::Pending);
+        }
+        let mut out_ooo = None;
+        for pkt in &g0_pkts[..s0] {
+            if let RsmIngestOutcome::Frame(f) = rx_ooo.ingest(pkt).unwrap() {
+                out_ooo = Some(f);
+            }
+        }
+        let f_ooo = out_ooo.expect("out-of-order uneven multi-group frame must reassemble");
+        assert!(!f_ooo.prior_frames_dropped);
+        assert_eq!(f_ooo.payload, annexb);
+
+        // 3. Lose 1 source packet in trailing group 1 and recover via group 1's (s=2, r=1) parity.
+        let mut rx_fec = RsmVideoReassembler::new();
+        let mut out_fec = None;
+        for pkt in [
+            &g0_pkts[0],
+            &g0_pkts[1],
+            &g0_pkts[2],
+            &g1_pkts[0], // g1_pkts[1] lost
+            &g1_pkts[2], // g1 parity
+        ] {
+            if let RsmIngestOutcome::Frame(f) = rx_fec.ingest(pkt).unwrap() {
+                out_fec = Some(f);
+            }
+        }
+        let f_fec = out_fec.expect("trailing uneven group must recover lost packet via RS parity");
+        assert!(f_fec.fec_recovered);
+        assert!(!f_fec.prior_frames_dropped);
+        assert_eq!(f_fec.payload, annexb);
+    }
+
+    #[test]
+    fn two_dim_multi_group_full_first_group_loss_recovers_via_vertical_parity() {
+        let mut annexb = vec![0, 0, 0, 1, 0x02, 0x01];
+        for i in 0..300u16 {
+            annexb.push(((i * 19 + 5) & 0xff) as u8);
+        }
+        let framed = frame_annexb_access_unit(VideoWireCodec::H265, &annexb).unwrap();
+        let x_groups = 2usize;
+        let s = 3usize;
+        let y_groups = 1usize;
+        let chunk_len = framed.bytes.len().div_ceil(x_groups * s);
+        let mut padded = framed.bytes.clone();
+        padded.resize(x_groups * s * chunk_len, 0);
+        let total_pkts = x_groups * s + y_groups * s;
+
+        let srcs: Vec<Vec<Vec<u8>>> = (0..x_groups)
+            .map(|g| {
+                (0..s)
+                    .map(|col| {
+                        padded[(g * s + col) * chunk_len..(g * s + col + 1) * chunk_len].to_vec()
+                    })
+                    .collect()
+            })
+            .collect();
+        let v_par: Vec<Vec<u8>> = (0..s)
+            .map(|col| {
+                test_rs_encode(&[srcs[0][col].clone(), srcs[1][col].clone()], y_groups)
+                    .pop()
+                    .unwrap()
+            })
+            .collect();
+
+        // All packets of group 0 are lost; only group 1 + vertical parity arrive.
+        let mut rx = RsmVideoReassembler::new();
+        let mut out = None;
+        for (col, src) in srcs[1].iter().enumerate() {
+            assert_eq!(
+                rx.ingest(&build_2d_rsm_pkt(
+                    VideoWireCodec::H265,
+                    85,
+                    x_groups,
+                    1,
+                    s,
+                    0,
+                    col + 1,
+                    s + col + 1,
+                    total_pkts,
+                    y_groups,
+                    false,
+                    0,
+                    src,
+                ))
+                .unwrap(),
+                RsmIngestOutcome::Pending
+            );
+        }
+        for (col, vp) in v_par.iter().enumerate() {
+            if let RsmIngestOutcome::Frame(f) = rx
+                .ingest(&build_2d_rsm_pkt(
+                    VideoWireCodec::H265,
+                    85,
+                    x_groups,
+                    0,
+                    s,
+                    0,
+                    col + 1,
+                    2 * s + col + 1,
+                    total_pkts,
+                    y_groups,
+                    true,
+                    0,
+                    vp,
+                ))
+                .unwrap()
+            {
+                out = Some(f);
+            }
+        }
+        let f = out.expect("2D vertical parity must recover completely missing group 0");
+        assert!(f.fec_recovered);
+        assert_eq!(f.payload, annexb);
+    }
+
+    #[test]
+    fn multi_group_fec_p_frame_survives_reorder_across_adjacent_frame_without_false_drop() {
+        let mut p1 = vec![0, 0, 0, 1, 0x41, 0x9a];
+        p1.extend((0..320u16).map(|i| ((i * 3 + 1) & 0xff) as u8));
+        let f1 = frame_annexb_access_unit(VideoWireCodec::H264, &p1).unwrap();
+        // 5 source chunks across 2 horizontal groups: group 0 (s=3, r=1), group 1 (s=2, r=1).
+        let chunk_len = f1.bytes.len().div_ceil(5);
+        let mut pad1 = f1.bytes.clone();
+        pad1.resize(5 * chunk_len, 0);
+
+        let mut p2 = vec![0, 0, 0, 1, 0x41, 0x9a];
+        p2.extend((0..80u8).map(|i| i.wrapping_mul(7).wrapping_add(5)));
+        let f2 = frame_annexb_access_unit(VideoWireCodec::H264, &p2).unwrap();
+
+        let mut rx = RsmVideoReassembler::new();
+        for c in 0..3usize {
+            assert_eq!(
+                rx.ingest(&build_2d_rsm_pkt(
+                    VideoWireCodec::H264,
+                    60,
+                    2,
+                    0,
+                    3,
+                    1,
+                    c + 1,
+                    c + 1,
+                    7,
+                    0,
+                    false,
+                    0,
+                    &pad1[c * chunk_len..(c + 1) * chunk_len]
+                ))
+                .unwrap(),
+                RsmIngestOutcome::Pending
+            );
+        }
+        assert_eq!(
+            rx.ingest(&build_2d_rsm_pkt(
+                VideoWireCodec::H264,
+                60,
+                2,
+                1,
+                2,
+                1,
+                1,
+                5,
+                7,
+                0,
+                false,
+                0,
+                &pad1[3 * chunk_len..4 * chunk_len]
+            ))
+            .unwrap(),
+            RsmIngestOutcome::Pending
+        );
+        // Next frame 61 completes ahead of frame 60's trailing group-1 packet.
+        assert_eq!(
+            rx.ingest(&build_2d_rsm_pkt(
+                VideoWireCodec::H264,
+                61,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                2,
+                0,
+                false,
+                0,
+                &f2.bytes
+            ))
+            .unwrap(),
+            RsmIngestOutcome::Pending
+        );
+        let RsmIngestOutcome::Frame(out60) = rx
+            .ingest(&build_2d_rsm_pkt(
+                VideoWireCodec::H264,
+                60,
+                2,
+                1,
+                2,
+                1,
+                2,
+                6,
+                7,
+                0,
+                false,
+                0,
+                &pad1[4 * chunk_len..5 * chunk_len],
+            ))
+            .unwrap()
+        else {
+            panic!("reordered trailing packet of uneven multi-group FEC frame 60 must complete");
+        };
+        assert_eq!(out60.frame_index, 60);
+        assert!(!out60.prior_frames_dropped);
+        assert_eq!(out60.payload, p1);
+
+        let out61 = rx.pop_ready().expect("buffered frame 61 must drain next");
+        assert_eq!(out61.frame_index, 61);
+        assert!(!out61.prior_frames_dropped);
+        assert_eq!(out61.payload, p2);
+    }
+
+    #[test]
+    fn parse_rsm_packet_header_decodes_media_2d_virtual_and_padding_packets() {
+        let mut pktz = RsmVideoPacketizer::new(7, 2)
+            .with_orientation(3)
+            .with_chunk_bytes(100)
+            .unwrap();
+        let mut idr = vec![0, 0, 0, 1, 0x67, 0x64, 0x00, 0x16, 0, 0, 0, 1, 0x68, 0xee];
+        idr.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        idr.extend((0..240u16).map(|i| (i & 0xff) as u8));
+        let pkts = pktz
+            .packetize(VideoWireCodec::H264, &idr, 1234, 15, 500)
+            .unwrap();
+        assert!(pkts.len() >= 3);
+
+        let h0 = parse_rsm_packet_header(&pkts[0]).unwrap();
+        assert_eq!(h0.codec, VideoWireCodec::H264);
+        assert_eq!(h0.member_id, 7);
+        assert_eq!(h0.stream_id, 2);
+        assert_eq!(h0.frame_index, 1);
+        assert_eq!(h0.total_pkg_seq, 1);
+        assert_eq!(h0.pkg_seq, Some(1));
+        assert_eq!(h0.timestamp_ms, 1234);
+        assert_eq!(h0.orientation, 3);
+        assert!(h0.is_iframe);
+        assert!(!h0.is_virtual_frame);
+        assert_eq!(h0.virtual_frame_orientation, None);
+        assert_eq!(h0.frame_count, 2);
+        assert_eq!(h0.x_groups, 1);
+        assert_eq!(h0.s_per_group as usize, pkts.len());
+        assert_eq!(h0.r_per_group, 0);
+        assert_eq!(h0.pkg_idx_in_group, 1);
+        assert_eq!(h0.frame_pkt_idx, 1);
+        assert_eq!(h0.frame_total_pkts as usize, pkts.len());
+
+        // Virtual-frame metadata packet sets `is_virtual_frame`, extracts protobuf orientation,
+        // advances `total_pkg_seq`, and leaves `pkg_seq = None`.
+        let vf = pktz
+            .build_orientation_metadata_packet(VideoWireCodec::H264, 1250, 15)
+            .unwrap();
+        let hvf = parse_rsm_packet_header(&vf).unwrap();
+        assert!(hvf.is_virtual_frame);
+        assert_eq!(hvf.virtual_frame_orientation, Some(3));
+        assert_eq!(hvf.pkg_seq, None);
+        assert_eq!(hvf.total_pkg_seq as usize, pkts.len() + 1);
+
+        // Degenerate/padding packet (`f_tot_pkts == 0`) leaves `pkg_seq = None`.
+        let mut padding = pkts[0].clone();
+        padding[22] = 0;
+        let hpad = parse_rsm_packet_header(&padding).unwrap();
+        assert!(!hpad.is_virtual_frame);
+        assert_eq!(hpad.pkg_seq, None);
+
+        // 2D vertical parity packet parses `y_groups`, `is_vert_parity`, `vert_group_idx`, and `frame_index`.
+        let vpkt = build_2d_rsm_pkt(
+            VideoWireCodec::H265,
+            300,
+            2,
+            0,
+            4,
+            1,
+            2,
+            10,
+            12,
+            1,
+            true,
+            0,
+            &[0xaa; 32],
+        );
+        let hv = parse_rsm_packet_header(&vpkt).unwrap();
+        assert_eq!(hv.codec, VideoWireCodec::H265);
+        assert_eq!(hv.frame_index, 300);
+        assert_eq!(hv.x_groups, 2);
+        assert_eq!(hv.y_groups, 1);
+        assert!(hv.is_vert_parity);
+        assert_eq!(hv.vert_group_idx, 0);
+        assert_eq!(hv.s_per_group, 4);
+        assert_eq!(hv.r_per_group, 1);
+        assert_eq!(hv.pkg_idx_in_group, 2);
+        assert_eq!(hv.frame_pkt_idx, 10);
+        assert_eq!(hv.frame_total_pkts, 12);
+        assert_eq!(hv.payload_offset + 32, vpkt.len());
+
+        // Truncated or non-kind-3 packets fail header validation cleanly.
+        assert!(parse_rsm_packet_header(&[0u8; 12]).is_err());
+        let mut bad_kind = pkts[0].clone();
+        bad_kind[3] = (bad_kind[3] & !0x03) | 2;
+        assert!(parse_rsm_packet_header(&bad_kind).is_err());
+    }
+
+    #[test]
+    fn advance_seq16_handles_high_start_wraparound_and_reordering() {
+        let seq = advance_seq16(None, 0xfffe);
+        assert_eq!(seq, 0xfffe);
+        // Out-of-order older sequence does not move backward.
+        assert_eq!(advance_seq16(Some(seq), 0xfffc), 0xfffe);
+        // Wraparound into 64-bit space advances monotonically.
+        let seq = advance_seq16(Some(seq), 0xffff);
+        assert_eq!(seq, 0xffff);
+        let seq = advance_seq16(Some(seq), 0x0000);
+        assert_eq!(seq, 0x1_0000);
+        let seq = advance_seq16(Some(seq), 0x0005);
+        assert_eq!(seq, 0x1_0005);
+        // Late packet from before wraparound is ignored.
+        assert_eq!(advance_seq16(Some(seq), 0xfffe), 0x1_0005);
+    }
+
+    #[test]
+    fn annexb_keyframe_and_nalu_type_helpers_cover_h264_and_h265_irap() {
+        let h264_idr = [
+            0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88,
+        ];
+        let h264_p = [0, 0, 0, 1, 0x41, 0x9a];
+        assert!(is_annexb_keyframe(VideoWireCodec::H264, &h264_idr));
+        assert!(!is_annexb_keyframe(VideoWireCodec::H264, &h264_p));
+        assert_eq!(
+            annexb_nalu_types(VideoWireCodec::H264, &h264_idr),
+            vec![7, 8, 5]
+        );
+
+        // HEVC BLA (NAL type 16) and IDR (19) are keyframes; TRAIL_R (1) is not.
+        let h265_bla = [0, 0, 0, 1, 16 << 1, 0x01, 0xaa];
+        let h265_idr = [0, 0, 0, 1, 32 << 1, 0x01, 0, 0, 0, 1, 19 << 1, 0x01, 0xbb];
+        let h265_p = [0, 0, 0, 1, 1 << 1, 0x01, 0xcc];
+        assert!(is_annexb_keyframe(VideoWireCodec::H265, &h265_bla));
+        assert!(is_annexb_keyframe(VideoWireCodec::H265, &h265_idr));
+        assert!(!is_annexb_keyframe(VideoWireCodec::H265, &h265_p));
+        assert_eq!(
+            annexb_nalu_types(VideoWireCodec::H265, &h265_idr),
+            vec![32, 19]
+        );
+    }
+
+    #[test]
+    fn ingest_with_header_enforces_group_bounds_orientation_mask_and_payload_offset() {
+        let mut pktz = RsmVideoPacketizer::new(7, 1).with_orientation(2);
+        let idr = vec![0, 0, 0, 1, 0x65, 0x88, 0x11, 0x22, 0x33, 0x44];
+        let pkts = pktz
+            .packetize(VideoWireCodec::H264, &idr, 100, 15, 500)
+            .unwrap();
+        let valid_hdr = parse_rsm_packet_header(&pkts[0]).unwrap();
+        let mut rx = RsmVideoReassembler::new();
+
+        // Out-of-bounds payload_offset must return an error rather than panicking.
+        let mut bad_off = valid_hdr;
+        bad_off.payload_offset = pkts[0].len() + 1;
+        assert!(rx.ingest_with_header(&pkts[0], &bad_off).is_err());
+
+        // Out-of-range 3-bit group counts (`x_groups = 0/8/255`, `y_groups = 8/253`) must be ignored.
+        for (x_groups, y_groups) in [(0, 0), (8, 0), (255, 0), (2, 8), (2, 253)] {
+            let mut crafted = valid_hdr;
+            crafted.x_groups = x_groups;
+            crafted.y_groups = y_groups;
+            assert_eq!(
+                rx.ingest_with_header(&pkts[0], &crafted).unwrap(),
+                RsmIngestOutcome::Pending
+            );
+        }
+
+        // Unmasked synthetic orientation values are masked to 3 bits (`0..=7`).
+        let mut masked_hdr = valid_hdr;
+        masked_hdr.orientation = 0xfd; // 0xfd & 0x07 == 5
+        let RsmIngestOutcome::Frame(frame) = rx.ingest_with_header(&pkts[0], &masked_hdr).unwrap()
+        else {
+            panic!("expected valid frame");
+        };
+        assert_eq!(frame.orientation, 5);
     }
 }
