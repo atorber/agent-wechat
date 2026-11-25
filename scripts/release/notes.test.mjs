@@ -5,10 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { changelogEntry, mergeReleaseNotes, renderReleaseNotes } from './notes.mjs';
 
-async function fixture(t, cliNotes = '### Major Changes\n\n- Native daemon.', pluginNotes = '### Major Changes\n\n- OpenClaw SecretRefs.', desktopNotes = '', crateNotes = '') {
+async function fixture(t, cliNotes = '### Major Changes\n\n- Native daemon.', pluginNotes = '### Major Changes\n\n- OpenClaw SecretRefs.', desktopNotes = '', crateNotes = '', deepseekNotes = '') {
   const root = await mkdtemp(join(tmpdir(), 'native-release-notes-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  for (const [directory, name, notes] of [['cli', '@agent-wechat/cli', cliNotes], ['openclaw-extension', '@agent-wechat/agent-wechat', pluginNotes], ['desktop', '@agent-wechat/desktop', desktopNotes], ['rust-crates', '@agent-wechat/rust-crates', crateNotes]]) {
+  for (const [directory, name, notes] of [['cli', '@agent-wechat/cli', cliNotes], ['openclaw-extension', '@agent-wechat/agent-wechat', pluginNotes], ['deepseek-harness-extension', '@agent-wechat/deepseek-harness-extension', deepseekNotes], ['desktop', '@agent-wechat/desktop', desktopNotes], ['rust-crates', '@agent-wechat/rust-crates', crateNotes]]) {
     const path = join(root, 'packages', directory); await mkdir(path, { recursive: true });
     await writeFile(join(path, 'package.json'), JSON.stringify({ name, version: '1.0.0', ...(['desktop', 'rust-crates'].includes(directory) ? { private: true } : {}) }));
     await writeFile(join(path, 'CHANGELOG.md'), `# ${name}\n\n## 1.0.0\n\n${notes}\n\n## 0.16.0\n\n- Old release.\n`);
