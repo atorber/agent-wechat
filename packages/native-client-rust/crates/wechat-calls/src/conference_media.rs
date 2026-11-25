@@ -4,17 +4,18 @@ use crate::{
     audio::{AudioDecoder, AudioFormat},
     opus::OpusDecoder,
     ordering::RtpOrder,
+    video_stream::VideoStreamReceiver,
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use wechat_protocol::calls::{
     audio_packet::{self, Live96, MediaContext, MediaEpoch},
     relay::SelectedRelay,
     video_packet::{
-        classify_video_channel_payload, ReassembledVideoFrame, RsmIngestOutcome,
-        RsmVideoReassembler, VideoChannelPayload,
+        classify_video_channel_payload, ReassembledVideoFrame, VideoChannelPayload, VideoP2sReport,
     },
+    video_qos::ScheduledIRequest,
 };
 
 /// Outcome of consuming one conference relay datagram, including audio, video and RTCP signals.
@@ -65,17 +66,22 @@ pub struct StreamReport {
     pub identity_quarantined: bool,
     pub decode_errors: u64,
 }
+
+const MAX_READY_VIDEO_FRAMES: usize = 8;
+
 pub struct ConferenceReceiver {
     channel: Live96,
     decoder: OpusDecoder,
     order: RtpOrder,
-    video: RsmVideoReassembler,
-    last_video_stream_id: Option<u8>,
+    video: VideoStreamReceiver,
+    ready_video: VecDeque<ReassembledVideoFrame>,
+    video_clock_anchored: bool,
     pub report: StreamReport,
     timeline: Option<(u32, u64)>,
     sequence: u64,
     decoding: bool,
 }
+
 impl ConferenceReceiver {
     pub fn new(selected: &SelectedRelay, member: u16, epoch: MediaEpoch) -> Result<Self> {
         Ok(Self {
@@ -92,8 +98,9 @@ impl ConferenceReceiver {
             )?,
             decoder: OpusDecoder::new(AudioFormat::new(16000, 1, 20)?)?,
             order: RtpOrder::new(),
-            video: RsmVideoReassembler::new(),
-            last_video_stream_id: None,
+            video: VideoStreamReceiver::new(0),
+            ready_video: VecDeque::new(),
+            video_clock_anchored: false,
             report: StreamReport::default(),
             timeline: None,
             sequence: 0,
@@ -101,17 +108,68 @@ impl ConferenceReceiver {
         })
     }
 
+    /// Anchor video P2S/recovery clocks at `now_ms` for a newly joined or rejoined member.
+    pub(crate) fn anchor_video_clock(&mut self, now_ms: u64) {
+        if !self.video_clock_anchored {
+            self.video.reset(now_ms);
+            self.video_clock_anchored = true;
+        }
+    }
+
     /// Last video stream ID observed on an authenticated inbound `RsmVideo` packet from this member.
     pub(crate) fn last_video_stream_id(&self) -> Option<u8> {
-        self.last_video_stream_id
+        self.video.last_stream_id()
+    }
+
+    /// Latest unwrapped 64-bit `total_pkg_seq` observed on inbound RSM video packets from this member.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_video_total_pkg_seq(&self) -> Option<u64> {
+        self.video.last_total_pkg_seq()
+    }
+
+    /// Poll due `0x06` ARQ/NACK missing packet sequence ranges for this member.
+    pub(crate) fn poll_due_nack(&mut self, now_ms: u64) -> Option<(u8, Vec<(u16, u16)>)> {
+        self.video.poll_due_nack(now_ms)
+    }
+
+    pub(crate) fn has_active_video_window(&self) -> bool {
+        self.video.has_active_video_window()
+    }
+
+    pub(crate) fn is_video_keyframe_synced(&self) -> bool {
+        self.video.is_keyframe_synced()
+    }
+
+    pub(crate) fn queue_local_keyframe_request(&mut self, retries: u8) {
+        self.video.queue_local_keyframe_request(retries);
+    }
+
+    pub(crate) fn poll_due_irequests(
+        &mut self,
+        local_member: u16,
+        target_member: u16,
+        now_ms: u64,
+    ) -> Vec<ScheduledIRequest> {
+        self.video
+            .poll_due_irequests(local_member, target_member, now_ms)
+    }
+
+    pub(crate) fn snapshot_video_p2s(
+        &mut self,
+        member_id: u16,
+        conn_id: u32,
+        codec_support_mask: u32,
+        now_ms: u64,
+    ) -> VideoP2sReport {
+        self.video
+            .snapshot_p2s(member_id, conn_id, codec_support_mask, now_ms)
     }
 
     /// Pop the next buffered in-order video frame that is ready for delivery after [`Self::consume_media`].
     pub fn pop_ready_video(&mut self) -> Option<ReassembledVideoFrame> {
-        let frame = self.video.pop_ready()?;
-        self.last_video_stream_id = Some(frame.stream_id);
-        Some(frame)
+        self.ready_video.pop_front()
     }
+
     pub fn consume(
         &mut self,
         epoch: MediaEpoch,
@@ -119,9 +177,9 @@ impl ConferenceReceiver {
         elapsed_ms: u64,
         decode_audio: bool,
     ) -> Result<Vec<DecodedAudio>> {
-        Ok(self
-            .consume_media(epoch, packet, elapsed_ms, decode_audio)?
-            .audio)
+        let out = self.consume_media(epoch, packet, elapsed_ms, decode_audio)?;
+        self.ready_video.clear();
+        Ok(out.audio)
     }
 
     /// Consume one conference relay packet and return decoded audio, reassembled video
@@ -159,30 +217,56 @@ impl ConferenceReceiver {
             }
         };
         self.report.authenticated_packets += 1;
-        if (opened.packed_kind & 0xf0) == 0x20 {
+        if matches!(opened.packed_kind & 0xf0, 0x20 | 0x60) {
             if let Ok(kind) = classify_video_channel_payload(opened.payload()) {
                 match kind {
-                    VideoChannelPayload::IRequest(_) => {
+                    VideoChannelPayload::IRequest(req) => {
+                        if std::env::var("WX_CALL_VIDEO_TRACE").as_deref() == Ok("1") {
+                            eprintln!(
+                                "[wechat-call-video] conf rx ireq magic=0x{:02x} kind=0x{:02x} ext={} seq={} from={} stream={} target={} tstream={} ts={} raw={:02x?}",
+                                opened.magic(),
+                                opened.packed_kind,
+                                opened.extension_byte(),
+                                opened.sequence32(),
+                                req.local_member,
+                                req.local_stream_id,
+                                req.target_member,
+                                req.target_stream_id,
+                                req.timestamp_ms,
+                                opened.payload()
+                            );
+                        }
                         out.peer_requested_keyframe = true;
                     }
-                    VideoChannelPayload::Nack(_) => {
+                    VideoChannelPayload::Nack(raw_nack) => {
+                        if std::env::var("WX_CALL_VIDEO_TRACE").as_deref() == Ok("1") {
+                            eprintln!(
+                                "[wechat-call-video] conf rx nack magic=0x{:02x} kind=0x{:02x} ext={} seq={} len={} raw={:02x?}",
+                                opened.magic(),
+                                opened.packed_kind,
+                                opened.extension_byte(),
+                                opened.sequence32(),
+                                raw_nack.len(),
+                                raw_nack
+                            );
+                        }
                         self.report.feedback_packets += 1;
                     }
                     VideoChannelPayload::RsmVideo(raw) => {
-                        self.last_video_stream_id = Some(opened.packed_kind & 0x0f);
-                        match self.video.ingest(raw) {
-                            Ok(RsmIngestOutcome::Frame(frame)) => {
-                                self.last_video_stream_id = Some(frame.stream_id);
-                                if frame.prior_frames_dropped && !frame.is_keyframe {
-                                    out.need_keyframe = true;
-                                }
-                                out.video = Some(frame);
-                            }
-                            Ok(RsmIngestOutcome::FrameDroppedNeedKeyframe) | Err(_) => {
-                                out.need_keyframe = true;
-                            }
-                            Ok(RsmIngestOutcome::Pending) => {}
+                        if (opened.packed_kind & 0xf0) != 0x20 {
+                            self.report.control_packets += 1;
+                            return Ok(out);
                         }
+                        self.anchor_video_clock(elapsed_ms);
+                        let batch =
+                            self.video
+                                .ingest_rsm(opened.packed_kind & 0x0f, raw, elapsed_ms);
+                        out.need_keyframe = batch.assembly_dropped;
+                        self.ready_video.extend(batch.frames);
+                        while self.ready_video.len() > MAX_READY_VIDEO_FRAMES {
+                            self.ready_video.pop_front();
+                        }
+                        out.video = self.ready_video.pop_front();
                     }
                 }
             }
@@ -331,11 +415,13 @@ impl ConferenceReceiver {
     /// New application track incarnation; keep authenticated replay/order state
     /// and the shared presentation clock, while discarding codec history.
     pub fn reset_decoder(&mut self) -> Result<()> {
-        self.video.reset();
-        self.last_video_stream_id = None;
+        self.video.reset(0);
+        self.video_clock_anchored = false;
+        self.ready_video.clear();
         self.decoder.reset().map_err(Into::into)
     }
 }
+
 impl Drop for ConferenceReceiver {
     fn drop(&mut self) {
         self.close();
@@ -424,6 +510,283 @@ mod tests {
             }
         }
         assert_eq!(rx.last_video_stream_id(), Some(2));
+        assert_eq!(rx.last_video_total_pkg_seq(), Some(1));
         assert!(saw_frame);
+    }
+
+    #[test]
+    fn unknown_0x60_rtcp_payload_is_counted_as_control_not_rsm_video() {
+        use zeroize::Zeroizing;
+        let selected = SelectedRelay {
+            room_id: 42,
+            room_key: 77,
+            own_member: 0,
+            connection_id: 1,
+            endpoint: "127.0.0.1:8080".parse().unwrap(),
+            media_key: Zeroizing::new([7; 32]),
+            merge_mode: false,
+        };
+        let epoch = MediaEpoch {
+            account_generation: 1,
+            logout_epoch: 0,
+            call_generation: 1,
+            key_generation: 1,
+        };
+        let mut rx = ConferenceReceiver::new(&selected, 1, epoch).unwrap();
+        let mut peer_tx = Live96::new(
+            [7; 32],
+            77,
+            MediaContext {
+                room_id: 42,
+                own_member: 1,
+                peer_member: 0,
+                connection_id: 1,
+            },
+            epoch,
+        )
+        .unwrap();
+        peer_tx
+            .authorize_transmit(
+                epoch,
+                TransmitScope::LegacyRelayAudio {
+                    key_generation: epoch.key_generation,
+                },
+            )
+            .unwrap();
+
+        // Unknown 0x61 RTCP subtype (leading byte 0x77, not 0x66/0x06) must never enter RSM ingest.
+        let unknown_rtcp = [0x77u8; 28];
+        let pkt = peer_tx
+            .seal_video_rtcp(epoch, 100, 1, &unknown_rtcp)
+            .unwrap();
+        let out = rx.consume_media(epoch, &pkt, 100, true).unwrap();
+        assert!(!out.need_keyframe);
+        assert!(out.video.is_none());
+        assert_eq!(rx.last_video_stream_id(), None);
+        assert_eq!(rx.report.control_packets, 1);
+    }
+
+    #[test]
+    fn conference_receiver_telemetry_clears_on_idle_window_and_decoder_reset() {
+        use zeroize::Zeroizing;
+        let selected = SelectedRelay {
+            room_id: 42,
+            room_key: 77,
+            own_member: 0,
+            connection_id: 1,
+            endpoint: "127.0.0.1:8081".parse().unwrap(),
+            media_key: Zeroizing::new([7; 32]),
+            merge_mode: false,
+        };
+        let epoch = MediaEpoch {
+            account_generation: 1,
+            logout_epoch: 0,
+            call_generation: 1,
+            key_generation: 1,
+        };
+        let mut rx = ConferenceReceiver::new(&selected, 1, epoch).unwrap();
+        let mut peer_tx = Live96::new(
+            [7; 32],
+            77,
+            MediaContext {
+                room_id: 42,
+                own_member: 1,
+                peer_member: 0,
+                connection_id: 1,
+            },
+            epoch,
+        )
+        .unwrap();
+        peer_tx
+            .authorize_transmit(
+                epoch,
+                TransmitScope::LegacyRelayAudio {
+                    key_generation: epoch.key_generation,
+                },
+            )
+            .unwrap();
+
+        // Self-contained H.265 VPS + IDR so keyframe sync completes inside consume_media.
+        let mut packetizer = RsmVideoPacketizer::new(1, 1);
+        let idr = vec![
+            0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0, 0, 0, 1, 0x26, 0x01, 0xaa, 0xbb, 0xcc, 0xdd,
+        ];
+        let chunks = packetizer
+            .packetize(VideoWireCodec::H265, &idr, 100, 15, 350)
+            .unwrap();
+        let pkt = peer_tx.seal_video(epoch, 100, 1, true, &chunks[0]).unwrap();
+        let out = rx.consume_media(epoch, &pkt, 100, true).unwrap();
+        assert!(out.video.is_some());
+        assert!(rx.is_video_keyframe_synced());
+        assert!(rx.has_active_video_window());
+
+        let rep1 = rx.snapshot_video_p2s(1, 1, 0x1d, 1100);
+        assert_eq!(rep1.play_frames, 1);
+        assert!(!rx.has_active_video_window());
+
+        // Snapshotting an idle camera-off window resets anchors without reporting freeze.
+        let idle = rx.snapshot_video_p2s(1, 1, 0x1d, 5100);
+        assert_eq!(idle.heavy_freeze_cnt, 0);
+        assert_eq!(idle.actual_member_num, 0);
+
+        // Rejoin / reset_decoder resets video telemetry and keyframe sync completely.
+        rx.reset_decoder().unwrap();
+        assert!(!rx.is_video_keyframe_synced());
+        let after_reset = rx.snapshot_video_p2s(1, 1, 0x1d, 6100);
+        assert_eq!(after_reset.play_frames, 0);
+    }
+
+    #[test]
+    fn late_join_and_rejoin_anchor_p2s_window_and_audio_only_consume_clears_ready_video() {
+        use zeroize::Zeroizing;
+        let selected = SelectedRelay {
+            room_id: 42,
+            room_key: 77,
+            own_member: 0,
+            connection_id: 1,
+            endpoint: "127.0.0.1:8082".parse().unwrap(),
+            media_key: Zeroizing::new([7; 32]),
+            merge_mode: false,
+        };
+        let epoch = MediaEpoch {
+            account_generation: 1,
+            logout_epoch: 0,
+            call_generation: 1,
+            key_generation: 1,
+        };
+        let mut rx = ConferenceReceiver::new(&selected, 1, epoch).unwrap();
+        let mut peer_tx = Live96::new(
+            [7; 32],
+            77,
+            MediaContext {
+                room_id: 42,
+                own_member: 1,
+                peer_member: 0,
+                connection_id: 1,
+            },
+            epoch,
+        )
+        .unwrap();
+        peer_tx
+            .authorize_transmit(
+                epoch,
+                TransmitScope::LegacyRelayAudio {
+                    key_generation: epoch.key_generation,
+                },
+            )
+            .unwrap();
+
+        // Member joins 120 seconds into the conference sending pre-sync H.264 P-frames.
+        // Anchoring on first video arrival ensures window_ms is ~550 ms, NOT 120_550 ms.
+        let mut pktz = RsmVideoPacketizer::new(1, 1);
+        let p_frame = vec![0, 0, 0, 1, 0x41, 0x9a, 0x11, 0x22, 0x33, 0x44];
+        for i in 0..8u64 {
+            let at = 120_000 + i * 66;
+            let chunks = pktz
+                .packetize(VideoWireCodec::H264, &p_frame, at as u32, 15, 500)
+                .unwrap();
+            let pkt = peer_tx.seal_video(epoch, at, 1, true, &chunks[0]).unwrap();
+            let _ = rx.consume_media(epoch, &pkt, at, true).unwrap();
+        }
+        let late_rep = rx.snapshot_video_p2s(1, 1, 0x1d, 120_550);
+        assert!(late_rep.recv_fps >= 12);
+        assert_eq!(late_rep.play_fps, 0);
+        assert_eq!(late_rep.heavy_freeze_cnt, 1);
+        assert!(late_rep.heavy_freeze_time_ratio >= 80);
+
+        // Member departs and rejoins another 120 seconds later (`reset_decoder()`):
+        // window_start_ms re-anchors to 240_000 ms rather than freezing at 120_550 ms.
+        rx.reset_decoder().unwrap();
+        let idr = vec![
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x16, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0x88,
+            0xaa, 0xbb,
+        ];
+        for i in 0..10u64 {
+            let at = 240_000 + i * 66;
+            let frame = if i == 0 { &idr } else { &p_frame };
+            let chunks = pktz
+                .packetize(VideoWireCodec::H264, frame, at as u32, 15, 500)
+                .unwrap();
+            let pkt = peer_tx.seal_video(epoch, at, 1, true, &chunks[0]).unwrap();
+            let _ = rx.consume_media(epoch, &pkt, at, true).unwrap();
+        }
+        let rejoin_rep = rx.snapshot_video_p2s(1, 1, 0x1d, 240_700);
+        assert!(rejoin_rep.play_fps >= 12);
+        assert_eq!(rejoin_rep.heavy_freeze_cnt, 0);
+
+        // Multi-frame release (completing a 2-packet IDR while a newer P-frame is buffered
+        // behind it) must emit frames in FIFO order via consume_media + pop_ready_video, and
+        // audio-only consume() must clear the extra buffered frames rather than retaining them.
+        let mut multi_pktz = RsmVideoPacketizer::new(1, 1)
+            .with_orientation(1)
+            .with_chunk_bytes(64)
+            .unwrap();
+        let mut two_pkt_idr = idr.clone();
+        two_pkt_idr.extend_from_slice(&[0x55; 96]);
+        let idr_pair = multi_pktz
+            .packetize(VideoWireCodec::H264, &two_pkt_idr, 241_000, 15, 500)
+            .unwrap();
+        assert!(idr_pair.len() >= 2);
+        let trailing_p = multi_pktz
+            .packetize(VideoWireCodec::H264, &p_frame, 241_066, 15, 500)
+            .unwrap();
+        assert_eq!(trailing_p.len(), 1);
+
+        // Positive FIFO order check via consume_media: send IDR pkt 0, then P-frame (buffered
+        // behind incomplete IDR), then remaining IDR packets so both release on the final packet.
+        let d0 = peer_tx
+            .seal_video(epoch, 241_000, 1, true, &idr_pair[0])
+            .unwrap();
+        assert!(rx
+            .consume_media(epoch, &d0, 241_000, true)
+            .unwrap()
+            .video
+            .is_none());
+        let dp = peer_tx
+            .seal_video(epoch, 241_020, 1, true, &trailing_p[0])
+            .unwrap();
+        assert!(rx
+            .consume_media(epoch, &dp, 241_020, true)
+            .unwrap()
+            .video
+            .is_none());
+        let mut released_first = None;
+        for (idx, chunk) in idr_pair.iter().enumerate().skip(1) {
+            let at = 241_030 + idx as u64;
+            let d = peer_tx.seal_video(epoch, at, 1, true, chunk).unwrap();
+            let out = rx.consume_media(epoch, &d, at, true).unwrap();
+            if out.video.is_some() {
+                released_first = out.video;
+            }
+        }
+        let f_idr = released_first.expect("final IDR packet must release IDR first");
+        assert!(f_idr.is_keyframe);
+        let f_p = rx
+            .pop_ready_video()
+            .expect("buffered P-frame must follow IDR in FIFO order");
+        assert!(!f_p.is_keyframe);
+        assert!(rx.pop_ready_video().is_none());
+
+        // Audio-only consume() receiving the same 2-frame release burst must clear ready_video.
+        let idr_pair2 = multi_pktz
+            .packetize(VideoWireCodec::H264, &two_pkt_idr, 242_000, 15, 500)
+            .unwrap();
+        let trailing_p2 = multi_pktz
+            .packetize(VideoWireCodec::H264, &p_frame, 242_066, 15, 500)
+            .unwrap();
+        let d2_0 = peer_tx
+            .seal_video(epoch, 242_000, 1, true, &idr_pair2[0])
+            .unwrap();
+        let _ = rx.consume(epoch, &d2_0, 242_000, false).unwrap();
+        let d2_p = peer_tx
+            .seal_video(epoch, 242_020, 1, true, &trailing_p2[0])
+            .unwrap();
+        let _ = rx.consume(epoch, &d2_p, 242_020, false).unwrap();
+        for (idx, chunk) in idr_pair2.iter().enumerate().skip(1) {
+            let at = 242_030 + idx as u64;
+            let d = peer_tx.seal_video(epoch, at, 1, true, chunk).unwrap();
+            let _ = rx.consume(epoch, &d, at, false).unwrap();
+        }
+        assert!(rx.pop_ready_video().is_none());
     }
 }
