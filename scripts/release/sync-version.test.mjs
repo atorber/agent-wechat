@@ -11,6 +11,7 @@ import { cratePackage } from './crates-version.mjs';
 
 const require = createRequire(import.meta.url);
 const applicationPackages = ['@agent-wechat/cli', '@agent-wechat/agent-wechat', '@agent-wechat/desktop'];
+const deepseekPackage = '@agent-wechat/deepseek-harness-extension';
 // Use the repository's own fixed group so this test fails if the libraries leave it.
 const { fixed } = JSON.parse(await readFile(new URL('../../.changeset/config.json', import.meta.url), 'utf8'));
 
@@ -27,7 +28,7 @@ async function fixture(t, crateVersion = '1.0.0') {
     access: 'public', baseBranch: 'main', updateInternalDependencies: 'patch',
     privatePackages: { version: true, tag: false }, ignore: [] });
   for (const [directory, name] of [['cli', applicationPackages[0]], ['openclaw-extension', applicationPackages[1]],
-    ['desktop', applicationPackages[2]], ['rust-crates', cratePackage.name]]) {
+    ['desktop', applicationPackages[2]], ['deepseek-harness-extension', deepseekPackage], ['rust-crates', cratePackage.name]]) {
     await put(`packages/${directory}/package.json`, { name, version: directory === 'rust-crates' ? crateVersion : '1.0.0',
       private: ['desktop', 'rust-crates'].includes(directory) });
   }
@@ -42,8 +43,8 @@ async function fixture(t, crateVersion = '1.0.0') {
   return { root, put };
 }
 
-test('the fixed group holds the applications and the Rust library package', () => {
-  assert.deepEqual(fixed, [[...applicationPackages, cratePackage.name]]);
+test('the fixed group holds the applications, the WeChat plugin and the Rust library package', () => {
+  assert.deepEqual(fixed, [[...applicationPackages, cratePackage.name, deepseekPackage]]);
 });
 
 for (const scenario of [
@@ -59,7 +60,7 @@ for (const scenario of [
   // Cargo's lockfile updates are checked separately with the real workspace.
   const result = await syncVersions(root, { runCargo() {} });
   assert.deepEqual(result, { applicationVersion: scenario.version, crateVersion: scenario.version });
-  for (const directory of ['cli', 'openclaw-extension', 'desktop']) {
+  for (const directory of ['cli', 'openclaw-extension', 'desktop', 'deepseek-harness-extension']) {
     assert.equal(JSON.parse(await readFile(join(root, `packages/${directory}/package.json`), 'utf8')).version, scenario.version);
   }
   for (const name of crateNames) {
@@ -79,7 +80,7 @@ for (const scenario of [
 test('the new private library marker participates in the existing beta-exit version PR', async t => {
   const { root, put } = await fixture(t);
   for (const [directory, name] of [['cli', applicationPackages[0]], ['openclaw-extension', applicationPackages[1]],
-    ['desktop', applicationPackages[2]], ['rust-crates', cratePackage.name]]) {
+    ['desktop', applicationPackages[2]], ['deepseek-harness-extension', deepseekPackage], ['rust-crates', cratePackage.name]]) {
     await put(`packages/${directory}/package.json`, { name, version: '2.0.0-beta.1', private: ['desktop', 'rust-crates'].includes(directory) });
   }
   await put('.changeset/pre.json', { mode: 'exit', tag: 'beta',

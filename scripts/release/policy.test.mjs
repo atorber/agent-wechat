@@ -27,7 +27,7 @@ test('read-only beta registry guard requires both existing public stable lines a
     const name = publicPackages.find(([, value]) => url.includes(value.replace('/', '%2f')))?.[1];
     return Response.json({ name, version: '0.16.0' });
   });
-  assert.equal(requested.length, 2);
+  assert.equal(requested.length, publicPackages.length);
   for (const response of [new Response(null, { status: 503 }), Response.json({ name: '@agent-wechat/cli', version: '1.0.0-beta.0' })]) {
     await assert.rejects(requireStablePublicPackages(policy, async () => response.clone()), /stable npm latest/);
   }
