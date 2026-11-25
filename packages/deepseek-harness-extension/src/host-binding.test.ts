@@ -261,7 +261,7 @@ function fakeClientFactory(
       },
       sendText: async (accountId: string, chatJid: string, text: string, key: string) => {
         host.sends.push({ accountId, chatJid, text, key });
-        return { serverId: 'srv-msg-1', localMessageId: 'local-1' };
+        return { id: 'send-1', serverId: 'srv-msg-1', localMessageId: 'local-1' };
       },
       sendByKey: async () => undefined,
       contacts: async () => ({ items: host.directoryContacts, nextCursor: undefined }),

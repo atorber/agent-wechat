@@ -425,6 +425,7 @@ test('createOutboxTransport: sendText maps intent ids', async () => {
       sendText: async (...args) => {
         passed = args;
         return {
+          id: 'send-1',
           serverId: 'srv-1',
           localMessageId: 'local-1',
           clientId: 'cli-1',
@@ -441,14 +442,14 @@ test('createOutboxTransport: sendText maps intent ids', async () => {
 
 test('createOutboxTransport: sendText falls back to clientId then serverId', async () => {
   const t1 = createOutboxTransport(
-    fakeClient({ sendText: async () => ({ serverId: 's', clientId: 'c' }) }),
+    fakeClient({ sendText: async () => ({ id: 'send-a', serverId: 's', clientId: 'c' }) }),
   );
   assert.deepEqual(await t1.sendText(asAccountId('a'), asChatJid('c'), 't', 'k'), {
     serverId: 's',
     serverMessageId: 'c',
   });
   const t2 = createOutboxTransport(
-    fakeClient({ sendText: async () => ({ serverId: 's' }) }),
+    fakeClient({ sendText: async () => ({ id: 'send-b', serverId: 's' }) }),
   );
   assert.deepEqual(await t2.sendText(asAccountId('a'), asChatJid('c'), 't', 'k'), {
     serverId: 's',
@@ -456,10 +457,24 @@ test('createOutboxTransport: sendText falls back to clientId then serverId', asy
   });
 });
 
-test('createOutboxTransport: sendText throws when serverId is null or empty', async () => {
-  for (const serverId of [null, '', undefined]) {
+test('createOutboxTransport: null serverId means accepted-but-unacked, not rejection', async () => {
+  // The daemon queues sends asynchronously: serverId stays null until WeChat
+  // accepts. A queued intent maps to an empty serverId, never a throw.
+  const transport = createOutboxTransport(
+    fakeClient({
+      sendText: async () => ({ id: 'send-q', state: 'queued', clientId: 'cli-9', serverId: null }),
+    }),
+  );
+  assert.deepEqual(await transport.sendText(asAccountId('a'), asChatJid('c'), 't', 'k'), {
+    serverId: '',
+    serverMessageId: 'cli-9',
+  });
+});
+
+test('createOutboxTransport: sendText throws when the intent has no send id', async () => {
+  for (const id of [null, undefined, '']) {
     const transport = createOutboxTransport(
-      fakeClient({ sendText: async () => ({ serverId, clientId: 'cli' }) }),
+      fakeClient({ sendText: async () => ({ id, serverId: 's', clientId: 'cli' }) }),
     );
     await assert.rejects(
       () => transport.sendText(asAccountId('a'), asChatJid('c'), 'secret-text', 'key'),
@@ -486,6 +501,7 @@ test('createOutboxTransport: sendByKey maps valid intent with text', async () =>
   const transport = createOutboxTransport(
     fakeClient({
       sendByKey: async () => ({
+        id: 'send-2',
         serverId: 'srv-2',
         localMessageId: 'local-2',
         text: 'original text',
@@ -501,11 +517,31 @@ test('createOutboxTransport: sendByKey maps valid intent with text', async () =>
   });
 });
 
-test('createOutboxTransport: sendByKey omits text when not confidently available', async () => {
+test('createOutboxTransport: sendByKey confirms on accepted ids even without text', async () => {
+  // The send-intent readback does not echo the payload, so confirmation rests
+  // on the daemon's per-key record: accepted + ids, no text field.
   const transport = createOutboxTransport(
     fakeClient({
-      sendByKey: async () => ({ serverId: 'srv-3', clientId: 'cli-3' }),
+      sendByKey: async () => ({ id: 'send-3', state: 'accepted', clientId: 'cli-3', serverId: 'srv-3' }),
     }),
   );
-  assert.equal(await transport.sendByKey(asAccountId('acct'), 'key'), undefined);
+  assert.deepEqual(await transport.sendByKey(asAccountId('acct'), 'key'), {
+    serverId: 'srv-3',
+    serverMessageId: 'cli-3',
+  });
+});
+
+test('createOutboxTransport: sendByKey keeps polling on pending or failed states', async () => {
+  for (const intent of [
+    { id: 's', state: 'queued', clientId: 'c', serverId: null },
+    { id: 's', state: 'submitting', clientId: 'c', serverId: null },
+    { id: 's', state: 'failed', clientId: 'c', serverId: 'srv', errorCode: 'blocked' },
+    { id: 's', state: 'cancelled', clientId: 'c', serverId: 'srv' },
+    { id: 's', state: 'needs_review', clientId: 'c', serverId: 'srv' },
+  ]) {
+    const transport = createOutboxTransport(
+      fakeClient({ sendByKey: async () => intent }),
+    );
+    assert.equal(await transport.sendByKey(asAccountId('acct'), 'key'), undefined);
+  }
 });

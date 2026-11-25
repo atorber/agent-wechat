@@ -38,9 +38,13 @@ export interface SendResult {
   readonly serverMessageId: string;
 }
 
-/** Canonical readback used both by `verify` and by `sendByKey`. */
+/** Canonical readback used both by `verify` and by `sendByKey`. The daemon
+ * records the exact payload under our idempotency key, but its send-intent
+ * readback does not echo the text back, so `text` is optional: when present it
+ * must match byte-for-byte; when absent the per-key daemon record is trusted
+ * (the key is unique per logical send and we never post twice per key). */
 export interface ReadbackResult extends SendResult {
-  readonly text: string;
+  readonly text?: string;
 }
 
 export interface OutboxDeps {
@@ -108,7 +112,7 @@ function stamp(ms: number): string {
  * recorded by `verify`.
  */
 function readbackMatches(rec: OutboxRecord, readback: ReadbackResult): boolean {
-  if (readback.text !== rec.payload) return false;
+  if (readback.text !== undefined && readback.text !== rec.payload) return false;
   if (readback.serverId.length === 0 || readback.serverMessageId.length === 0) return false;
   if (rec.serverId !== undefined && rec.serverId !== readback.serverId) return false;
   if (rec.serverMessageId !== undefined && rec.serverMessageId !== readback.serverMessageId) {
@@ -262,6 +266,12 @@ export function createOutbox(deps: OutboxDeps): Outbox {
           current.payload,
           key,
         );
+        if (result.serverId.length === 0) {
+          // The daemon accepted and queued the send; WeChat's id is assigned
+          // asynchronously. Reconcile by key instead of trusting an un-ACKed
+          // POST response.
+          return confirmByKey(current);
+        }
         // Verify with the ids returned by the POST and the SAME payload —
         // never with a caller-supplied rendering of the message.
         return await verifyInternal(key, {

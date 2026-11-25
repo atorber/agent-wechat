@@ -224,6 +224,22 @@ test('readback mismatch marks needs_review with canonical-readback-mismatch and 
   assert.equal(h.lookups.length, 0);
 });
 
+test('queued POST (empty serverId) reconciles by key and confirms without text', async () => {
+  // The daemon accepts asynchronously: the POST response carries a send id
+  // but serverId stays null until WeChat ACKs. deliver must not treat that as
+  // a failure; it polls sendByKey and confirms on accepted ids (no text echo).
+  const h = harness();
+  await enqueueDefault(h);
+  h.setSend(async () => ({ serverId: '', serverMessageId: 'cli-1' }));
+  h.setLookup(async () => ({ serverId: SERVER_ID, serverMessageId: 'cli-1' }));
+
+  const rec = await h.outbox.deliver(KEY);
+  assert.equal(rec?.status, 'sent');
+  assert.equal(rec?.serverId, SERVER_ID);
+  assert.equal(h.sendInvocations, 1, 'never a second POST');
+  assert.ok(h.lookups.includes(KEY), 'reconciled by key');
+});
+
 test('send throws, sendByKey finds matching message, deliver becomes sent without resending', async () => {
   const h = harness();
   await enqueueDefault(h);
