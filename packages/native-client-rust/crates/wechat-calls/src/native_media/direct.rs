@@ -1,7 +1,7 @@
 //! Direct voice and video transport, codec state, packet ordering and pacing.
 use super::{
-    connect_relay_with_early, DirectAudioFrame, DirectMediaHost, DirectMediaOptions, DirectVideoTx,
-    MediaMetric, PreconnectedRelay, TxAudioJitterBuffer,
+    connect_relay_with_early, rx_trace::RxTrace, DirectAudioFrame, DirectMediaHost,
+    DirectMediaOptions, DirectVideoTx, MediaMetric, PreconnectedRelay, TxAudioJitterBuffer,
 };
 use crate::{
     audio::{AudioDecoder, AudioEncoder, AudioFormat},
@@ -20,9 +20,10 @@ use std::{
 use wechat_protocol::calls::{
     audio_packet::{self, Live96, MediaContext, TransmitScope},
     relay::RelayEpoch,
+    rudp::{self, RudpAckTracker},
     video_packet::{
         classify_video_channel_payload, encode_p2s_report, encode_video_nack, parse_s2p,
-        parse_video_nack, VideoChannelPayload, VideoS2pCommand,
+        parse_video_nack, VideoChannelPayload, VideoS2pCommand, P2S_CODEC_SUPPORT_H264_H265,
     },
     video_qos::KeyframeRequestReason,
 };
@@ -172,7 +173,7 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
     } else {
         VideoStreamReceiver::new(connected_ms)
     };
-    let mut video_tx = VideoTxPacer::new(selected.own_member, 1, connected_ms);
+    let mut video_tx = VideoTxPacer::new(selected.own_member, 1);
     let mut last_p2s_tx: Option<Instant> = None;
     let mut p2s_seq = 1u16;
     let mut last_peer_activity = Instant::now();
@@ -194,6 +195,8 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
     let mut trace_rx_rtcp_logged = 0u32;
     let mut trace_rx_video_wire_logged = false;
     let mut trace_tx_ireq_wire_logged = 0u32;
+    let mut rx_trace = RxTrace::from_env();
+    let mut rudp_acks = RudpAckTracker::default();
     let media_result = (|| -> Result<()> {
         while host.current() {
             ensure!(
@@ -214,13 +217,17 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                 match recv_outcome {
                     Ok((n, source)) if source == endpoint && n <= 8197 => {
                         drained += 1;
+                        rx_trace.datagram(&buffer[..n]);
                         let Ok((_magic, member)) =
                             audio_packet::unverified_live_member(&buffer[..n])
                         else {
+                            rx_trace.bad_header();
                             continue;
                         };
                         if member == 0xffff {
+                            rx_trace.relay();
                             if let Ok(Some(opened)) = relay_qos.open(epoch, &buffer[..n]) {
+                                rx_trace.relay_qos(opened.packed_kind, opened.payload());
                                 if opened.packed_kind == 0x30 {
                                     if let Ok(s2p) = parse_s2p(opened.payload()) {
                                         if video_trace {
@@ -254,8 +261,14 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                             continue;
                         }
                         let opened = match channel.open(epoch, &buffer[..n]) {
-                            Ok(v) => v,
+                            Ok(v) => {
+                                if v.is_none() {
+                                    rx_trace.open_dropped();
+                                }
+                                v
+                            }
                             Err(e) => {
+                                rx_trace.open_error(&buffer[..n], &e);
                                 if e.to_string().contains("nonce")
                                     || e.to_string().contains("generation")
                                 {
@@ -269,6 +282,7 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                             // peer renews liveness. Relay traffic and bad/replayed
                             // packets do not establish that the peer is still here.
                             last_peer_activity = Instant::now();
+                            rx_trace.opened(opened.packed_kind);
                             if opened.packed_kind == 0x70 {
                                 if let Some(reply) =
                                     channel.reply_to_probe(epoch, clock(), &opened)?
@@ -459,9 +473,12 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                                     }
                                 }
                             } else if opened.packed_kind == 0x10 {
-                                if let Ok(primary) =
-                                    audio_packet::parse_ordinary95(opened.payload())
-                                {
+                                let parsed = audio_packet::parse_ordinary95(opened.payload());
+                                match &parsed {
+                                    Ok(primary) => rx_trace.audio_parsed(opened.payload(), primary),
+                                    Err(error) => rx_trace.audio_unparsed(opened.payload(), error),
+                                }
+                                if let Ok(primary) = parsed {
                                     let primary_count = primary.primaries.len();
                                     let admission = match rx_order.admit(
                                         primary.last_sequence,
@@ -471,6 +488,7 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                                         Ok(admission) => Some(admission),
                                         Err(_) => {
                                             host.record(MediaMetric::InvalidOrder, 1);
+                                            rx_trace.order_rejected();
                                             None
                                         }
                                     };
@@ -497,21 +515,57 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                                                 host.current(),
                                                 "Call authority revoked before decode"
                                             );
-                                            let pcm = decoder.decode(packet)?;
+                                            let pcm = match decoder.decode(packet) {
+                                                Ok(pcm) => pcm,
+                                                Err(error) => {
+                                                    rx_trace.decode_error(packet, &error);
+                                                    return Err(error.into());
+                                                }
+                                            };
                                             ensure!(
                                                 host.current(),
                                                 "Call authority revoked before audio delivery"
                                             );
                                             host.receive_pcm_at(sample_offset, &pcm)?;
                                             host.record(MediaMetric::DeliveredFrames, 1);
+                                            rx_trace.pcm(&pcm);
                                         }
                                     }
                                 }
+                            } else if opened.packed_kind == 0x50 {
+                                // Acknowledge in-band RUDP data so the peer stops
+                                // retransmitting it; the payloads are not interpreted.
+                                if let Ok(Some(data)) = rudp::parse_rudp_data(opened.payload()) {
+                                    rx_trace.rudp_data(&data);
+                                    if let Some(acked) =
+                                        rudp_acks.record(data.stream_id, data.pkt_num)
+                                    {
+                                        // Official clients stamp RUDP packets with wall-clock
+                                        // milliseconds, as in relay check-in.
+                                        if let Ok(feedback) = rudp::encode_rudp_feedback(
+                                            super::relay::epoch_ms32(),
+                                            data.stream_id,
+                                            acked,
+                                            media.peer_member,
+                                        ) {
+                                            if let Ok(Some(datagram)) =
+                                                channel.seal_rudp(epoch, clock(), &feedback)
+                                            {
+                                                if host.submit(&socket, endpoint, &datagram, &[])? {
+                                                    rx_trace.rudp_ack(data.stream_id, acked);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                rx_trace.other_kind(opened.packed_kind, opened.payload());
                             }
                         }
                     }
                     Ok(_) => {
                         drained += 1;
+                        rx_trace.foreign();
                     }
                     Err(e)
                         if matches!(
@@ -528,6 +582,7 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                     Err(e) => return Err(e.into()),
                 }
             }
+            rx_trace.report();
             if video_enabled || video_rx.last_stream_id().is_some() {
                 let video_now = Instant::now();
                 let now_ms = clock();
@@ -611,14 +666,21 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                 if video_enabled {
                     let p2s_interval =
                         Duration::from_millis(video_rx.recommended_p2s_interval_ms());
-                    if last_p2s_tx.is_none_or(|t| t.elapsed() >= p2s_interval) {
+                    // Report only once a video packet has shown the sender's codec, so the
+                    // server is never offered a codec the sender cannot encode. Packets, not
+                    // decoded frames, open the gate: P2S drives keyframe recovery even while
+                    // no frame can be decoded.
+                    if video_rx.has_rx_codec()
+                        && last_p2s_tx.is_none_or(|t| t.elapsed() >= p2s_interval)
+                    {
                         let report = video_rx.snapshot_p2s(
                             media.peer_member,
                             u32::from(selected.connection_id),
-                            0x1d,
+                            P2S_CODEC_SUPPORT_H264_H265,
                             now_ms,
                         );
-                        if let Ok(p2s) = encode_p2s_report(p2s_seq, 2, &report) {
+                        if let Ok(p2s) = encode_p2s_report(p2s_seq, 2, selected.own_member, &report)
+                        {
                             let sent_seq = p2s_seq;
                             p2s_seq = p2s_seq.wrapping_add(1);
                             if let Ok(datagram) = channel.seal_qos_p2s(epoch, now_ms, &p2s) {
@@ -632,10 +694,11 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
                                         || sent_seq.is_multiple_of(2))
                                 {
                                     eprintln!(
-                                        "[wechat-call-video] tx p2s seq={sent_seq} peer={} stream={} codec={} rx_kbps={} est_bw={} rx_fps={} play_fps={} loss={}%({}pkts,long={}%) arq={} freeze=L{}/{}%,H{}/{}% gap={}ms",
+                                        "[wechat-call-video] tx p2s seq={sent_seq} peer={} stream={} codec={} size={} rx_kbps={} est_bw={} rx_fps={} play_fps={} loss={}%({}pkts,long={}%) arq={} freeze=L{}/{}%,H{}/{}% gap={}ms",
                                         report.remote_member_id,
                                         report.stream_id,
                                         report.decode_type,
+                                        report.max_size_format,
                                         report.recv_kbps,
                                         report.est_bw_kbps,
                                         report.recv_fps,
@@ -761,6 +824,7 @@ pub fn run_direct_media_with_preconnected_relay<H: DirectMediaHost>(
         }
         Ok(())
     })();
+    rx_trace.finish(media_result.as_ref().err());
     relay_qos.close();
     channel.close();
     media_result
