@@ -1,6 +1,6 @@
 {
   "name": "@agent-wechat/deepseek-harness-extension",
-  "version": "3.0.0-beta.6",
+  "version": "3.2.0",
   "type": "module",
   "description": "agent-wechat WeChat channel for DeepSeek Harness (Cordis) hosts — native daemon bridge, per-thread agent routing, and WeChat tools",
   "license": "UNLICENSED",
