@@ -1,7 +1,8 @@
 # wechat-protocol
 
 Native protocol library for the Linux 4.1.13.26 profile. This is Rust
-protocol code using OpenSSL primitives; it does not execute Node or load an
+protocol code using vendored OpenSSL primitives by default (`openssl-crypto`)
+or an opt-in pure-Rust backend (`pure-rust-crypto`); it does not execute Node or load an
 official WeChat executable/library. Account-owned requests use async methods
 backed by blocking transport workers. Login bootstrap
 and remaining low-level operations require a blocking worker in async applications.
@@ -14,14 +15,16 @@ The crate-level Functions list mainly contains helper functions.
 
 | Task | API |
 | --- | --- |
-| Login | `start_qr_login`, `poll_login`, `complete_login` |
-| Receive | `sync`, `sync_scene`, `heartbeat`, `open_push_connection_blocking` |
+| Login | `start_qr_login`, `poll_login`, `complete_login` (or `*_async` with `with_transport`) |
+| Receive | `sync`, `sync_scene`, `heartbeat`, `open_push_connection` / `open_push_connection_blocking` |
 | Send | `send_text`, `send_share`, `send_quote`, `send_file`, `send_image`, `send_video`, `send_voice` |
-| Contacts | `lookup_contacts`, `lookup_room`, `init_contacts` |
-| Lower-level operations | `wire`, `media`, group request builders and response decoders |
+| Contacts | `lookup_contacts`, `lookup_openim_contact`, `lookup_room`, `init_contacts` |
+| Lower-level operations | `transport`, `wire`, `media`, group request builders and response decoders |
 
 After login, move the accepted `AccountState` into
-`NativeClient::from_account(state, options)`. Cloned handles share that account
+`NativeClient::from_account(state, options)` (or
+`NativeClient::from_account_with_transport(state, options, transport)` for a
+custom async transport). Cloned handles share that account
 owner. Async sync, text and call requests take temporary request snapshots and
 adopt accepted cookie updates without holding a state lock over network waits.
 Explicit renewal fences older credential generations. `shutdown().await` stops
@@ -30,6 +33,49 @@ updated secret state out once for handoff. Exporting a persistence snapshot alon
 does not transfer ownership. Ordinary operations no longer accept a separate
 mutable `AccountState`. The daemon shares this same owner and stores accepted
 updates through its encrypted persistence callback.
+
+### Pluggable async transport and WebAssembly
+
+Use the `transport` module (`StreamTransport`, `AsyncByteStream`,
+`HttpTransport`, `HttpOverStream`, `Clock`, `TaskSpawner`, and
+`ProtocolTransport`) to supply your own async sockets, HTTP client and clock
+instead of OS sockets and `reqwest`. Hosts with only raw TCP streams (such as a
+browser Isolated Web App using Direct Sockets) can build a bundle with
+`ProtocolTransport::from_streams(streams, clock)`, which layers strict plaintext
+HTTP/1.1 (`HttpOverStream`) over the byte stream for MMTLS short-link exchanges.
+On native Tokio runtimes, submitted account exchanges detach automatically so
+dropping an outer future still holds the shutdown barrier and adopts verified
+replies; on `wasm32` or non-Tokio executors, attach a host spawner with
+`ProtocolTransport::with_spawner` (for example `wasm_bindgen_futures::spawn_local`)
+if callers may cancel in-flight account RPC futures.
+
+Bind the transport with `NativeClient::with_transport` for async login bootstrap
+(`start_qr_login_async`, `start_saved_device_login_async`, `poll_login_async`,
+`complete_login_async`, `refresh_qr_login_async`) and
+`NativeClient::from_account_with_transport` /
+`from_account_with_transport_and_persistence` for authenticated RPCs and
+`open_push_connection` (`AsyncPushConnection`). For media transfers, use the
+async methods on `media::CdnClient` (`download_async`,
+`download_to_with_progress_async`, `download_storage_with_progress_async`,
+`download_voice_with_progress_async`,
+`upload_async`, `upload_source_with_progress_async`, `upload_image_async`,
+`upload_video_async`, `upload_large_file_with_progress_async`,
+`upload_large_file_from_source_with_progress_async`,
+`upload_video_original_with_progress_async`) together with `AsyncDownloadSink`
+and `PreparedAsyncUpload` (`AsyncUploadSource`) for streaming large downloads
+and uploads without full-file buffering, and the async standalone downloaders
+(`download_advertised_avatar_async`,
+`fetch_sticker_async`, `fetch_sticker_original_async`,
+`fetch_link_thumbnail_async`, `fetch_tp_media_async`,
+`fetch_tp_media_to_async`, `fetch_channels_video_async`).
+
+On `wasm32-unknown-unknown`, blocking OS-socket methods and `reqwest` are
+omitted automatically (`cfg(not(target_arch = "wasm32"))`) with no extra Cargo
+features. Build with `default-features = false, features = ["pure-rust-crypto"]`
+and select a `getrandom` 0.4 backend in the application crate (for browser/IWA
+targets, add `getrandom = { version = "0.4", features = ["wasm_js"] }` and
+`RUSTFLAGS='--cfg getrandom_backend="wasm_js"'`; for custom runtimes, use
+`RUSTFLAGS='--cfg getrandom_backend="custom"'`).
 
 Embedders that already use blocking workers can use `request_blocking` for one
 scoped operation, or `open_push_connection_blocking` for persistent notifications.
@@ -124,9 +170,22 @@ known contact and group lookups, contact bootstrap pages, avatar bytes and voice
 download chunks. The CDN module implements authenticated routing bootstrap,
 encrypted range downloads, ordinary-file uploads with an initial 32 MiB plaintext
 ceiling, supplied JPEG image variants and MP4/thumbnail uploads. Metadata finalizers cover
-files, images, videos and bounded SILK voice notes. The bundled portable SILK SDK
-encodes fresh mono 16 kHz audio and decodes incoming voice bytes without loading
-an official client codec. A separate core layer owns resizing, input conversion,
+files, images, videos and bounded SILK voice notes. Cargo features control the
+bundled native dependencies: `voice-silk` (default) compiles the bundled
+portable SILK C SDK for `silk::encode` and `silk::decode` without loading an
+official client codec; `openssl-crypto` (default) uses vendored OpenSSL; and
+`pure-rust-crypto` uses pure-Rust cryptographic primitives without OpenSSL.
+Disabling default features requires selecting at least one crypto backend
+(`openssl-crypto` or `pure-rust-crypto`). If both crypto features are enabled
+via Cargo feature unification (for example, when default features remain enabled
+or another crate in the dependency graph enables `openssl-crypto`),
+`openssl-crypto` takes precedence. Omitting `voice-silk` skips the C
+SILK build while keeping `silk::validate_framing`, `silk::wav`, voice bounds,
+and all protocol codecs. Portable callers can use `crypto::Curve`,
+`Ecdh::generate_for`, `Ecdh::from_private_for`, `crypto::cbc_encrypt`, and
+`crypto::cbc_decrypt`; the OpenSSL-typed `Ecdh::generate`,
+`Ecdh::from_private`, and `crypto::cbc` wrappers remain available under
+`openssl-crypto`. A separate core layer owns resizing, input conversion,
 durable jobs, upload readback and uncertain-send handling. Sticker retrieval is
 restricted to the verified original-byte CDN host, with pinned public DNS,
 redirect refusal, MD5 validation and bounded full image decoding.

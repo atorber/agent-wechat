@@ -1,18 +1,20 @@
 //! Fetch only a card's advertised thumbnail, without opening its target page.
+use crate::transport::{HttpMethod, HttpRequest, HttpTransport};
 use anyhow::{ensure, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     io::Read,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
-    time::Duration,
+    net::{SocketAddr, ToSocketAddrs},
 };
+use std::{net::IpAddr, time::Duration};
 pub const MAX_LINK_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
-pub fn validate_shared_link_url(value: &str) -> Result<reqwest::Url> {
+pub fn validate_shared_link_url(value: &str) -> Result<url::Url> {
     ensure!(
         !value.is_empty() && value.len() <= 8192 && !value.chars().any(|c| c.is_control()),
         "link_source_not_allowed"
     );
-    let url = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("link_source_not_allowed"))?;
+    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("link_source_not_allowed"))?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -22,7 +24,7 @@ pub fn validate_shared_link_url(value: &str) -> Result<reqwest::Url> {
     );
     Ok(url)
 }
-pub fn validate_link_thumbnail_url(value: &str) -> Result<reqwest::Url> {
+pub fn validate_link_thumbnail_url(value: &str) -> Result<url::Url> {
     let url = validate_shared_link_url(value)?;
     ensure!(
         url.fragment().is_none() && url.port().is_none(),
@@ -37,6 +39,10 @@ pub fn validate_link_thumbnail_url(value: &str) -> Result<reqwest::Url> {
     }
     Ok(url)
 }
+// Legacy blocking thumbnail downloader kept for 3.x native compatibility (#701).
+// Prefer `fetch_link_thumbnail_async` over `HttpTransport` for new code.
+/// Download one bounded link-card thumbnail from a validated public host without redirects.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_link_thumbnail(
     value: &str,
     progress: impl FnMut(u64, Option<u64>) -> Result<()>,
@@ -49,10 +55,70 @@ pub fn fetch_link_thumbnail(
     )?;
     fetch_at(url, address, progress)
 }
+
+/// Asynchronously download one bounded link-card thumbnail from a validated
+/// public URL using a pluggable [`HttpTransport`].
+///
+/// The caller's [`HttpTransport`] must not follow HTTP redirects and is
+/// responsible for DNS/SSRF validation before connecting to non-literal hostnames.
+pub async fn fetch_link_thumbnail_async(
+    value: &str,
+    http: &dyn HttpTransport,
+    mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let url = validate_link_thumbnail_url(value)?;
+    progress(0, None)?;
+    let response = http
+        .send(HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: vec![("Accept-Encoding".into(), "identity".into())],
+            body: Vec::new(),
+            timeout: Duration::from_secs(20),
+            max_response_bytes: MAX_LINK_THUMBNAIL_BYTES,
+        })
+        .await
+        .map_err(|error| {
+            if crate::transport::find_transport_error(&error)
+                == Some(crate::transport::TransportError::ResponseTooLarge)
+            {
+                anyhow::anyhow!("link_thumbnail_size_limit")
+            } else {
+                anyhow::anyhow!("link_thumbnail_fetch_failed")
+            }
+        })?;
+    ensure!(response.status == 200, "link_thumbnail_fetch_failed");
+    ensure!(
+        response
+            .header_values("content-encoding")
+            .into_iter()
+            .all(|v| v.trim().eq_ignore_ascii_case("identity")),
+        "link_thumbnail_encoding_refused"
+    );
+    let total = response
+        .content_length()
+        .map_err(|_| anyhow::anyhow!("link_thumbnail_fetch_failed"))?;
+    ensure!(
+        total.is_none_or(|n| n <= MAX_LINK_THUMBNAIL_BYTES as u64),
+        "link_thumbnail_size_limit"
+    );
+    ensure!(
+        response.body.len() <= MAX_LINK_THUMBNAIL_BYTES,
+        "link_thumbnail_size_limit"
+    );
+    progress(response.body.len() as u64, total)?;
+    ensure!(
+        !response.body.is_empty() && total.is_none_or(|n| n == response.body.len() as u64),
+        "media_integrity_failed"
+    );
+    super::inspect_image(&response.body)?;
+    Ok(response.body)
+}
 /// Resolve a URL's host once and require every address to be public, so a fetch can pin its
 /// connection to the checked address. Returns an IPv4 address when one exists.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn public_address(
-    url: &reqwest::Url,
+    url: &url::Url,
     dns_failed: &'static str,
     not_public: &'static str,
 ) -> Result<SocketAddr> {
@@ -80,8 +146,9 @@ pub(crate) fn public_address(
         .or_else(|| addresses.first())
         .unwrap())
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_at(
-    url: reqwest::Url,
+    url: url::Url,
     address: SocketAddr,
     mut progress: impl FnMut(u64, Option<u64>) -> Result<()>,
 ) -> Result<Vec<u8>> {
@@ -156,6 +223,7 @@ mod tests {
             assert!(validate_link_thumbnail_url(value).is_err(), "{value}");
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn http_thumbnail_checks_status_encoding_bounds_and_image_bytes_without_redirects() {
         use std::{io::Write, net::TcpListener};
@@ -222,7 +290,7 @@ mod tests {
             // Only this private transport helper accepts a local test socket;
             // the public entry point validates and pins public DNS answers.
             let result = fetch_at(
-                reqwest::Url::parse(&format!(
+                url::Url::parse(&format!(
                     "http://preview.example.invalid:{}/preview",
                     address.port()
                 ))
@@ -237,5 +305,82 @@ mod tests {
                 assert_eq!(result.unwrap(), image);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn async_link_thumbnail_checks_status_encoding_bounds_and_image() {
+        let image = hex::decode("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082").unwrap();
+        struct StaticHttp(crate::transport::HttpResponse);
+        impl HttpTransport for StaticHttp {
+            fn send<'a>(
+                &'a self,
+                _req: HttpRequest,
+            ) -> crate::transport::TransportFuture<'a, Result<crate::transport::HttpResponse>>
+            {
+                let resp = self.0.clone();
+                Box::pin(async move { Ok(resp) })
+            }
+        }
+        let ok = StaticHttp(crate::transport::HttpResponse {
+            status: 200,
+            headers: vec![("Content-Length".into(), image.len().to_string())],
+            body: image.clone(),
+        });
+        assert_eq!(
+            fetch_link_thumbnail_async("https://example.invalid/preview.png", &ok, |_, _| Ok(()))
+                .await
+                .unwrap(),
+            image
+        );
+        let gzip = StaticHttp(crate::transport::HttpResponse {
+            status: 200,
+            headers: vec![("Content-Encoding".into(), "gzip".into())],
+            body: image.clone(),
+        });
+        assert_eq!(
+            fetch_link_thumbnail_async("https://example.invalid/preview.png", &gzip, |_, _| Ok(()))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "link_thumbnail_encoding_refused"
+        );
+        let truncated = StaticHttp(crate::transport::HttpResponse {
+            status: 200,
+            headers: vec![("Content-Length".into(), (image.len() + 1).to_string())],
+            body: image,
+        });
+        assert_eq!(
+            fetch_link_thumbnail_async(
+                "https://example.invalid/preview.png",
+                &truncated,
+                |_, _| Ok(())
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "media_integrity_failed"
+        );
+
+        struct TooLargeHttp;
+        impl HttpTransport for TooLargeHttp {
+            fn send<'a>(
+                &'a self,
+                _req: HttpRequest,
+            ) -> crate::transport::TransportFuture<'a, Result<crate::transport::HttpResponse>>
+            {
+                Box::pin(async { Err(crate::transport::TransportError::ResponseTooLarge.into()) })
+            }
+        }
+        assert_eq!(
+            fetch_link_thumbnail_async(
+                "https://example.invalid/preview.png",
+                &TooLargeHttp,
+                |_, _| Ok(())
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "link_thumbnail_size_limit"
+        );
     }
 }
