@@ -1,5 +1,37 @@
 # @agent-wechat/desktop
 
+## 3.1.1
+
+### Patch Changes
+
+- [#709](https://github.com/thisnick/agent-wechat/pull/709) [`239a696`](https://github.com/thisnick/agent-wechat/commit/239a69674dda2e970cdf14f32fb3df9cad2492cb) Thanks [@thisnick](https://github.com/thisnick)! - Make large-file uploads (files and original videos over 25 MiB) handle CDN errors like the official client, and say why an upload stopped:
+
+  - A CDN error that the reply marks as retryable (`isretry`), or a code the official client retries, is retried with a new sequence number on the next CDN address. The retry waits `retrysec` when given, otherwise the official backoff. At most 8 server errors are retried per upload, waiting 15 minutes in total at most. Before, any CDN error stopped the upload.
+  - A successful reply's `isretry`, `retrysec`, `isoverload` and `isgetcdn` no longer stop the upload, as in the official client.
+  - An empty or unreadable CDN reply is retried like a dropped connection on every CDN transfer, uploads and downloads, resending the same request.
+  - A CDN rejection now sets `serviceStage: "large_file_upload"` and `serviceCode` on the job, with reason `media_service_rejected`, instead of `media_processing_failed` with no detail. A large-file job that stops during the transfer also includes `result.cdnUploadFailure` with the request (`apply`, `uploadblock`, `fin` or `complete`), the block, the attempts for that request, the server errors retried and a fixed cause.
+
+- [#707](https://github.com/thisnick/agent-wechat/pull/707) [`7889f30`](https://github.com/thisnick/agent-wechat/commit/7889f30a981f0625a1858b0e7fc3566374349769) Thanks [@thisnick](https://github.com/thisnick)! - Fix the voice note player in Safari and the macOS app, where the overflow (»)
+  button could be drawn on top of the play button. WebKit doesn't always lay out
+  its native media controls again after the media loads or after the page returns
+  from the background, so the voice player now makes WebKit redo that layout. Removes
+  the font override from the previous attempt, which had no visible effect.
+- Updated dependencies [[`7889f30`](https://github.com/thisnick/agent-wechat/commit/7889f30a981f0625a1858b0e7fc3566374349769)]:
+  - @agent-wechat/client-ui@0.7.2
+
+## 3.1.0
+
+### Patch Changes
+
+- [#692](https://github.com/thisnick/agent-wechat/pull/692) [`4718a4d`](https://github.com/thisnick/agent-wechat/commit/4718a4d972fd3893ff83834fac0872b12a100ab5) Thanks [@thisnick](https://github.com/thisnick)! - Add an opt-in `pure-rust-crypto` Cargo feature to `wechat-protocol` alongside the default-enabled `openssl-crypto` backend so consumers can build without vendored OpenSSL (`default-features = false, features = ["pure-rust-crypto"]`), and switch `wechat-calls` (`native-runtime`), the shipped `wx` CLI/daemon, and the desktop sidecar build to use `wechat-protocol`'s `pure-rust-crypto` backend (SQLCipher profile and store encryption continue to use OpenSSL). Add portable `crypto::Curve`, `crypto::Ecdh::generate_for`, `crypto::Ecdh::from_private_for`, `crypto::cbc_encrypt`, and `crypto::cbc_decrypt` APIs; OpenSSL-typed `Ecdh::generate`, `Ecdh::from_private`, and `crypto::cbc` remain available when `openssl-crypto` is enabled. Callers setting `default-features = false` must select at least one crypto backend (`openssl-crypto` or `pure-rust-crypto`).
+
+- [#695](https://github.com/thisnick/agent-wechat/pull/695) [`92e543e`](https://github.com/thisnick/agent-wechat/commit/92e543e3bac1305213dccebd5ed02340f9ab7433) Thanks [@thisnick](https://github.com/thisnick)! - Make native CDN chunked uploads and downloads reuse a pooled HTTP/1.1 connection per transfer instead of creating a new client with `Connection: close` per chunk, retry transient transport drops and 5xx/408/429 responses with bounded backoff while honoring cancellation/logout fences, and fail over across authenticated CDN server IPs.
+
+- [#696](https://github.com/thisnick/agent-wechat/pull/696) [`e30326b`](https://github.com/thisnick/agent-wechat/commit/e30326b94aa3cc4589fa1cbfa3d7c9b764a02ade) Thanks [@thisnick](https://github.com/thisnick)! - Fix the voice message player's layout in the macOS app and Safari, where the time labels overlapped the progress bar and the play button rendered incorrectly.
+
+- Updated dependencies [[`e30326b`](https://github.com/thisnick/agent-wechat/commit/e30326b94aa3cc4589fa1cbfa3d7c9b764a02ade)]:
+  - @agent-wechat/client-ui@0.7.1
+
 ## 3.0.0
 
 ### Minor Changes
