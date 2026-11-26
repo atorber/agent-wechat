@@ -28,6 +28,15 @@ connecting to a running daemon can use the [HTTP API](/use/api/).
 
 2. Build with Rust 1.93.1+, a C compiler, Make and Perl. Cargo resolves supporting
    crates automatically. Native Opus also needs CMake and a C++ compiler.
+   In `wechat-protocol`, `voice-silk` and `openssl-crypto` are enabled by
+   default. To skip compiling C SILK or vendored OpenSSL, set
+   `default-features = false` and enable either `openssl-crypto` or
+   `pure-rust-crypto` (plus `voice-silk` if you need `silk::encode` or
+   `silk::decode`). `wechat-calls`'s default `native-runtime` feature selects
+   `pure-rust-crypto` on `wechat-protocol`; if another crate in the same
+   dependency graph enables `openssl-crypto`, `openssl-crypto` takes
+   precedence. Framing validation, WAV packaging, and
+   all protocol codecs stay available without `voice-silk`.
 
 From the release after 2.3.2, the Rust libraries have the same version number as
 the CLI, daemon and OpenClaw plugin, and every release publishes all five. Earlier
@@ -151,6 +160,15 @@ runtime. See its [crate guide](https://docs.rs/crate/wechat-calls/latest) for ex
 The high-level `client.calls()` facade is unfinished. Use the
 [Calls API](../calls-api/) for complete call operations today.
 [Crate architecture](../../how-it-works/rust-crates/) explains the dependencies.
+
+## Pluggable async transport and WebAssembly
+
+`wechat-protocol` supports custom async transports through `wechat_protocol::transport` (`StreamTransport`, `HttpTransport`, `HttpOverStream`, `Clock`, `TaskSpawner`, and `ProtocolTransport`). Hosts with only raw TCP streams—such as a browser Isolated Web App using Direct Sockets—can wrap a `StreamTransport` with `ProtocolTransport::from_streams(streams, clock)`. On `wasm32` or non-Tokio executors, attach a task spawner with `ProtocolTransport::with_spawner` (for example `wasm_bindgen_futures::spawn_local`) so cancelling an in-flight account request still waits for the exchange and adopts verified replies.
+
+- Use `NativeClient::with_transport` for async login (`start_qr_login_async`, `poll_login_async`, `complete_login_async`).
+- Use `NativeClient::from_account_with_transport` for async account RPCs and `open_push_connection` (`AsyncPushConnection`).
+- Use `media::CdnClient` async methods (`download_async`, `download_to_with_progress_async`, `download_voice_with_progress_async`, `upload_async`, `upload_source_with_progress_async`, `upload_image_async`, `upload_video_async`, `upload_large_file_with_progress_async`, `upload_large_file_from_source_with_progress_async`), streaming `AsyncDownloadSink` / `AsyncUploadSource` (`PreparedAsyncUpload`), and async standalone downloaders (`download_advertised_avatar_async`, `fetch_sticker_async`, `fetch_link_thumbnail_async`, `fetch_tp_media_async`, `fetch_tp_media_to_async`, `fetch_channels_video_async`) over any `HttpTransport` and `Clock`.
+- On `wasm32-unknown-unknown`, `wechat-media` and `wechat-protocol` (`default-features = false, features = ["pure-rust-crypto"]`) omit OS sockets, `reqwest`, and native media tools automatically. In the application crate, configure a `getrandom` 0.4 backend (for browsers, add `getrandom = { version = "0.4", features = ["wasm_js"] }` and build with `RUSTFLAGS='--cfg getrandom_backend="wasm_js"'`).
 
 ## Profile writes
 
